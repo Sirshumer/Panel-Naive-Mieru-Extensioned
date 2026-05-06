@@ -1,5 +1,5 @@
 /* ============================================================
-   Panel Naive + Mieru by RIXXX — Global Stylesheet v1.1.0
+   Panel Naive + Mieru by RIXXX — Global Stylesheet v1.1.1
    Palette: dark gradient #1a1a1d → #2c2c30 | bronze accent #c08552
    ============================================================ */
 
@@ -933,13 +933,31 @@ select option { background: var(--bg-card); color: var(--text); }
 .toast.info    { border-left: 3px solid var(--accent); }
 @keyframes slideLeft { from { opacity: 0; transform: translateX(22px); } to { opacity: 1; transform: translateX(0); } }
 
+/* ── Sidebar overlay (mobile) ───────────────────────────────── */
+.sidebar-overlay {
+  display: none;
+  position: fixed; inset: 0;
+  background: rgba(0,0,0,0.5);
+  z-index: 199;
+  backdrop-filter: blur(2px);
+  -webkit-backdrop-filter: blur(2px);
+  cursor: pointer;
+}
+.sidebar-overlay.active { display: block; }
+
 /* ── Responsive ──────────────────────────────────────────────── */
 @media (max-width: 768px) {
   .sidebar { transform: translateX(-100%); }
-  .sidebar.open { transform: translateX(0); box-shadow: var(--shadow); }
+  .sidebar.open { transform: translateX(0); box-shadow: var(--shadow); z-index: 200; }
   .main-content { margin-left: 0; }
   .menu-toggle { display: flex; }
   .content-page { padding: 16px; }
   .form-row { grid-template-columns: 1fr; }
   .topbar-version { display: none; }
+  .modal { max-width: calc(100vw - 32px); }
+  .modal-footer { flex-direction: column; }
+  .modal-footer .btn { width: 100%; justify-content: center; }
+  .metrics-strip { gap: 8px; }
+  .metric-chip { min-width: 90px; padding: 10px 12px; }
+  .grid-4, .grid-3, .grid-2 { grid-template-columns: 1fr; }
 }
