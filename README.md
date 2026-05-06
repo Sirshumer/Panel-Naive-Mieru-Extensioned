@@ -1,113 +1,115 @@
-# Panel Naive + Mieru — by RIXXX
-
-> Web management panel for **NaiveProxy** + **Mieru** on Ubuntu/Debian VPS.  
-> Modelled on [Panel-Naive-Hy2 by RIXXX](https://github.com/cwash797-cmd/Panel---Naive-Hy2---by---RIXXX) — Hysteria2 replaced with Mieru.
-
-[![Telegram](https://img.shields.io/badge/Telegram-Support-blue?logo=telegram)](https://t.me/russian_paradice_vpn)
-[![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-black?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
+[🇷🇺 Русский](README.md) | [🇬🇧 English](README.en.md)
 
 ---
 
-## Features
+<div align="center">
 
-| Sprint | Feature |
-|--------|---------|
-| 1 | Auto-installer: arch detection, NaiveProxy binary, Mieru .deb, systemd units, NTP, UFW, config.json |
-| 2 | User CRUD: SQLite model, Caddyfile / Mieru config rebuild on change, expiry cron |
-| 3 | Server settings: port changes, traffic-pattern presets, MTU, UFW auto-update |
-| 4 | Client configs: Naive link, Mieru sing-box JSON, universal auto-fallback config |
-| 5 | Monitoring dashboard: WebSocket live metrics, traffic snapshots, quota alerts |
+# 🛡 Panel Naive + Mieru by RIXXX
+
+**v1.0.0** — Веб-панель управления NaiveProxy + Mieru для Ubuntu/Debian VPS
+
+[![Telegram](https://img.shields.io/badge/Telegram-@russian__paradice__vpn-2CA5E0?logo=telegram&logoColor=white)](https://t.me/russian_paradice_vpn)
+[![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-181717?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
+[![License](https://img.shields.io/badge/License-MIT-bronze?color=c08552)](LICENSE)
+
+> 💬 **Поддержка и обновления:** [t.me/russian_paradice_vpn](https://t.me/russian_paradice_vpn)  
+> ☕ **Поддержать проект:** [app.lava.top/2107724612](https://app.lava.top/2107724612?tabId=donate)
+
+</div>
+
+---
+
+## ✨ Возможности
+
+| Sprint | Функционал |
+|--------|-----------|
+| 1 | Авто-установщик: определение архитектуры, NaiveProxy, Mieru .deb, systemd, NTP, UFW, config.json |
+| 2 | CRUD пользователей: SQLite, перестройка Caddyfile / Mieru-конфига, cron удаления просроченных |
+| 3 | Настройки сервера: смена портов, паттерны трафика, MTU, авто-обновление UFW |
+| 4 | Клиентские конфиги: Naive-ссылка, Mieru sing-box JSON, универсальный конфиг, QR-коды |
+| 5 | Мониторинг: WebSocket метрики в реальном времени, трафик, квоты, история снимков |
 | 6 | `update.sh`: `--dry-run`, `--force`, `--expose`, `--ssh-only`, `--status`, `--repair`, `--help` |
 
-## Supported OS
+---
 
-| Distro | Versions |
-|--------|----------|
+## 🖥 Поддерживаемые ОС
+
+| Дистрибутив | Версии |
+|-------------|--------|
 | Ubuntu | 20.04, 22.04, 24.04 |
 | Debian | 11, 12 |
 
-**Architectures:** `x86_64` (amd64), `aarch64` (arm64), `armv7l` (armhf)
+**Архитектуры:** `x86_64` (amd64), `aarch64` (arm64), `armv7l` (armhf)
 
 ---
 
-## Quick Start
+## 🚀 Быстрый старт
 
 ```bash
-# 1. Clone the repository
+# 1. Клонировать репозиторий
 git clone https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX.git
 cd Panel-Naive-Mieru-by-RIXXX
 
-# 2. Run the installer as root
+# 2. Запустить установщик от root
 sudo bash install.sh
 ```
 
-The wizard will prompt you for:
-- Domain / hostname
-- TLS email
-- NaiveProxy port (default: `443`)
-- Mieru port range (default: `2012–2022`)
-- Panel admin credentials
-- UFW firewall setup (optional)
-- Panel expose mode (SSH-only vs public)
+Мастер установки запросит:
+- Язык (Русский / English) — **первый вопрос**
+- Домен / имя хоста
+- Email для TLS-сертификата
+- Порт NaiveProxy (по умолчанию: `443`)
+- Диапазон портов Mieru (по умолчанию: `2012-2022`)
+- Данные администратора панели
+- Настройка UFW (опционально)
+- Режим доступа к панели (SSH-only / публичный)
 
 ---
 
-## Accessing the Panel
+## 🔒 Доступ к панели
 
-### SSH-only (default, most secure)
+### SSH-only (по умолчанию, наиболее безопасно)
 ```bash
-# From your local machine:
-ssh -L 3000:127.0.0.1:3000 root@<your-server-ip>
-# Then open: http://localhost:3000/
+# С вашей локальной машины:
+ssh -L 3000:127.0.0.1:3000 root@<ip-сервера>
+# Затем откройте: http://localhost:3000/
 ```
 
-### Public mode
+### Публичный режим
 ```bash
 sudo bash update.sh --expose vpn.example.com
-# Panel available at http://vpn.example.com:8080/
+# Панель доступна по: http://vpn.example.com:8080/
 ```
 
 ---
 
-## update.sh Reference
+## 📁 Важные пути
 
-```
-bash update.sh                   # Interactive update
-bash update.sh --dry-run         # Preview changes (no writes)
-bash update.sh --force -y        # Force update, non-interactive
-bash update.sh --status          # Full health report
-bash update.sh --repair          # Restore broken configs from backup
-bash update.sh --expose <domain> # Switch to public panel mode
-bash update.sh --ssh-only        # Revert to SSH-only mode
-```
+| Путь | Назначение |
+|------|-----------|
+| `/etc/rixxx-panel/config.json` | Конфигурация панели |
+| `/etc/rixxx-panel/version` | Установленная версия |
+| `/etc/rixxx-panel/backups/` | Резервные копии (хранится последние 10) |
+| `/etc/caddy-naive/Caddyfile` | Конфиг Caddy NaiveProxy |
+| `/var/lib/rixxx-panel/mita-state.json` | JSON-файл Mieru (применяется через `mita apply config`) |
+| `/var/lib/rixxx-panel/db.sqlite` | SQLite база данных пользователей |
+| `/opt/panel-naive-mieru/` | Файлы приложения панели |
+| `/usr/local/bin/caddy-naive` | Бинарный файл Caddy с плагином naive |
 
----
-
-## Important Paths
-
-| Path | Purpose |
-|------|---------|
-| `/etc/rixxx-panel/config.json` | Panel configuration |
-| `/etc/rixxx-panel/version` | Installed version |
-| `/etc/rixxx-panel/backups/` | Timestamped backups (last 10 kept) |
-| `/etc/caddy-naive/Caddyfile` | Caddy NaiveProxy config |
-| `/etc/mita/server.json` | Mieru server config |
-| `/etc/mita/users.json` | Mieru users |
-| `/var/lib/rixxx-panel/db.sqlite` | SQLite user database |
-| `/opt/panel-naive-mieru/` | Panel application files |
-| `/usr/local/bin/caddy-naive` | Caddy with naive plugin binary |
+> ⚠️ **Важно:** `/etc/mita/` — внутреннее хранилище Mieru в формате protobuf, **не редактируется вручную**.  
+> Панель использует `/var/lib/rixxx-panel/mita-state.json` и применяет его командой `mita apply config <file>`.
 
 ---
 
-## Key Commands
+## 🔧 Ключевые команды
 
 ```bash
-# Service management
+# Управление сервисами
 systemctl status caddy-naive mita
 systemctl restart caddy-naive
 systemctl restart mita
 
-# Panel (PM2)
+# Панель (PM2)
 pm2 logs panel-naive-mieru
 pm2 restart panel-naive-mieru
 pm2 status
@@ -116,84 +118,187 @@ pm2 status
 mita status
 mita describe users
 mita describe config
-mita apply config /etc/mita/server.json
+mita apply config /var/lib/rixxx-panel/mita-state.json
 mita reload
 
 # Caddy
 caddy-naive validate --config /etc/caddy-naive/Caddyfile --adapter caddyfile
 caddy-naive reload  --config /etc/caddy-naive/Caddyfile --adapter caddyfile
 
-# Panel management
-bash update.sh --status          # Health check
-bash update.sh --repair          # Fix broken install
-bash uninstall.sh                # Full removal
+# Управление панелью
+bash update.sh --status    # Проверка состояния
+bash update.sh --repair    # Исправление сломанной установки
+sudo bash uninstall.sh     # Полное удаление
+sudo bash uninstall.sh --keep-configs  # Удаление без конфигов
 ```
 
 ---
 
-## Client Configuration
+## 📱 Клиентские приложения
 
 ### NaiveProxy
-Link format: `naive+https://username:password@domain:443`
+Формат ссылки: `naive+https://username:password@domain:443`
 
-Compatible clients:
-- [ShadowRocket](https://apps.apple.com/app/shadowrocket/id932747118) (iOS)
-- [NekoBox](https://github.com/MatsuriDayo/NekoBoxForAndroid) (Android)
-- [naiveproxy](https://github.com/klzgrad/naiveproxy/releases) (CLI)
+| Клиент | Платформа |
+|--------|-----------|
+| [ShadowRocket](https://apps.apple.com/app/shadowrocket/id932747118) | iOS |
+| [Karing](https://github.com/KaringX/karing/releases) | iOS / Android / Windows / macOS / Linux |
+| [NekoBox](https://github.com/MatsuriDayo/NekoBoxForAndroid) | Android |
+| [naiveproxy](https://github.com/klzgrad/naiveproxy/releases) | CLI |
 
 ### Mieru (sing-box)
-Download the **Mieru sing-box JSON** or **Universal Config** from the Users page.
+Скачайте **Mieru JSON** или **Универсальный конфиг** со страницы пользователей.
 
-Compatible clients:
-- [Sing-box](https://apps.apple.com/app/sing-box/id6451272673) (iOS)
-- [Sing-box](https://github.com/SagerNet/sing-box/releases) (Android / Windows / Linux / macOS)
+| Клиент | Платформа |
+|--------|-----------|
+| [Karing](https://github.com/KaringX/karing/releases) | iOS / Android / Windows / macOS / Linux |
+| [Sing-box](https://apps.apple.com/app/sing-box/id6451272673) | iOS |
+| [Sing-box](https://github.com/SagerNet/sing-box/releases) | Android / Windows / Linux / macOS |
 
-### Universal Config (urltest auto-fallback)
-Contains both NaiveProxy and Mieru outbounds with `urltest` selector — automatically uses the faster connection.
+### Универсальный конфиг (urltest авто-выбор)
+Содержит оба протокола (NaiveProxy + Mieru) с `urltest` — автоматически выбирает более быстрое соединение.
 
 ---
 
-## Architecture
+## 🏗 Архитектура
 
 ```
-┌─────────────────────────────────────────────┐
-│                   VPS                        │
-│                                              │
-│  ┌──────────┐  port 443   ┌───────────────┐ │
-│  │  Client  │ ──HTTPS──▶  │  caddy-naive  │ │
-│  └──────────┘             │  (NaiveProxy) │ │
-│                           └───────────────┘ │
-│  ┌──────────┐  port 2012- ┌───────────────┐ │
-│  │  Client  │ ──TCP/UDP─▶ │     mita      │ │
-│  └──────────┘  2022       │    (Mieru)    │ │
-│                           └───────────────┘ │
-│                                              │
-│  ┌──────────────────────────────────────┐   │
-│  │    Panel (Node.js + PM2)             │   │
-│  │    127.0.0.1:3000  (SSH-only)        │   │
-│  │    SQLite DB  │  REST API  │  WS     │   │
-│  └──────────────────────────────────────┘   │
-└─────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────┐
+│                         VPS                               │
+│                                                          │
+│  ┌──────────┐  порт 443     ┌──────────────────────┐    │
+│  │  Клиент  │ ──HTTPS──────▶│    caddy-naive       │    │
+│  │ (Naive)  │               │  (NaiveProxy HTTPS   │    │
+│  └──────────┘               │   forward proxy)     │    │
+│                             └──────────────────────┘    │
+│                                                          │
+│  ┌──────────┐  порты        ┌──────────────────────┐    │
+│  │  Клиент  │  2012-2022    │        mita          │    │
+│  │ (Mieru)  │ ──TCP/UDP────▶│    (Mieru proxy)     │    │
+│  └──────────┘               └──────────────────────┘    │
+│                                                          │
+│  ┌────────────────────────────────────────────────────┐  │
+│  │           Панель управления (Node.js + PM2)         │  │
+│  │   127.0.0.1:3000  │  REST API  │  WebSocket  │  UI  │  │
+│  │              SQLite DB (/var/lib/rixxx-panel/)      │  │
+│  └────────────────────────────────────────────────────┘  │
+│                                                          │
+│  ┌─────────────────────┐   ┌────────────────────────┐   │
+│  │  /etc/caddy-naive/  │   │ /var/lib/rixxx-panel/  │   │
+│  │     Caddyfile       │   │   mita-state.json      │   │
+│  └─────────────────────┘   └────────────────────────┘   │
+└──────────────────────────────────────────────────────────┘
 ```
 
 ---
 
-## Security Notes
+## 🔄 Справочник update.sh
 
-- Panel runs on `127.0.0.1:3000` by default — not exposed to the internet
-- Admin password is bcrypt-hashed in `config.json` (chmod 600)
-- SQLite DB is in `/var/lib/rixxx-panel/` (root access only)
-- Temporary config files are deleted with `shred -u`
-- Rate limiting on login endpoint (20 req/15 min)
-- Session cookies are `httpOnly`
+```bash
+bash update.sh                    # Интерактивное обновление
+bash update.sh --dry-run          # Предпросмотр изменений (без записи)
+bash update.sh --force -y         # Принудительное обновление, без вопросов
+bash update.sh --status           # Полный отчёт о состоянии
+bash update.sh --repair           # Восстановление сломанных конфигов
+bash update.sh --expose <домен>   # Публичный режим панели
+bash update.sh --ssh-only         # Вернуться в SSH-only режим
+bash update.sh --help             # Справка
+```
 
 ---
 
-## Credits
+## 🗑 Удаление
 
-- **Author:** RIXXX
+```bash
+# Полное удаление (включая конфиги и базу данных)
+sudo bash uninstall.sh
+
+# Удаление без конфигов (сохранить /etc/rixxx-panel/ и DB)
+sudo bash uninstall.sh --keep-configs
+```
+
+---
+
+## 🛡 Безопасность
+
+- Панель работает на `127.0.0.1:3000` — не доступна из интернета по умолчанию
+- Пароль администратора хранится в bcrypt-хэше в `config.json` (chmod 600)
+- SQLite БД в `/var/lib/rixxx-panel/` (только root)
+- Временные конфиг-файлы удаляются через `shred -u`
+- Rate limiting на login (20 запросов / 15 мин)
+- Куки сессии `httpOnly`
+
+---
+
+## 🔧 Решение проблем
+
+### Топ-5 распространённых проблем
+
+**1. Ошибка синхронизации времени (Mieru не подключается)**
+```bash
+timedatectl status
+timedatectl set-ntp true
+# Mieru требует точность ±30 секунд между клиентом и сервером
+```
+
+**2. Конфликт портов**
+```bash
+ss -tlnup | grep -E '443|2012'
+# Проверьте, не занят ли порт другим процессом
+```
+
+**3. mita не запускается**
+```bash
+journalctl -u mita -n 50
+mita status
+# Проверьте /var/lib/rixxx-panel/mita-state.json на валидность JSON
+mita apply config /var/lib/rixxx-panel/mita-state.json
+```
+
+**4. Проблемы с TLS-сертификатом Caddy**
+```bash
+journalctl -u caddy-naive -n 50
+caddy-naive validate --config /etc/caddy-naive/Caddyfile --adapter caddyfile
+# Убедитесь, что домен указывает на IP сервера и порт 443 открыт
+```
+
+**5. Клиент не подключается**
+```bash
+# Чеклист:
+# 1. Пинг домена с клиентского устройства
+# 2. Время синхронизировано на обоих устройствах?
+# 3. Порты открыты в UFW?
+ufw status
+# 4. Скачайте новый конфиг после любого изменения портов
+# 5. Используйте правильный клиент (ShadowRocket / Karing / Sing-box)
+```
+
+---
+
+## 📸 Скриншоты
+
+> Скриншоты UI доступны в папке `docs/screenshots/` репозитория.
+
+---
+
+## 📋 Стек технологий
+
+- **Установщик:** Bash (Ubuntu 20.04–24.04, Debian 11–12)
+- **Панель:** Node.js 20 LTS + Express + better-sqlite3 + WebSocket
+- **Процесс-менеджер:** PM2
+- **NaiveProxy:** caddy-naive (Caddy + forward_proxy plugin)
+- **Mieru:** mita (управляется через `mita apply config`)
+- **Файрвол:** UFW
+- **База данных:** SQLite (WAL mode)
+
+---
+
+## 📝 Кредиты
+
+- **Автор:** RIXXX
 - **Telegram:** [@russian_paradice_vpn](https://t.me/russian_paradice_vpn)
-- **Donate:** [lava.top](https://app.lava.top/2107724612?tabId=donate)
+- **Донат:** [app.lava.top/2107724612](https://app.lava.top/2107724612?tabId=donate)
 - **NaiveProxy:** [klzgrad/naiveproxy](https://github.com/klzgrad/naiveproxy)
 - **Mieru:** [enfein/mieru](https://github.com/enfein/mieru)
 - **Caddy:** [caddyserver.com](https://caddyserver.com)
+- **Karing:** [KaringX/karing](https://github.com/KaringX/karing)

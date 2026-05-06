@@ -1,12 +1,16 @@
 <!DOCTYPE html>
-<html lang="en">
+<html lang="ru" data-theme="dark">
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Panel Naive + Mieru — by RIXXX</title>
+  <title>Naive + Mieru by RIXXX v1.0.0</title>
+  <meta name="description" content="Panel Naive + Mieru — web management for NaiveProxy + Mieru by RIXXX" />
+  <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Ccircle cx='20' cy='20' r='18' fill='%23c08552'/%3E%3Cpath d='M13 20h14M20 13l7 7-7 7' stroke='%23fff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin />
   <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet" />
+  <!-- QR code library (self-contained, no external dep required) -->
+  <script src="https://cdn.jsdelivr.net/npm/qrcode@1.5.3/build/qrcode.min.js"></script>
   <link rel="stylesheet" href="style.css" />
 </head>
 <body>
@@ -16,23 +20,41 @@
 ════════════════════════════════════════════════════════════════ -->
 <div id="page-login" class="page active">
   <div class="login-bg"></div>
+
+  <!-- Language + Theme controls on login -->
+  <div class="login-controls">
+    <button class="ctrl-btn lang-btn" id="login-lang-btn" onclick="cycleLang()" title="Switch language">RU</button>
+    <button class="ctrl-btn" id="login-theme-btn" onclick="toggleTheme()" title="Toggle theme">
+      <!-- sun icon shown in dark, moon in light -->
+      <svg id="login-theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+        <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+        <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+        <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+        <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+      </svg>
+    </button>
+  </div>
+
   <div class="login-card">
     <div class="login-logo">
       <div class="logo-icon">
-        <svg viewBox="0 0 40 40" fill="none"><circle cx="20" cy="20" r="18" stroke="var(--accent)" stroke-width="2.5"/><path d="M13 20h14M20 13l7 7-7 7" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        <svg viewBox="0 0 40 40" fill="none">
+          <circle cx="20" cy="20" r="18" stroke="var(--accent)" stroke-width="2.5"/>
+          <path d="M13 20h14M20 13l7 7-7 7" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
       </div>
       <div>
-        <h1>RIXXX Panel</h1>
-        <p>Naive + Mieru Management</p>
+        <h1 data-i18n="login.title">RIXXX Panel</h1>
+        <p data-i18n="login.subtitle">Naive + Mieru Management</p>
       </div>
     </div>
     <form id="login-form" autocomplete="off">
       <div class="form-group">
-        <label>Username</label>
+        <label data-i18n="login.username">Username</label>
         <input type="text" id="login-user" name="username" placeholder="admin" required autocomplete="username" />
       </div>
       <div class="form-group">
-        <label>Password</label>
+        <label data-i18n="login.password">Password</label>
         <div class="input-pw-wrap">
           <input type="password" id="login-pass" name="password" placeholder="••••••••" required autocomplete="current-password" />
           <button type="button" class="btn-eye" onclick="togglePw('login-pass')">
@@ -42,13 +64,13 @@
       </div>
       <div id="login-error" class="alert alert-error hidden"></div>
       <button type="submit" class="btn btn-primary btn-block" id="login-btn">
-        <span>Sign In</span>
+        <span data-i18n="login.signIn">Sign In</span>
       </button>
     </form>
     <div class="login-footer">
-      <a href="https://t.me/russian_paradice_vpn" target="_blank">Telegram Support</a>
+      <a href="https://t.me/russian_paradice_vpn" target="_blank" data-i18n="login.telegramSupport">Telegram Support</a>
       <span>·</span>
-      <a href="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX" target="_blank">GitHub</a>
+      <a href="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX" target="_blank" data-i18n="login.github">GitHub</a>
     </div>
   </div>
 </div>
@@ -61,42 +83,46 @@
   <!-- Sidebar -->
   <aside class="sidebar" id="sidebar">
     <div class="sidebar-logo">
-      <svg viewBox="0 0 40 40" fill="none" width="32" height="32"><circle cx="20" cy="20" r="18" stroke="var(--accent)" stroke-width="2.5"/><path d="M13 20h14M20 13l7 7-7 7" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/></svg>
-      <span>RIXXX Panel</span>
+      <svg viewBox="0 0 40 40" fill="none" width="30" height="30">
+        <circle cx="20" cy="20" r="18" stroke="var(--accent)" stroke-width="2.5"/>
+        <path d="M13 20h14M20 13l7 7-7 7" stroke="var(--accent)" stroke-width="2.5" stroke-linecap="round" stroke-linejoin="round"/>
+      </svg>
+      <div>
+        <div>RIXXX Panel</div>
+        <div class="sidebar-product-label">Naive + Mieru v1.0.0</div>
+      </div>
     </div>
     <nav class="sidebar-nav">
       <a href="#" class="nav-item active" data-page="dashboard">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/></svg>
-        Dashboard
+        <span data-i18n="nav.dashboard">Dashboard</span>
       </a>
       <a href="#" class="nav-item" data-page="users">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg>
-        Users
+        <span data-i18n="nav.users">Users</span>
       </a>
       <a href="#" class="nav-item" data-page="settings">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/></svg>
-        Server Settings
+        <span data-i18n="nav.settings">Server Settings</span>
       </a>
       <a href="#" class="nav-item" data-page="monitoring">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
-        Monitoring
+        <span data-i18n="nav.monitoring">Monitoring</span>
       </a>
       <a href="#" class="nav-item" data-page="logs">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
-        Logs
+        <span data-i18n="nav.logs">Logs</span>
       </a>
       <a href="#" class="nav-item" data-page="diagnostics">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M22 12h-4l-3 9L9 3l-3 9H2"/></svg>
-        Diagnostics
+        <span data-i18n="nav.diagnostics">Diagnostics</span>
       </a>
     </nav>
     <div class="sidebar-bottom">
-      <div class="sidebar-user">
-        <div class="avatar" id="sidebar-avatar">A</div>
-        <div>
-          <div class="sidebar-username" id="sidebar-uname">admin</div>
-          <div class="sidebar-role">Administrator</div>
-        </div>
+      <div class="avatar" id="sidebar-avatar">A</div>
+      <div>
+        <div class="sidebar-username" id="sidebar-uname">admin</div>
+        <div class="sidebar-role" data-i18n="nav.administrator">Administrator</div>
       </div>
       <button class="btn-logout" onclick="logout()" title="Logout">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
@@ -110,10 +136,21 @@
       <button class="menu-toggle" id="menu-toggle" onclick="toggleSidebar()">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
-      <h2 class="topbar-title" id="topbar-title">Dashboard</h2>
+      <h2 class="topbar-title" id="topbar-title" data-i18n="nav.dashboard">Dashboard</h2>
       <div class="topbar-right">
         <div class="status-dot" id="ws-dot" title="Real-time connection"></div>
         <span class="topbar-version" id="topbar-version">v1.0.0</span>
+        <!-- Language toggle -->
+        <button class="ctrl-btn lang-btn" id="topbar-lang-btn" onclick="cycleLang()" title="Switch language">RU</button>
+        <!-- Theme toggle -->
+        <button class="ctrl-btn" id="topbar-theme-btn" onclick="toggleTheme()" title="Toggle theme">
+          <svg id="topbar-theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+            <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+            <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+            <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+            <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+          </svg>
+        </button>
       </div>
     </header>
 
@@ -125,13 +162,13 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z"/></svg>
           </div>
           <div class="stat-body">
-            <div class="stat-label">NaiveProxy</div>
+            <div class="stat-label" data-i18n="dashboard.naiveProxy">NaiveProxy</div>
             <div class="stat-value" id="d-naive-status">—</div>
           </div>
           <div class="stat-actions">
-            <button class="btn btn-xs btn-success" onclick="svcAction('caddy-naive','start')">Start</button>
-            <button class="btn btn-xs btn-warning" onclick="svcAction('caddy-naive','restart')">Restart</button>
-            <button class="btn btn-xs btn-danger"  onclick="svcAction('caddy-naive','stop')">Stop</button>
+            <button class="btn btn-xs btn-success" onclick="svcAction('caddy-naive','start')" data-i18n="dashboard.start">Start</button>
+            <button class="btn btn-xs btn-warning" onclick="svcAction('caddy-naive','restart')" data-i18n="dashboard.restart">Restart</button>
+            <button class="btn btn-xs btn-danger"  onclick="svcAction('caddy-naive','stop')" data-i18n="dashboard.stop">Stop</button>
           </div>
         </div>
         <div class="stat-card">
@@ -139,13 +176,13 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><circle cx="12" cy="12" r="10"/><path d="M2 12h20M12 2a15.3 15.3 0 0 1 4 10 15.3 15.3 0 0 1-4 10 15.3 15.3 0 0 1-4-10 15.3 15.3 0 0 1 4-10z"/></svg>
           </div>
           <div class="stat-body">
-            <div class="stat-label">Mieru (mita)</div>
+            <div class="stat-label" data-i18n="dashboard.mieru">Mieru (mita)</div>
             <div class="stat-value" id="d-mieru-status">—</div>
           </div>
           <div class="stat-actions">
-            <button class="btn btn-xs btn-success" onclick="svcAction('mita','start')">Start</button>
-            <button class="btn btn-xs btn-warning" onclick="svcAction('mita','restart')">Restart</button>
-            <button class="btn btn-xs btn-danger"  onclick="svcAction('mita','stop')">Stop</button>
+            <button class="btn btn-xs btn-success" onclick="svcAction('mita','start')" data-i18n="dashboard.start">Start</button>
+            <button class="btn btn-xs btn-warning" onclick="svcAction('mita','restart')" data-i18n="dashboard.restart">Restart</button>
+            <button class="btn btn-xs btn-danger"  onclick="svcAction('mita','stop')" data-i18n="dashboard.stop">Stop</button>
           </div>
         </div>
         <div class="stat-card">
@@ -153,7 +190,7 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/></svg>
           </div>
           <div class="stat-body">
-            <div class="stat-label">Active Users</div>
+            <div class="stat-label" data-i18n="dashboard.activeUsers">Active Users</div>
             <div class="stat-value" id="d-user-count">—</div>
           </div>
         </div>
@@ -162,32 +199,31 @@
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="2" y="3" width="20" height="14" rx="2"/><path d="M8 21h8M12 17v4"/></svg>
           </div>
           <div class="stat-body">
-            <div class="stat-label">Server</div>
+            <div class="stat-label" data-i18n="dashboard.server">Server</div>
             <div class="stat-value" id="d-domain">—</div>
           </div>
         </div>
       </div>
 
-      <!-- System metrics -->
       <div class="grid grid-3 mt-4">
         <div class="card">
-          <div class="card-header">CPU Usage</div>
+          <div class="card-header" data-i18n="dashboard.cpuUsage">CPU Usage</div>
           <div class="card-body">
-            <div class="progress-label"><span>Usage</span><span id="d-cpu">—%</span></div>
+            <div class="progress-label"><span data-i18n="dashboard.usage">Usage</span><span id="d-cpu">—%</span></div>
             <div class="progress-bar"><div class="progress-fill" id="d-cpu-bar" style="width:0%"></div></div>
           </div>
         </div>
         <div class="card">
-          <div class="card-header">Memory</div>
+          <div class="card-header" data-i18n="dashboard.memory">Memory</div>
           <div class="card-body">
-            <div class="progress-label"><span>Used</span><span id="d-ram">—</span></div>
+            <div class="progress-label"><span data-i18n="dashboard.used">Used</span><span id="d-ram">—</span></div>
             <div class="progress-bar"><div class="progress-fill" id="d-ram-bar" style="width:0%"></div></div>
           </div>
         </div>
         <div class="card">
-          <div class="card-header">Disk</div>
+          <div class="card-header" data-i18n="dashboard.disk">Disk</div>
           <div class="card-body">
-            <div class="progress-label"><span>Used</span><span id="d-disk">—</span></div>
+            <div class="progress-label"><span data-i18n="dashboard.used">Used</span><span id="d-disk">—</span></div>
             <div class="progress-bar"><div class="progress-fill" id="d-disk-bar" style="width:0%"></div></div>
           </div>
         </div>
@@ -195,14 +231,15 @@
 
       <div class="grid grid-2 mt-4">
         <div class="card">
-          <div class="card-header">System Info</div>
+          <div class="card-header" data-i18n="dashboard.systemInfo">System Info</div>
           <div class="card-body info-list" id="d-sysinfo"></div>
         </div>
         <div class="card">
-          <div class="card-header">Quick Links</div>
+          <div class="card-header" data-i18n="dashboard.quickLinks">Quick Links</div>
           <div class="card-body">
             <a href="https://github.com/klzgrad/naiveproxy/releases" target="_blank" class="quick-link">NaiveProxy Releases</a>
             <a href="https://github.com/enfein/mieru/releases"       target="_blank" class="quick-link">Mieru Releases</a>
+            <a href="https://github.com/KaringX/karing/releases"     target="_blank" class="quick-link">Karing Client (iOS/Android/Win/Mac/Linux)</a>
             <a href="https://github.com/SagerNet/sing-box/releases"  target="_blank" class="quick-link">Sing-box Client</a>
             <a href="https://apps.apple.com/app/sing-box/id6451272673" target="_blank" class="quick-link">Sing-box iOS</a>
             <a href="https://t.me/russian_paradice_vpn"              target="_blank" class="quick-link">Telegram Support</a>
@@ -214,10 +251,10 @@
     <!-- ── USERS ─────────────────────────────────────────────── -->
     <section id="page-users" class="content-page">
       <div class="page-header">
-        <h3>Users</h3>
+        <h3 data-i18n="users.title">Users</h3>
         <button class="btn btn-primary" onclick="openAddUser()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
-          Add User
+          <span data-i18n="users.addUser">Add User</span>
         </button>
       </div>
 
@@ -226,19 +263,20 @@
           <table class="data-table" id="users-table">
             <thead>
               <tr>
-                <th>Username</th>
-                <th>Email</th>
-                <th>Expiry</th>
-                <th>Naive</th>
-                <th>Mieru</th>
-                <th>Used (MB)</th>
-                <th>Quota (MB)</th>
-                <th>Last Active</th>
-                <th>Actions</th>
+                <th data-i18n="users.username">Username</th>
+                <th data-i18n="users.email">Email</th>
+                <th data-i18n="users.expiry">Expiry</th>
+                <th data-i18n="users.naive">Naive</th>
+                <th data-i18n="users.mieru">Mieru</th>
+                <th data-i18n="users.usedMB">Used (MB)</th>
+                <th data-i18n="users.quotaMB">Quota (MB)</th>
+                <th data-i18n="users.quotaUsed">Quota</th>
+                <th data-i18n="users.lastActive">Last Active</th>
+                <th data-i18n="users.actions">Actions</th>
               </tr>
             </thead>
             <tbody id="users-tbody">
-              <tr><td colspan="9" class="table-empty">Loading users…</td></tr>
+              <tr><td colspan="10" class="table-empty" data-i18n="users.loading">Loading users…</td></tr>
             </tbody>
           </table>
         </div>
@@ -248,55 +286,55 @@
       <div class="modal-overlay hidden" id="user-modal">
         <div class="modal">
           <div class="modal-header">
-            <h4 id="user-modal-title">Add User</h4>
+            <h4 id="user-modal-title" data-i18n="users.addTitle">Add User</h4>
             <button class="modal-close" onclick="closeUserModal()">✕</button>
           </div>
           <div class="modal-body">
             <input type="hidden" id="user-id" />
             <div class="form-row">
               <div class="form-group">
-                <label>Username *</label>
-                <input type="text" id="u-username" placeholder="john_doe" required />
+                <label data-i18n="users.username">Username *</label>
+                <input type="text" id="u-username" data-i18n-ph="users.usernamePlaceholder" placeholder="john_doe" required />
               </div>
               <div class="form-group">
-                <label>Email *</label>
-                <input type="email" id="u-email" placeholder="john@example.com" required />
+                <label data-i18n="users.email">Email *</label>
+                <input type="email" id="u-email" data-i18n-ph="users.emailPlaceholder" placeholder="john@example.com" required />
               </div>
             </div>
             <div class="form-row">
               <div class="form-group">
-                <label>Password *</label>
+                <label data-i18n="users.passwordLabel">Password *</label>
                 <div class="input-pw-wrap">
-                  <input type="password" id="u-password" placeholder="Minimum 8 chars" />
+                  <input type="password" id="u-password" data-i18n-ph="users.passwordPlaceholder" placeholder="Minimum 8 chars" />
                   <button type="button" class="btn-eye" onclick="togglePw('u-password')">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                   </button>
                 </div>
-                <small id="u-pass-hint">Leave blank to keep current (edit mode)</small>
+                <small id="u-pass-hint" data-i18n="users.passwordHintNew">Required for new user</small>
               </div>
               <div class="form-group">
-                <label>Expiry Date</label>
+                <label data-i18n="users.expiryLabel">Expiry Date</label>
                 <input type="datetime-local" id="u-expiry" />
               </div>
             </div>
             <div class="form-row">
               <div class="form-group">
-                <label>Quota (MB, 0 = unlimited)</label>
+                <label data-i18n="users.quotaLabel">Quota (MB, 0 = unlimited)</label>
                 <input type="number" id="u-quota" value="0" min="0" />
               </div>
               <div class="form-group">
-                <label>Protocols</label>
+                <label data-i18n="users.protocolsLabel">Protocols</label>
                 <div class="checkbox-row">
-                  <label class="checkbox"><input type="checkbox" id="p-naive" checked /> NaiveProxy</label>
-                  <label class="checkbox"><input type="checkbox" id="p-mieru" checked /> Mieru</label>
+                  <label class="checkbox"><input type="checkbox" id="p-naive" checked /> <span data-i18n="users.naiveProxyLabel">NaiveProxy</span></label>
+                  <label class="checkbox"><input type="checkbox" id="p-mieru" checked /> <span data-i18n="users.mieruLabel">Mieru</span></label>
                 </div>
               </div>
             </div>
             <div id="user-modal-error" class="alert alert-error hidden"></div>
           </div>
           <div class="modal-footer">
-            <button class="btn btn-ghost" onclick="closeUserModal()">Cancel</button>
-            <button class="btn btn-primary" onclick="saveUser()">Save User</button>
+            <button class="btn btn-ghost" onclick="closeUserModal()" data-i18n="users.cancel">Cancel</button>
+            <button class="btn btn-primary" onclick="saveUser()" data-i18n="users.save">Save User</button>
           </div>
         </div>
       </div>
@@ -305,30 +343,37 @@
       <div class="modal-overlay hidden" id="config-modal">
         <div class="modal modal-sm">
           <div class="modal-header">
-            <h4>Download Client Config</h4>
+            <h4 data-i18n="config.downloadTitle">Download Client Config</h4>
             <button class="modal-close" onclick="closeConfigModal()">✕</button>
           </div>
           <div class="modal-body">
-            <p style="margin-bottom:12px;color:var(--text-secondary)">Enter the user's plain-text password to embed in the config file.</p>
+            <p style="margin-bottom:12px;color:var(--text-secondary);font-size:13px" data-i18n="config.passwordNote">
+              Enter the user's plain-text password to embed in the config file.
+            </p>
             <div class="form-group">
-              <label>Password</label>
-              <input type="password" id="cfg-password" placeholder="User password" />
+              <label data-i18n="config.passwordLabel">Password</label>
+              <input type="password" id="cfg-password" data-i18n-ph="config.passwordPlaceholder" placeholder="User password" />
             </div>
             <div id="naive-link-box" class="code-box hidden"></div>
+            <!-- QR code container (shown after naive link generation) -->
+            <div id="qr-container" class="qr-container hidden">
+              <canvas id="qr-canvas"></canvas>
+              <div class="qr-note" data-i18n="config.qrNote">Scan QR code with client app (iOS: ShadowRocket, Karing)</div>
+            </div>
           </div>
           <div class="modal-footer">
-            <button class="btn btn-ghost" onclick="closeConfigModal()">Cancel</button>
+            <button class="btn btn-ghost" onclick="closeConfigModal()" data-i18n="config.cancel">Cancel</button>
             <button class="btn btn-secondary" onclick="downloadNaiveLink()">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
-              Naive Link
+              <span data-i18n="config.naiveLink">Naive Link</span>
             </button>
             <button class="btn btn-secondary" onclick="downloadMieruConfig()">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Mieru JSON
+              <span data-i18n="config.mieruJson">Mieru JSON</span>
             </button>
             <button class="btn btn-primary" onclick="downloadUniversalConfig()">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
-              Universal Config
+              <span data-i18n="config.universalConfig">Universal Config</span>
             </button>
           </div>
         </div>
@@ -337,114 +382,119 @@
 
     <!-- ── SERVER SETTINGS ───────────────────────────────────── -->
     <section id="page-settings" class="content-page">
-      <div class="page-header"><h3>Server Settings</h3></div>
+      <div class="page-header"><h3 data-i18n="settings.title">Server Settings</h3></div>
       <div class="grid grid-2">
 
-        <!-- NaiveProxy port -->
         <div class="card">
-          <div class="card-header">NaiveProxy Port</div>
+          <div class="card-header" data-i18n="settings.naivePortTitle">NaiveProxy Port</div>
           <div class="card-body">
-            <p class="card-desc">Change the HTTPS port for NaiveProxy. Reloads Caddy only — no service restart.</p>
+            <p class="card-desc" data-i18n="settings.naivePortDesc">Change the HTTPS port for NaiveProxy. Reloads Caddy only — no service restart.</p>
             <div class="form-group">
-              <label>Port (1–65535)</label>
+              <label data-i18n="settings.naivePortLabel">Port (1–65535)</label>
               <input type="number" id="s-naive-port" min="1" max="65535" value="443" />
             </div>
             <div class="alert alert-warning">
-              <strong>Note:</strong> Changing port will require clients to update their configs.
+              <strong>⚠</strong> <span data-i18n="settings.naivePortNote">Changing port will require clients to update their configs.</span>
             </div>
-            <button class="btn btn-primary mt-2" onclick="changeNaivePort()">Apply Naive Port</button>
+            <button class="btn btn-primary mt-2" onclick="changeNaivePort()" data-i18n="settings.applyNaivePort">Apply Naive Port</button>
             <div id="naive-port-msg" class="msg-inline hidden"></div>
           </div>
         </div>
 
-        <!-- Mieru ports -->
         <div class="card">
-          <div class="card-header">Mieru Port Range</div>
+          <div class="card-header" data-i18n="settings.mieruPortTitle">Mieru Port Range</div>
           <div class="card-body">
-            <p class="card-desc">Change the UDP/TCP port range for Mieru. <strong>Requires full Mieru restart.</strong></p>
+            <p class="card-desc" data-i18n="settings.mieruPortDesc">Change the UDP/TCP port range for Mieru. <strong>Requires full Mieru restart.</strong></p>
             <div class="form-row">
               <div class="form-group">
-                <label>Start Port (1025–65535)</label>
+                <label data-i18n="settings.mieruStartLabel">Start Port (1025–65535)</label>
                 <input type="number" id="s-mieru-start" min="1025" max="65535" value="2012" />
               </div>
               <div class="form-group">
-                <label>End Port (1025–65535)</label>
+                <label data-i18n="settings.mieruEndLabel">End Port (1025–65535)</label>
                 <input type="number" id="s-mieru-end" min="1025" max="65535" value="2022" />
               </div>
             </div>
             <div class="alert alert-warning">
-              <strong>Note:</strong> UFW rules will be updated automatically. Clients must download new configs.
+              <strong>⚠</strong> <span data-i18n="settings.mieruPortNote">UFW rules will be updated automatically. Clients must download new configs.</span>
             </div>
-            <button class="btn btn-primary mt-2" onclick="changeMieruPorts()">Apply Mieru Ports</button>
+            <button class="btn btn-primary mt-2" onclick="changeMieruPorts()" data-i18n="settings.applyMieruPorts">Apply Mieru Ports</button>
             <div id="mieru-port-msg" class="msg-inline hidden"></div>
           </div>
         </div>
 
-        <!-- Traffic pattern -->
         <div class="card">
-          <div class="card-header">Traffic Obfuscation</div>
+          <div class="card-header" data-i18n="settings.trafficTitle">Traffic Obfuscation</div>
           <div class="card-body">
-            <p class="card-desc">Configure Mieru traffic obfuscation pattern and MTU.</p>
+            <p class="card-desc" data-i18n="settings.trafficDesc">Configure Mieru traffic obfuscation pattern and MTU.</p>
             <div class="form-group">
-              <label>Traffic Pattern</label>
+              <label data-i18n="settings.trafficPatternLabel">Traffic Pattern</label>
               <div class="radio-group">
-                <label class="radio"><input type="radio" name="traffic-pattern" value="NOOP" checked /> <div><strong>Off</strong><small>No obfuscation</small></div></label>
-                <label class="radio"><input type="radio" name="traffic-pattern" value="RANDOM_PADDING" /> <div><strong>Light</strong><small>Random padding</small></div></label>
-                <label class="radio"><input type="radio" name="traffic-pattern" value="RANDOM_PADDING_AGGRESSIVE" /> <div><strong>Aggressive</strong><small>Heavy obfuscation</small></div></label>
+                <label class="radio">
+                  <input type="radio" name="traffic-pattern" value="NOOP" checked />
+                  <div><strong data-i18n="settings.patternOff">Off</strong><small data-i18n="settings.patternOffDesc">No obfuscation</small></div>
+                </label>
+                <label class="radio">
+                  <input type="radio" name="traffic-pattern" value="RANDOM_PADDING" />
+                  <div><strong data-i18n="settings.patternLight">Light</strong><small data-i18n="settings.patternLightDesc">Random padding</small></div>
+                </label>
+                <label class="radio">
+                  <input type="radio" name="traffic-pattern" value="RANDOM_PADDING_AGGRESSIVE" />
+                  <div><strong data-i18n="settings.patternAggressive">Aggressive</strong><small data-i18n="settings.patternAggressiveDesc">Heavy obfuscation</small></div>
+                </label>
               </div>
             </div>
             <div class="form-group">
-              <label>MTU (1280–1400)</label>
+              <label data-i18n="settings.mtuLabel">MTU (1280–1400)</label>
               <input type="number" id="s-mtu" min="1280" max="1400" value="1350" />
             </div>
-            <button class="btn btn-primary mt-2" onclick="changeTrafficPattern()">Apply Pattern</button>
+            <button class="btn btn-primary mt-2" onclick="changeTrafficPattern()" data-i18n="settings.applyPattern">Apply Pattern</button>
             <div id="traffic-msg" class="msg-inline hidden"></div>
           </div>
         </div>
 
-        <!-- Panel password -->
         <div class="card">
-          <div class="card-header">Panel Password</div>
+          <div class="card-header" data-i18n="settings.passwordTitle">Panel Password</div>
           <div class="card-body">
             <div class="form-group">
-              <label>Current Password</label>
+              <label data-i18n="settings.currentPassword">Current Password</label>
               <input type="password" id="s-cur-pass" placeholder="Current password" />
             </div>
             <div class="form-group">
-              <label>New Password</label>
+              <label data-i18n="settings.newPassword">New Password</label>
               <input type="password" id="s-new-pass" placeholder="New password (min 8 chars)" />
             </div>
             <div class="form-group">
-              <label>Confirm New Password</label>
+              <label data-i18n="settings.confirmPassword">Confirm New Password</label>
               <input type="password" id="s-new-pass2" placeholder="Repeat new password" />
             </div>
-            <button class="btn btn-primary" onclick="changePassword()">Change Password</button>
+            <button class="btn btn-primary" onclick="changePassword()" data-i18n="settings.changePassword">Change Password</button>
             <div id="pw-msg" class="msg-inline hidden"></div>
           </div>
         </div>
       </div>
 
-      <!-- About -->
       <div class="card mt-4">
-        <div class="card-header">About</div>
+        <div class="card-header" data-i18n="settings.aboutTitle">About</div>
         <div class="card-body about-grid">
           <div>
             <div class="info-list">
-              <div class="info-row"><span>Panel Version</span><span id="about-version">—</span></div>
-              <div class="info-row"><span>Author</span><span>RIXXX</span></div>
+              <div class="info-row"><span data-i18n="settings.panelVersion">Panel Version</span><span id="about-version">v1.0.0</span></div>
+              <div class="info-row"><span data-i18n="settings.author">Author</span><span>RIXXX</span></div>
               <div class="info-row"><span>GitHub</span><a href="https://github.com/cwash797-cmd" target="_blank">cwash797-cmd</a></div>
               <div class="info-row"><span>Telegram</span><a href="https://t.me/russian_paradice_vpn" target="_blank">@russian_paradice_vpn</a></div>
               <div class="info-row"><span>Donate</span><a href="https://app.lava.top/2107724612?tabId=donate" target="_blank">lava.top</a></div>
             </div>
           </div>
           <div>
-            <h5>Client Applications</h5>
+            <h5 data-i18n="settings.clientApps">Client Applications</h5>
             <div class="app-links">
-              <a href="https://apps.apple.com/app/sing-box/id6451272673"       target="_blank" class="app-link">📱 Sing-box (iOS)</a>
-              <a href="https://github.com/SagerNet/sing-box/releases"          target="_blank" class="app-link">🤖 Sing-box (Android)</a>
-              <a href="https://github.com/SagerNet/sing-box/releases"          target="_blank" class="app-link">🪟 Sing-box (Windows)</a>
-              <a href="https://github.com/SagerNet/sing-box/releases"          target="_blank" class="app-link">🐧 Sing-box (Linux)</a>
-              <a href="https://github.com/klzgrad/naiveproxy/releases"         target="_blank" class="app-link">🛡 NaiveProxy CLI</a>
+              <a href="https://github.com/KaringX/karing/releases"          target="_blank" class="app-link">📱 Karing (iOS / Android)</a>
+              <a href="https://github.com/KaringX/karing/releases"          target="_blank" class="app-link">🪟 Karing (Windows / macOS / Linux)</a>
+              <a href="https://apps.apple.com/app/shadowrocket/id932747118" target="_blank" class="app-link">📱 ShadowRocket (iOS — Naive)</a>
+              <a href="https://apps.apple.com/app/sing-box/id6451272673"    target="_blank" class="app-link">📱 Sing-box (iOS)</a>
+              <a href="https://github.com/SagerNet/sing-box/releases"       target="_blank" class="app-link">🤖 Sing-box (Android / Windows / Linux)</a>
+              <a href="https://github.com/klzgrad/naiveproxy/releases"      target="_blank" class="app-link">🛡 NaiveProxy CLI</a>
             </div>
           </div>
         </div>
@@ -454,41 +504,39 @@
     <!-- ── MONITORING ────────────────────────────────────────── -->
     <section id="page-monitoring" class="content-page">
       <div class="page-header">
-        <h3>Monitoring</h3>
+        <h3 data-i18n="monitoring.title">Monitoring</h3>
         <button class="btn btn-ghost btn-sm" onclick="refreshStats()">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-          Refresh
+          <span data-i18n="monitoring.refresh">Refresh</span>
         </button>
       </div>
 
-      <!-- Live metrics strip -->
       <div class="metrics-strip" id="live-metrics">
-        <div class="metric-chip"><span class="metric-label">CPU</span><span class="metric-val" id="m-cpu">—%</span></div>
-        <div class="metric-chip"><span class="metric-label">RAM</span><span class="metric-val" id="m-ram">—</span></div>
-        <div class="metric-chip"><span class="metric-label">NaiveProxy</span><span class="metric-val" id="m-naive">—</span></div>
-        <div class="metric-chip"><span class="metric-label">Mieru</span><span class="metric-val" id="m-mieru">—</span></div>
-        <div class="metric-chip"><span class="metric-label">Uptime</span><span class="metric-val" id="m-uptime">—</span></div>
+        <div class="metric-chip"><span class="metric-label" data-i18n="monitoring.cpu">CPU</span><span class="metric-val" id="m-cpu">—%</span></div>
+        <div class="metric-chip"><span class="metric-label" data-i18n="monitoring.ram">RAM</span><span class="metric-val" id="m-ram">—</span></div>
+        <div class="metric-chip"><span class="metric-label" data-i18n="monitoring.naiveProxy">NaiveProxy</span><span class="metric-val" id="m-naive">—</span></div>
+        <div class="metric-chip"><span class="metric-label" data-i18n="monitoring.mieru">Mieru</span><span class="metric-val" id="m-mieru">—</span></div>
+        <div class="metric-chip"><span class="metric-label" data-i18n="monitoring.uptime">Uptime</span><span class="metric-val" id="m-uptime">—</span></div>
       </div>
 
-      <!-- User traffic table -->
       <div class="card mt-4">
-        <div class="card-header">User Traffic & Quota</div>
+        <div class="card-header" data-i18n="monitoring.trafficTitle">User Traffic &amp; Quota</div>
         <div class="table-wrap">
           <table class="data-table" id="traffic-table">
             <thead>
               <tr>
-                <th>Username</th>
-                <th>Upload (MB)</th>
-                <th>Download (MB)</th>
-                <th>Total Used (MB)</th>
-                <th>Quota (MB)</th>
-                <th>Quota Used</th>
-                <th>Expiry</th>
-                <th>Last Active</th>
+                <th data-i18n="monitoring.username">Username</th>
+                <th data-i18n="monitoring.upload">Upload (MB)</th>
+                <th data-i18n="monitoring.download">Download (MB)</th>
+                <th data-i18n="monitoring.totalUsed">Total Used (MB)</th>
+                <th data-i18n="monitoring.quota">Quota (MB)</th>
+                <th data-i18n="monitoring.quotaUsed">Quota Used</th>
+                <th data-i18n="monitoring.expiry">Expiry</th>
+                <th data-i18n="monitoring.lastActive">Last Active</th>
               </tr>
             </thead>
             <tbody id="traffic-tbody">
-              <tr><td colspan="8" class="table-empty">Loading…</td></tr>
+              <tr><td colspan="8" class="table-empty" data-i18n="users.loading">Loading…</td></tr>
             </tbody>
           </table>
         </div>
@@ -498,57 +546,57 @@
     <!-- ── LOGS ──────────────────────────────────────────────── -->
     <section id="page-logs" class="content-page">
       <div class="page-header">
-        <h3>Logs</h3>
+        <h3 data-i18n="logs.title">Logs</h3>
         <div class="btn-group">
-          <button class="btn btn-ghost btn-sm active" onclick="loadLogs('caddy')" id="log-btn-caddy">Caddy</button>
-          <button class="btn btn-ghost btn-sm" onclick="loadLogs('mieru')" id="log-btn-mieru">Mieru</button>
-          <button class="btn btn-ghost btn-sm" onclick="loadLogs('panel')" id="log-btn-panel">Panel</button>
+          <button class="btn btn-ghost btn-sm active" onclick="loadLogs('caddy')" id="log-btn-caddy" data-i18n="logs.caddy">Caddy</button>
+          <button class="btn btn-ghost btn-sm" onclick="loadLogs('mieru')" id="log-btn-mieru" data-i18n="logs.mieru">Mieru</button>
+          <button class="btn btn-ghost btn-sm" onclick="loadLogs('panel')" id="log-btn-panel" data-i18n="logs.panel">Panel</button>
         </div>
       </div>
       <div class="card">
         <div class="log-toolbar">
           <select id="log-lines" onchange="loadLogs(currentLogService)">
-            <option value="50">50 lines</option>
-            <option value="100" selected>100 lines</option>
-            <option value="200">200 lines</option>
-            <option value="500">500 lines</option>
+            <option value="50" data-i18n="logs.lines50">50 lines</option>
+            <option value="100" selected data-i18n="logs.lines100">100 lines</option>
+            <option value="200" data-i18n="logs.lines200">200 lines</option>
+            <option value="500" data-i18n="logs.lines500">500 lines</option>
           </select>
           <button class="btn btn-ghost btn-sm" onclick="loadLogs(currentLogService)">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
-            Refresh
+            <span data-i18n="logs.refresh">Refresh</span>
           </button>
         </div>
-        <pre class="log-viewer" id="log-content">Select a log above…</pre>
+        <pre class="log-viewer" id="log-content" data-i18n="logs.selectLog">Select a log above…</pre>
       </div>
     </section>
 
     <!-- ── DIAGNOSTICS ───────────────────────────────────────── -->
     <section id="page-diagnostics" class="content-page">
       <div class="page-header">
-        <h3>Diagnostics</h3>
-        <button class="btn btn-primary btn-sm" onclick="runDiagnostics()">Run Checks</button>
+        <h3 data-i18n="diagnostics.title">Diagnostics</h3>
+        <button class="btn btn-primary btn-sm" onclick="runDiagnostics()" data-i18n="diagnostics.runChecks">Run Checks</button>
       </div>
       <div class="grid grid-2">
         <div class="card">
-          <div class="card-header">Port Status</div>
+          <div class="card-header" data-i18n="diagnostics.portStatus">Port Status</div>
           <div class="card-body" id="diag-ports">
-            <p class="text-muted">Click "Run Checks" to begin.</p>
+            <p class="text-muted" data-i18n="diagnostics.clickToRun">Click "Run Checks" to begin.</p>
           </div>
         </div>
         <div class="card">
-          <div class="card-header">Config Validation</div>
+          <div class="card-header" data-i18n="diagnostics.configValidation">Config Validation</div>
           <div class="card-body" id="diag-config">
             <p class="text-muted">—</p>
           </div>
         </div>
         <div class="card">
-          <div class="card-header">Mita Status</div>
+          <div class="card-header" data-i18n="diagnostics.mitaStatus">Mita Status</div>
           <div class="card-body">
             <pre class="mini-log" id="diag-mita-status">—</pre>
           </div>
         </div>
         <div class="card">
-          <div class="card-header">Mita Config (describe)</div>
+          <div class="card-header" data-i18n="diagnostics.mitaConfig">Mita Config (describe)</div>
           <div class="card-body">
             <pre class="mini-log" id="diag-mita-config">—</pre>
           </div>
