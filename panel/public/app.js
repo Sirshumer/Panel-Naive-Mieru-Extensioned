@@ -1,10 +1,141 @@
 /**
- * Panel Naive + Mieru — Frontend Application
- * Single-page app: login, dashboard, users, settings, monitoring, logs, diagnostics
+ * Panel Naive + Mieru — Frontend Application v1.1.0
+ * Features: i18n (ru/en), dark/light theme, QR codes, all 6 sprints
  */
 'use strict';
 
-// ── State ─────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// I18N SYSTEM
+// ══════════════════════════════════════════════════════════════
+
+const SUPPORTED_LANGS = ['ru', 'en'];
+let locale = {};
+
+async function loadLocale(lang) {
+  try {
+    const res = await fetch(`/locales/${lang}.json`);
+    if (!res.ok) throw new Error('locale not found');
+    locale = await res.json();
+  } catch {
+    locale = {};
+  }
+}
+
+function t(key, vars) {
+  const parts = key.split('.');
+  let val = locale;
+  for (const p of parts) {
+    val = val?.[p];
+    if (val === undefined) return key;
+  }
+  if (typeof val !== 'string') return key;
+  if (vars) {
+    Object.entries(vars).forEach(([k, v]) => {
+      val = val.replace(new RegExp(`\\{\\{${k}\\}\\}`, 'g'), v);
+    });
+  }
+  return val;
+}
+
+function applyI18n() {
+  // Text content
+  document.querySelectorAll('[data-i18n]').forEach(el => {
+    const key = el.getAttribute('data-i18n');
+    const translated = t(key);
+    if (translated !== key) el.textContent = translated;
+  });
+  // Placeholder attributes
+  document.querySelectorAll('[data-i18n-ph]').forEach(el => {
+    const key = el.getAttribute('data-i18n-ph');
+    const translated = t(key);
+    if (translated !== key) el.placeholder = translated;
+  });
+  // HTML lang attribute
+  document.documentElement.lang = currentLang;
+  // Update lang button labels
+  const label = currentLang.toUpperCase();
+  ['login-lang-btn', 'topbar-lang-btn'].forEach(id => {
+    const btn = document.getElementById(id);
+    if (btn) btn.textContent = label;
+  });
+}
+
+// ══════════════════════════════════════════════════════════════
+// THEME SYSTEM
+// ══════════════════════════════════════════════════════════════
+
+const MOON_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+  <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"/>
+</svg>`;
+const SUN_SVG = `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+  <circle cx="12" cy="12" r="5"/>
+  <line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
+  <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
+  <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
+  <line x1="4.22" y1="19.78" x2="5.64" y2="18.36"/><line x1="18.36" y1="5.64" x2="19.78" y2="4.22"/>
+</svg>`;
+
+let currentTheme = 'dark';
+
+function applyTheme(theme) {
+  currentTheme = theme;
+  document.documentElement.setAttribute('data-theme', theme);
+  // Update all theme toggle icons (dark mode shows sun to switch to light, light shows moon)
+  const isDark = theme === 'dark';
+  const iconHtml = isDark ? SUN_SVG : MOON_SVG;
+  ['login-theme-btn', 'topbar-theme-btn'].forEach(id => {
+    const btn = document.getElementById(id);
+    if (btn) btn.innerHTML = iconHtml;
+  });
+  localStorage.setItem('rixxx-theme', theme);
+}
+
+function toggleTheme() {
+  applyTheme(currentTheme === 'dark' ? 'light' : 'dark');
+}
+
+// ══════════════════════════════════════════════════════════════
+// LANGUAGE SWITCHING
+// ══════════════════════════════════════════════════════════════
+
+let currentLang = 'ru';
+
+async function setLang(lang) {
+  if (!SUPPORTED_LANGS.includes(lang)) lang = 'ru';
+  currentLang = lang;
+  await loadLocale(lang);
+  applyI18n();
+  // Refresh page titles & dynamic content
+  if (state.authenticated) {
+    const titles = buildTitles();
+    const titleEl = document.getElementById('topbar-title');
+    if (titleEl) titleEl.textContent = titles[state.currentPage] || state.currentPage;
+    navigateTo(state.currentPage);
+  }
+  localStorage.setItem('rixxx-lang', lang);
+}
+
+async function cycleLang() {
+  const idx = SUPPORTED_LANGS.indexOf(currentLang);
+  const next = SUPPORTED_LANGS[(idx + 1) % SUPPORTED_LANGS.length];
+  await setLang(next);
+}
+
+function buildTitles() {
+  return {
+    dashboard:   t('nav.dashboard'),
+    users:       t('nav.users'),
+    settings:    t('nav.settings'),
+    monitoring:  t('nav.monitoring'),
+    logs:        t('nav.logs'),
+    diagnostics: t('nav.diagnostics'),
+  };
+}
+
+// ══════════════════════════════════════════════════════════════
+// APP STATE
+// ══════════════════════════════════════════════════════════════
+
 const state = {
   authenticated: false,
   username: '',
@@ -18,8 +149,18 @@ const state = {
 
 let currentLogService = 'caddy';
 
-// ── Init ──────────────────────────────────────────────────────
-document.addEventListener('DOMContentLoaded', () => {
+// ══════════════════════════════════════════════════════════════
+// INIT
+// ══════════════════════════════════════════════════════════════
+
+document.addEventListener('DOMContentLoaded', async () => {
+  // Restore persisted preferences FIRST
+  const savedTheme = localStorage.getItem('rixxx-theme') || 'dark';
+  const savedLang  = localStorage.getItem('rixxx-lang')  || 'ru';
+
+  applyTheme(savedTheme);
+  await setLang(savedLang);
+
   // Check existing session
   fetch('/api/me')
     .then(r => r.ok ? r.json() : null)
@@ -44,7 +185,10 @@ document.addEventListener('DOMContentLoaded', () => {
   });
 });
 
-// ── Login ─────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// LOGIN
+// ══════════════════════════════════════════════════════════════
+
 async function handleLogin(e) {
   e.preventDefault();
   const btn = document.getElementById('login-btn');
@@ -53,7 +197,7 @@ async function handleLogin(e) {
   const password = document.getElementById('login-pass').value;
 
   btn.disabled = true;
-  btn.innerHTML = '<span>Signing in…</span>';
+  btn.innerHTML = `<span>${t('login.signingIn')}</span>`;
   err.classList.add('hidden');
 
   try {
@@ -62,11 +206,11 @@ async function handleLogin(e) {
     state.username = res.username;
     enterApp();
   } catch (ex) {
-    err.textContent = ex.message || 'Invalid credentials';
+    err.textContent = ex.message || t('login.invalidCreds');
     err.classList.remove('hidden');
   } finally {
     btn.disabled = false;
-    btn.innerHTML = '<span>Sign In</span>';
+    btn.innerHTML = `<span>${t('login.signIn')}</span>`;
   }
 }
 
@@ -74,7 +218,6 @@ function enterApp() {
   document.getElementById('page-login').classList.remove('active');
   document.getElementById('app').classList.remove('hidden');
 
-  // Set sidebar username
   const uname = state.username || 'admin';
   document.getElementById('sidebar-uname').textContent = uname;
   document.getElementById('sidebar-avatar').textContent = uname[0].toUpperCase();
@@ -94,39 +237,32 @@ async function logout() {
   document.getElementById('login-pass').value = '';
 }
 
-// ── Navigation ────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// NAVIGATION
+// ══════════════════════════════════════════════════════════════
+
 function navigateTo(page) {
   state.currentPage = page;
 
   document.querySelectorAll('.nav-item').forEach(el => {
     el.classList.toggle('active', el.dataset.page === page);
   });
-
   document.querySelectorAll('.content-page').forEach(el => {
     el.classList.toggle('active', el.id === `page-${page}`);
   });
 
-  const titles = {
-    dashboard: 'Dashboard',
-    users: 'Users',
-    settings: 'Server Settings',
-    monitoring: 'Monitoring',
-    logs: 'Logs',
-    diagnostics: 'Diagnostics',
-  };
+  const titles = buildTitles();
   document.getElementById('topbar-title').textContent = titles[page] || page;
 
-  // Load page data
   switch (page) {
-    case 'dashboard':  loadDashboard();  break;
-    case 'users':      loadUsers();      break;
-    case 'settings':   loadSettings();   break;
-    case 'monitoring': loadMonitoring(); break;
-    case 'logs':       loadLogs('caddy'); break;
+    case 'dashboard':   loadDashboard();   break;
+    case 'users':       loadUsers();       break;
+    case 'settings':    loadSettings();    break;
+    case 'monitoring':  loadMonitoring();  break;
+    case 'logs':        loadLogs('caddy'); break;
     case 'diagnostics': break;
   }
 
-  // Close sidebar on mobile
   if (window.innerWidth <= 768) {
     document.getElementById('sidebar').classList.remove('open');
   }
@@ -136,7 +272,10 @@ function toggleSidebar() {
   document.getElementById('sidebar').classList.toggle('open');
 }
 
-// ── Config ────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// CONFIG
+// ══════════════════════════════════════════════════════════════
+
 async function loadConfig() {
   try {
     state.config = await api('GET', '/api/config');
@@ -144,70 +283,73 @@ async function loadConfig() {
   } catch {}
 }
 
-// ── Dashboard ─────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// DASHBOARD
+// ══════════════════════════════════════════════════════════════
+
 async function loadDashboard() {
   try {
     const status = await api('GET', '/api/status');
-    state.config = { ...state.config, ...{ domain: status.domain, serverIp: status.serverIp } };
+    state.config = { ...state.config, domain: status.domain, serverIp: status.serverIp };
 
-    // Service status badges
-    el('d-naive-status').innerHTML = badge(status.services.naive.active, 'Active', 'Inactive');
-    el('d-mieru-status').innerHTML = badge(status.services.mieru.active, 'Active', 'Inactive');
-    el('d-user-count').textContent  = status.panel.userCount;
-    el('d-domain').textContent       = status.domain || '—';
+    el('d-naive-status').innerHTML = badge(status.services.naive.active,
+      t('dashboard.active'), t('dashboard.inactive'));
+    el('d-mieru-status').innerHTML = badge(status.services.mieru.active,
+      t('dashboard.active'), t('dashboard.inactive'));
+    el('d-user-count').textContent = status.panel.userCount;
+    el('d-domain').textContent      = status.domain || '—';
 
-    // CPU
     const cpu = status.system.cpuPercent || 0;
-    el('d-cpu').textContent  = `${cpu}%`;
+    el('d-cpu').textContent = `${cpu}%`;
     setProgress('d-cpu-bar', cpu);
 
-    // RAM
     const ramPct = status.system.ramTotalMB
       ? Math.round((status.system.ramUsedMB / status.system.ramTotalMB) * 100) : 0;
     el('d-ram').textContent = `${fmtMB(status.system.ramUsedMB)} / ${fmtMB(status.system.ramTotalMB)}`;
     setProgress('d-ram-bar', ramPct);
 
-    // Disk
     const diskPct = status.system.diskTotalGB
       ? Math.round((status.system.diskUsedGB / status.system.diskTotalGB) * 100) : 0;
     el('d-disk').textContent = `${status.system.diskUsedGB} GB / ${status.system.diskTotalGB} GB`;
     setProgress('d-disk-bar', diskPct);
 
-    // Sysinfo
     el('d-sysinfo').innerHTML = infoList([
-      ['Domain',        status.domain],
-      ['Server IP',     status.serverIp],
-      ['OS',            status.system.os],
-      ['Architecture',  status.system.arch],
-      ['Uptime',        fmtUptime(status.system.uptime)],
-      ['Naive Port',    state.config.naivePort],
-      ['Mieru Ports',   `${state.config.mieruPortStart}–${state.config.mieruPortEnd}`],
-      ['Naive Version', status.services.naive.version || '—'],
-      ['Mieru Version', status.services.mieru.version || '—'],
+      [t('dashboard.domain'),       status.domain],
+      [t('dashboard.serverIp'),     status.serverIp],
+      [t('dashboard.os'),           status.system.os],
+      [t('dashboard.architecture'), status.system.arch],
+      [t('dashboard.uptime'),       fmtUptime(status.system.uptime)],
+      [t('dashboard.naivePort'),    state.config.naivePort],
+      [t('dashboard.mieruPorts'),   `${state.config.mieruPortStart}–${state.config.mieruPortEnd}`],
+      [t('dashboard.naiveVersion'), status.services.naive.version || '—'],
+      [t('dashboard.mieruVersion'), status.services.mieru.version || '—'],
     ]);
 
-    document.getElementById('about-version').textContent = status.panel.version || '1.0.0';
+    document.getElementById('about-version').textContent = `v${status.panel.version || '1.0.0'}`;
   } catch (err) {
     console.error('Dashboard error:', err);
   }
 }
 
-// ── Users ─────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// USERS
+// ══════════════════════════════════════════════════════════════
+
 async function loadUsers() {
   const tbody = el('users-tbody');
-  tbody.innerHTML = '<tr><td colspan="9" class="table-empty">Loading…</td></tr>';
+  tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${t('users.loading')}</td></tr>`;
   try {
     state.users = await api('GET', '/api/users');
     renderUsersTable(state.users);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="9" class="table-empty" style="color:var(--red)">${err.message}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="10" class="table-empty" style="color:var(--red)">${esc(err.message)}</td></tr>`;
   }
 }
 
 function renderUsersTable(users) {
   const tbody = el('users-tbody');
   if (!users.length) {
-    tbody.innerHTML = '<tr><td colspan="9" class="table-empty">No users yet. Click "Add User" to create one.</td></tr>';
+    tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${t('users.noUsers')}</td></tr>`;
     return;
   }
   tbody.innerHTML = users.map(u => {
@@ -216,14 +358,14 @@ function renderUsersTable(users) {
     const hasMieru  = protocols.includes('mieru');
     const expBadge  = u.expiry
       ? (new Date(u.expiry) < new Date()
-          ? `<span class="badge badge-red">Expired</span>`
+          ? `<span class="badge badge-red">${t('users.expired')}</span>`
           : `<span class="badge badge-yellow">${fmtDate(u.expiry)}</span>`)
-      : `<span class="badge badge-gray">Never</span>`;
+      : `<span class="badge badge-gray">${t('users.never')}</span>`;
 
     const quotaPct = u.quotaMB > 0 ? Math.min(100, Math.round((u.usedMB / u.quotaMB) * 100)) : 0;
     const quotaStr = u.quotaMB > 0
       ? `<div class="quota-bar"><div class="quota-fill${quotaPct>80?' warn':''}" style="width:${quotaPct}%"></div></div> ${quotaPct}%`
-      : '<span class="badge badge-gray">Unlimited</span>';
+      : `<span class="badge badge-gray">${t('users.unlimited')}</span>`;
 
     return `<tr>
       <td><strong>${esc(u.username)}</strong></td>
@@ -234,39 +376,30 @@ function renderUsersTable(users) {
       <td>${fmtNum(u.usedMB)}</td>
       <td>${u.quotaMB > 0 ? fmtNum(u.quotaMB) : '∞'}</td>
       <td>${quotaStr}</td>
-      <td class="table-empty">${fmtDate(u.lastSeen)}</td>
+      <td>${fmtDate(u.lastSeen)}</td>
       <td>
         <div style="display:flex;gap:4px;flex-wrap:wrap">
-          <button class="btn btn-xs btn-secondary" onclick="openEditUser('${u.id}')">Edit</button>
-          <button class="btn btn-xs btn-ghost" onclick="openConfigDownload('${u.id}')">Config</button>
-          <button class="btn btn-xs btn-danger" onclick="deleteUser('${u.id}','${esc(u.username)}')">Del</button>
+          <button class="btn btn-xs btn-secondary" onclick="openEditUser('${u.id}')">${t('users.edit')}</button>
+          <button class="btn btn-xs btn-ghost"     onclick="openConfigDownload('${u.id}')">${t('users.config')}</button>
+          <button class="btn btn-xs btn-danger"    onclick="deleteUser('${u.id}','${esc(u.username)}')">${t('users.delete')}</button>
         </div>
       </td>
     </tr>`;
   }).join('');
-
-  // Fix last-active column index — rebuild properly
-  tbody.querySelectorAll('tr').forEach((tr, i) => {
-    const tds = tr.querySelectorAll('td');
-    if (tds.length >= 9 && tds[8]) {
-      tds[8].textContent = fmtDate(users[i]?.lastSeen);
-      tds[8].classList.remove('table-empty');
-    }
-  });
 }
 
 function openAddUser() {
   state.selectedUserId = null;
-  el('user-modal-title').textContent = 'Add User';
-  el('user-id').value = '';
-  el('u-username').value = '';
-  el('u-email').value = '';
-  el('u-password').value = '';
-  el('u-expiry').value = '';
-  el('u-quota').value = '0';
-  el('p-naive').checked = true;
-  el('p-mieru').checked = true;
-  el('u-pass-hint').textContent = 'Required for new user';
+  el('user-modal-title').textContent = t('users.addTitle');
+  el('user-id').value      = '';
+  el('u-username').value   = '';
+  el('u-email').value      = '';
+  el('u-password').value   = '';
+  el('u-expiry').value     = '';
+  el('u-quota').value      = '0';
+  el('p-naive').checked    = true;
+  el('p-mieru').checked    = true;
+  el('u-pass-hint').textContent = t('users.passwordHintNew');
   el('user-modal-error').classList.add('hidden');
   el('user-modal').classList.remove('hidden');
 }
@@ -277,26 +410,24 @@ function openEditUser(id) {
   state.selectedUserId = id;
   const protocols = Array.isArray(user.protocols) ? user.protocols : JSON.parse(user.protocols || '[]');
 
-  el('user-modal-title').textContent = 'Edit User';
-  el('user-id').value = id;
+  el('user-modal-title').textContent = t('users.editTitle');
+  el('user-id').value    = id;
   el('u-username').value = user.username;
-  el('u-email').value = user.email;
+  el('u-email').value    = user.email;
   el('u-password').value = '';
-  el('u-expiry').value = user.expiry ? user.expiry.slice(0, 16) : '';
-  el('u-quota').value = user.quotaMB || 0;
-  el('p-naive').checked = protocols.includes('naive');
-  el('p-mieru').checked = protocols.includes('mieru');
-  el('u-pass-hint').textContent = 'Leave blank to keep current password';
+  el('u-expiry').value   = user.expiry ? user.expiry.slice(0, 16) : '';
+  el('u-quota').value    = user.quotaMB || 0;
+  el('p-naive').checked  = protocols.includes('naive');
+  el('p-mieru').checked  = protocols.includes('mieru');
+  el('u-pass-hint').textContent = t('users.passwordHintEdit');
   el('user-modal-error').classList.add('hidden');
   el('user-modal').classList.remove('hidden');
 }
 
-function closeUserModal() {
-  el('user-modal').classList.add('hidden');
-}
+function closeUserModal() { el('user-modal').classList.add('hidden'); }
 
 async function saveUser() {
-  const id = el('user-id').value;
+  const id       = el('user-id').value;
   const username = el('u-username').value.trim();
   const email    = el('u-email').value.trim();
   const password = el('u-password').value;
@@ -306,10 +437,10 @@ async function saveUser() {
   if (el('p-naive').checked) protocols.push('naive');
   if (el('p-mieru').checked) protocols.push('mieru');
 
-  if (!username || !email) return showUserError('Username and email are required');
-  if (!id && !password)    return showUserError('Password is required for new users');
-  if (password && password.length < 8) return showUserError('Password must be at least 8 characters');
-  if (!protocols.length)   return showUserError('Select at least one protocol');
+  if (!username || !email) return showUserError(t('users.usernameRequired'));
+  if (!id && !password)    return showUserError(t('users.passwordRequired'));
+  if (password && password.length < 8) return showUserError(t('users.passwordTooShort'));
+  if (!protocols.length)   return showUserError(t('users.protocolRequired'));
 
   const body = { email, username, expiry, protocols, quotaMB };
   if (password) body.password = password;
@@ -317,10 +448,10 @@ async function saveUser() {
   try {
     if (id) {
       await api('PUT', `/api/users/${id}`, body);
-      toast('User updated successfully', 'success');
+      toast(t('users.updated'), 'success');
     } else {
       await api('POST', '/api/users', body);
-      toast('User created successfully', 'success');
+      toast(t('users.created'), 'success');
     }
     closeUserModal();
     loadUsers();
@@ -336,82 +467,117 @@ function showUserError(msg) {
 }
 
 async function deleteUser(id, username) {
-  if (!confirm(`Delete user "${username}"? This will remove their access immediately.`)) return;
+  if (!confirm(t('users.deleteConfirm', { name: username }))) return;
   try {
     await api('DELETE', `/api/users/${id}`);
-    toast(`User ${username} deleted`, 'success');
+    toast(t('users.deleted', { name: username }), 'success');
     loadUsers();
   } catch (err) {
     toast(err.message, 'error');
   }
 }
 
-// ── Config downloads ──────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// CLIENT CONFIGS + QR CODE
+// ══════════════════════════════════════════════════════════════
+
 function openConfigDownload(id) {
   state.selectedUserId = id;
   el('cfg-password').value = '';
   el('naive-link-box').classList.add('hidden');
   el('naive-link-box').textContent = '';
+  el('qr-container').classList.add('hidden');
   el('config-modal').classList.remove('hidden');
 }
 
-function closeConfigModal() {
-  el('config-modal').classList.add('hidden');
-}
+function closeConfigModal() { el('config-modal').classList.add('hidden'); }
 
 async function downloadNaiveLink() {
   const password = el('cfg-password').value;
-  if (!password) { toast('Enter the user password first', 'error'); return; }
+  if (!password) { toast(t('config.enterPassword'), 'error'); return; }
   try {
-    const data = await api('GET', `/api/users/${state.selectedUserId}/naive-link?password=${encodeURIComponent(password)}`);
+    const data = await api('GET',
+      `/api/users/${state.selectedUserId}/naive-link?password=${encodeURIComponent(password)}`);
+
     el('naive-link-box').textContent = data.link;
     el('naive-link-box').classList.remove('hidden');
     copyToClipboard(data.link);
-    toast('Naive link copied to clipboard', 'success');
+    toast(t('config.naiveCopied'), 'success');
+
+    // Generate QR code for the Naive link
+    generateQR(data.link);
   } catch (err) { toast(err.message, 'error'); }
+}
+
+async function generateQR(text) {
+  const container = el('qr-container');
+  const canvas    = el('qr-canvas');
+  if (!container || !canvas) return;
+
+  // Try QRCode library (loaded from CDN in index.html)
+  if (typeof QRCode !== 'undefined') {
+    try {
+      await QRCode.toCanvas(canvas, text, {
+        width: 200,
+        margin: 2,
+        color: {
+          dark:  currentTheme === 'dark' ? '#e4e4e7' : '#18181b',
+          light: currentTheme === 'dark' ? '#1a1a1d' : '#f5f5f7',
+        }
+      });
+      container.classList.remove('hidden');
+    } catch (err) {
+      console.warn('QR generation failed:', err);
+    }
+  }
 }
 
 async function downloadMieruConfig() {
   const password = el('cfg-password').value;
-  if (!password) { toast('Enter the user password first', 'error'); return; }
+  if (!password) { toast(t('config.enterPassword'), 'error'); return; }
   try {
-    const res = await fetch(`/api/users/${state.selectedUserId}/mieru-config?password=${encodeURIComponent(password)}`);
+    const res = await fetch(
+      `/api/users/${state.selectedUserId}/mieru-config?password=${encodeURIComponent(password)}`);
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
-    const cd = res.headers.get('Content-Disposition') || '';
-    const fn = cd.match(/filename="(.+)"/)?.[1] || 'mieru-config.json';
+    const cd   = res.headers.get('Content-Disposition') || '';
+    const fn   = cd.match(/filename="(.+)"/)?.[1] || 'mieru-config.json';
     downloadBlob(blob, fn);
-    toast('Mieru config downloaded', 'success');
+    toast(t('config.mieruDownloaded'), 'success');
   } catch (err) { toast(err.message, 'error'); }
 }
 
 async function downloadUniversalConfig() {
   const password = el('cfg-password').value;
-  if (!password) { toast('Enter the user password first', 'error'); return; }
+  if (!password) { toast(t('config.enterPassword'), 'error'); return; }
   try {
-    const res = await fetch(`/api/users/${state.selectedUserId}/universal-config?password=${encodeURIComponent(password)}`);
+    const res = await fetch(
+      `/api/users/${state.selectedUserId}/universal-config?password=${encodeURIComponent(password)}`);
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
-    const cd = res.headers.get('Content-Disposition') || '';
-    const fn = cd.match(/filename="(.+)"/)?.[1] || 'universal-config.json';
+    const cd   = res.headers.get('Content-Disposition') || '';
+    const fn   = cd.match(/filename="(.+)"/)?.[1] || 'universal-config.json';
     downloadBlob(blob, fn);
-    toast('Universal config downloaded', 'success');
+    toast(t('config.universalDownloaded'), 'success');
   } catch (err) { toast(err.message, 'error'); }
 }
 
-// ── Server Settings ───────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// SERVER SETTINGS
+// ══════════════════════════════════════════════════════════════
+
 async function loadSettings() {
   try {
     const cfg = await api('GET', '/api/config');
     state.config = cfg;
-    el('s-naive-port').value  = cfg.naivePort   || 443;
+    el('s-naive-port').value  = cfg.naivePort    || 443;
     el('s-mieru-start').value = cfg.mieruPortStart || 2012;
     el('s-mieru-end').value   = cfg.mieruPortEnd   || 2022;
     el('s-mtu').value         = cfg.mtu || 1350;
     const pattern = cfg.trafficPattern || 'NOOP';
     const radio = document.querySelector(`input[name="traffic-pattern"][value="${pattern}"]`);
     if (radio) radio.checked = true;
-    document.getElementById('about-version').textContent = cfg.version || '1.0.0';
+    document.getElementById('about-version').textContent = `v${cfg.version || '1.0.0'}`;
   } catch {}
 }
 
@@ -421,7 +587,7 @@ async function changeNaivePort() {
     const res = await api('POST', '/api/settings/naive-port', { port });
     showMsg('naive-port-msg', res.message || 'Port updated', true);
     state.config.naivePort = port;
-    toast('NaiveProxy port updated — clients need new configs', 'info');
+    toast(t('toast.naivePortUpdated'), 'info');
   } catch (err) {
     showMsg('naive-port-msg', err.message, false);
   }
@@ -430,11 +596,11 @@ async function changeNaivePort() {
 async function changeMieruPorts() {
   const portStart = parseInt(el('s-mieru-start').value, 10);
   const portEnd   = parseInt(el('s-mieru-end').value, 10);
-  if (!confirm('Changing Mieru ports will restart the Mieru service. Continue?')) return;
+  if (!confirm(t('settings.mieruPortConfirm'))) return;
   try {
     const res = await api('POST', '/api/settings/mieru-ports', { portStart, portEnd });
     showMsg('mieru-port-msg', res.message || 'Ports updated', true);
-    toast('Mieru ports updated — service restarted, clients need new configs', 'info');
+    toast(t('toast.mieruPortsUpdated'), 'info');
   } catch (err) {
     showMsg('mieru-port-msg', err.message, false);
   }
@@ -445,36 +611,37 @@ async function changeTrafficPattern() {
   const mtu = parseInt(el('s-mtu').value, 10);
   try {
     const res = await api('POST', '/api/settings/traffic-pattern', { pattern, mtu });
-    showMsg('traffic-msg', `Pattern: ${res.pattern}, MTU: ${res.mtu}`, true);
-    toast('Traffic pattern updated', 'success');
+    showMsg('traffic-msg', `${t('settings.trafficPatternLabel')}: ${res.pattern}, MTU: ${res.mtu}`, true);
+    toast(t('toast.trafficPatternUpdated'), 'success');
   } catch (err) {
     showMsg('traffic-msg', err.message, false);
   }
 }
 
 async function changePassword() {
-  const current = el('s-cur-pass').value;
+  const current  = el('s-cur-pass').value;
   const newPass  = el('s-new-pass').value;
   const confirm2 = el('s-new-pass2').value;
-  if (!current || !newPass) return showMsg('pw-msg', 'All fields required', false);
-  if (newPass !== confirm2)  return showMsg('pw-msg', 'Passwords do not match', false);
-  if (newPass.length < 8)   return showMsg('pw-msg', 'New password must be at least 8 characters', false);
+  if (!current || !newPass) return showMsg('pw-msg', t('settings.allFieldsRequired'), false);
+  if (newPass !== confirm2)  return showMsg('pw-msg', t('settings.passwordMismatch'),  false);
+  if (newPass.length < 8)   return showMsg('pw-msg', t('settings.passwordTooShort'),  false);
   try {
     await api('POST', '/api/config/password', { current, newPass });
-    showMsg('pw-msg', 'Password changed successfully', true);
-    el('s-cur-pass').value = '';
-    el('s-new-pass').value = '';
+    showMsg('pw-msg', t('settings.passwordChanged'), true);
+    el('s-cur-pass').value  = '';
+    el('s-new-pass').value  = '';
     el('s-new-pass2').value = '';
-    toast('Password changed', 'success');
+    toast(t('settings.passwordChanged'), 'success');
   } catch (err) {
     showMsg('pw-msg', err.message, false);
   }
 }
 
-// ── Monitoring ────────────────────────────────────────────────
-async function loadMonitoring() {
-  refreshStats();
-}
+// ══════════════════════════════════════════════════════════════
+// MONITORING
+// ══════════════════════════════════════════════════════════════
+
+async function loadMonitoring() { refreshStats(); }
 
 async function refreshStats() {
   try {
@@ -483,11 +650,10 @@ async function refreshStats() {
       api('GET', '/api/stats/users'),
     ]);
 
-    // Metric chips (may be updated by WS too)
-    el('m-cpu').textContent   = `${status.system.cpuPercent}%`;
-    el('m-ram').textContent   = `${fmtMB(status.system.ramUsedMB)}/${fmtMB(status.system.ramTotalMB)}`;
-    el('m-naive').innerHTML   = badge(status.services.naive.active, 'Active', 'Inactive');
-    el('m-mieru').innerHTML   = badge(status.services.mieru.active, 'Active', 'Inactive');
+    el('m-cpu').textContent    = `${status.system.cpuPercent}%`;
+    el('m-ram').textContent    = `${fmtMB(status.system.ramUsedMB)}/${fmtMB(status.system.ramTotalMB)}`;
+    el('m-naive').innerHTML    = badge(status.services.naive.active, t('monitoring.active'), t('monitoring.inactive'));
+    el('m-mieru').innerHTML    = badge(status.services.mieru.active, t('monitoring.active'), t('monitoring.inactive'));
     el('m-uptime').textContent = fmtUptime(status.system.uptime);
 
     renderTrafficTable(stats);
@@ -499,12 +665,12 @@ async function refreshStats() {
 function renderTrafficTable(stats) {
   const tbody = el('traffic-tbody');
   if (!stats.length) {
-    tbody.innerHTML = '<tr><td colspan="8" class="table-empty">No users yet</td></tr>';
+    tbody.innerHTML = `<tr><td colspan="8" class="table-empty">${t('monitoring.noUsers')}</td></tr>`;
     return;
   }
   tbody.innerHTML = stats.map(u => {
     const quotaMB = u.quotaMB || 0;
-    const usedMB  = u.usedMB || 0;
+    const usedMB  = u.usedMB  || 0;
     const pct     = quotaMB > 0 ? Math.min(100, Math.round((usedMB / quotaMB) * 100)) : 0;
     const warn    = pct > 80;
     const danger  = pct > 95;
@@ -513,7 +679,7 @@ function renderTrafficTable(stats) {
           <div class="quota-bar"><div class="quota-fill${danger?' danger':warn?' warn':''}" style="width:${pct}%"></div></div>
           <span style="font-size:11px;color:${danger?'var(--red)':warn?'var(--yellow)':'var(--text-muted)'}">${pct}%</span>
          </div>`
-      : '<span class="badge badge-gray">Unlimited</span>';
+      : `<span class="badge badge-gray">${t('monitoring.unlimited')}</span>`;
 
     return `<tr>
       <td><strong>${esc(u.username)}</strong></td>
@@ -528,14 +694,17 @@ function renderTrafficTable(stats) {
   }).join('');
 }
 
-// ── Logs ──────────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// LOGS
+// ══════════════════════════════════════════════════════════════
+
 async function loadLogs(service) {
   currentLogService = service;
   ['caddy', 'mieru', 'panel'].forEach(s => {
     el(`log-btn-${s}`)?.classList.toggle('active', s === service);
   });
   const lines = el('log-lines')?.value || 100;
-  el('log-content').textContent = 'Loading…';
+  el('log-content').textContent = t('logs.loading');
   try {
     const data = await api('GET', `/api/logs/${service}?lines=${lines}`);
     el('log-content').textContent = data.logs || '(empty)';
@@ -545,53 +714,64 @@ async function loadLogs(service) {
   }
 }
 
-// ── Diagnostics ───────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// DIAGNOSTICS
+// ══════════════════════════════════════════════════════════════
+
 async function runDiagnostics() {
-  el('diag-ports').innerHTML   = '<p class="text-muted">Checking…</p>';
-  el('diag-config').innerHTML  = '<p class="text-muted">Checking…</p>';
-  el('diag-mita-status').textContent = 'Loading…';
-  el('diag-mita-config').textContent = 'Loading…';
+  el('diag-ports').innerHTML  = `<p class="text-muted">${t('diagnostics.checking')}</p>`;
+  el('diag-config').innerHTML = `<p class="text-muted">${t('diagnostics.checking')}</p>`;
+  el('diag-mita-status').textContent = t('logs.loading');
+  el('diag-mita-config').textContent = t('logs.loading');
 
   try {
     const data = await api('GET', '/api/diagnostics');
 
-    // Ports
     el('diag-ports').innerHTML = `
       <div class="info-list">
         <div class="info-row">
-          <span>NaiveProxy port ${state.config.naivePort || 443}</span>
-          <span>${data.ports?.naive ? '<span class="badge badge-green">Open</span>' : '<span class="badge badge-red">Closed</span>'}</span>
+          <span>${t('diagnostics.naivePort', { port: state.config.naivePort || 443 })}</span>
+          <span>${data.ports?.naive
+            ? `<span class="badge badge-green">${t('diagnostics.open')}</span>`
+            : `<span class="badge badge-red">${t('diagnostics.closed')}</span>`}</span>
         </div>
         <div class="info-row">
-          <span>Mieru port ${state.config.mieruPortStart || 2012}</span>
-          <span>${data.ports?.mieru ? '<span class="badge badge-green">Open</span>' : '<span class="badge badge-red">Closed</span>'}</span>
+          <span>${t('diagnostics.mieruPort', { port: state.config.mieruPortStart || 2012 })}</span>
+          <span>${data.ports?.mieru
+            ? `<span class="badge badge-green">${t('diagnostics.open')}</span>`
+            : `<span class="badge badge-red">${t('diagnostics.closed')}</span>`}</span>
         </div>
       </div>`;
 
-    // Config validation
     el('diag-config').innerHTML = data.caddyConfigValid
-      ? '<span class="badge badge-green">Caddyfile valid ✓</span>'
-      : `<span class="badge badge-red">Caddyfile invalid</span><pre class="mini-log mt-2">${esc(data.caddyConfigError || '')}</pre>`;
+      ? `<span class="badge badge-green">${t('diagnostics.caddyValid')}</span>`
+      : `<span class="badge badge-red">${t('diagnostics.caddyInvalid')}</span><pre class="mini-log mt-2">${esc(data.caddyConfigError || '')}</pre>`;
 
-    el('diag-mita-status').textContent = data.mitaStatus   || '(no output)';
-    el('diag-mita-config').textContent = data.mitaConfig   || '(no output)';
+    el('diag-mita-status').textContent = data.mitaStatus  || t('diagnostics.noOutput');
+    el('diag-mita-config').textContent = data.mitaConfig  || t('diagnostics.noOutput');
   } catch (err) {
     toast(err.message, 'error');
   }
 }
 
-// ── Service control ───────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// SERVICE CONTROL
+// ══════════════════════════════════════════════════════════════
+
 async function svcAction(service, action) {
   try {
     await api('POST', `/api/service/${service}/${action}`);
-    toast(`${service}: ${action} OK`, 'success');
+    toast(t('service.actionOk', { service, action }), 'success');
     setTimeout(loadDashboard, 1500);
   } catch (err) {
-    toast(`${service} ${action} failed: ${err.message}`, 'error');
+    toast(t('service.actionFail', { service, action, msg: err.message }), 'error');
   }
 }
 
-// ── WebSocket: live metrics ───────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// WEBSOCKET — live metrics
+// ══════════════════════════════════════════════════════════════
+
 function connectWebSocket() {
   if (state.wsReconnectTimer) clearTimeout(state.wsReconnectTimer);
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
@@ -609,17 +789,15 @@ function connectWebSocket() {
       try {
         const msg = JSON.parse(e.data);
         if (msg.type === 'metrics') {
-          // Update monitoring chips if on that page
           if (state.currentPage === 'monitoring') {
             el('m-cpu').textContent  = `${msg.cpu}%`;
             el('m-ram').textContent  = `${fmtMB(msg.ramUsedMB)}/${fmtMB(msg.ramTotalMB)}`;
-            el('m-naive').innerHTML  = badge(msg.naive, 'Active', 'Inactive');
-            el('m-mieru').innerHTML  = badge(msg.mieru, 'Active', 'Inactive');
+            el('m-naive').innerHTML  = badge(msg.naive, t('monitoring.active'), t('monitoring.inactive'));
+            el('m-mieru').innerHTML  = badge(msg.mieru, t('monitoring.active'), t('monitoring.inactive'));
           }
-          // Update dashboard service indicators if on that page
           if (state.currentPage === 'dashboard') {
-            el('d-naive-status').innerHTML = badge(msg.naive, 'Active', 'Inactive');
-            el('d-mieru-status').innerHTML = badge(msg.mieru, 'Active', 'Inactive');
+            el('d-naive-status').innerHTML = badge(msg.naive, t('dashboard.active'), t('dashboard.inactive'));
+            el('d-mieru-status').innerHTML = badge(msg.mieru, t('dashboard.active'), t('dashboard.inactive'));
             const cpuEl = el('d-cpu');
             if (cpuEl) { cpuEl.textContent = `${msg.cpu}%`; setProgress('d-cpu-bar', msg.cpu); }
           }
@@ -632,14 +810,16 @@ function connectWebSocket() {
       state.ws = null;
       state.wsReconnectTimer = setTimeout(connectWebSocket, 5000);
     };
-
     ws.onerror = () => ws.close();
   } catch {
     state.wsReconnectTimer = setTimeout(connectWebSocket, 5000);
   }
 }
 
-// ── HTTP helper ───────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// HTTP HELPER
+// ══════════════════════════════════════════════════════════════
+
 async function api(method, path, body) {
   const opts = {
     method,
@@ -648,8 +828,8 @@ async function api(method, path, body) {
   };
   if (body) opts.body = JSON.stringify(body);
 
-  const res = await fetch(path, opts);
-  const ct  = res.headers.get('Content-Type') || '';
+  const res  = await fetch(path, opts);
+  const ct   = res.headers.get('Content-Type') || '';
   const data = ct.includes('json') ? await res.json() : await res.text();
 
   if (!res.ok) {
@@ -659,16 +839,17 @@ async function api(method, path, body) {
   return data;
 }
 
-// ── UI helpers ────────────────────────────────────────────────
+// ══════════════════════════════════════════════════════════════
+// UI HELPERS
+// ══════════════════════════════════════════════════════════════
+
 function el(id) { return document.getElementById(id); }
 
 function esc(str) {
   if (!str) return '';
   return String(str)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;');
+    .replace(/&/g, '&amp;').replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
 }
 
 function badge(active, trueLabel, falseLabel) {
@@ -704,9 +885,8 @@ function showMsg(id, text, ok) {
 function fmtDate(iso) {
   if (!iso) return '—';
   try {
-    return new Date(iso).toLocaleDateString('en-GB', {
-      day: '2-digit', month: 'short', year: 'numeric'
-    });
+    const opts = { day: '2-digit', month: 'short', year: 'numeric' };
+    return new Date(iso).toLocaleDateString(currentLang === 'ru' ? 'ru-RU' : 'en-GB', opts);
   } catch { return iso; }
 }
 
@@ -742,10 +922,8 @@ function copyToClipboard(text) {
     navigator.clipboard.writeText(text).catch(() => {});
   } else {
     const ta = document.createElement('textarea');
-    ta.value = text;
-    ta.style.position = 'fixed'; ta.style.opacity = '0';
-    document.body.appendChild(ta);
-    ta.select(); document.execCommand('copy');
+    ta.value = text; ta.style.position = 'fixed'; ta.style.opacity = '0';
+    document.body.appendChild(ta); ta.select(); document.execCommand('copy');
     document.body.removeChild(ta);
   }
 }
@@ -761,21 +939,15 @@ function downloadBlob(blob, filename) {
 
 function toast(message, type = 'info') {
   const container = document.getElementById('toast-container');
-  const toast = document.createElement('div');
-  toast.className = `toast ${type}`;
-
-  const icons = {
-    success: '✓',
-    error:   '✗',
-    info:    'ℹ',
-  };
-  toast.innerHTML = `<span style="font-weight:700;font-size:14px">${icons[type] || 'ℹ'}</span><span>${esc(message)}</span>`;
-  container.appendChild(toast);
-
+  const t_el = document.createElement('div');
+  t_el.className = `toast ${type}`;
+  const icons = { success: '✓', error: '✗', info: 'ℹ' };
+  t_el.innerHTML = `<span style="font-weight:700;font-size:14px">${icons[type] || 'ℹ'}</span><span>${esc(message)}</span>`;
+  container.appendChild(t_el);
   setTimeout(() => {
-    toast.style.opacity = '0';
-    toast.style.transform = 'translateX(20px)';
-    toast.style.transition = 'all 0.3s';
-    setTimeout(() => toast.remove(), 300);
+    t_el.style.opacity = '0';
+    t_el.style.transform = 'translateX(20px)';
+    t_el.style.transition = 'all 0.3s';
+    setTimeout(() => t_el.remove(), 300);
   }, 4000);
 }
