@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.1.0
+ * Panel Naive + Mieru — Frontend Application v1.1.1
  * Features: i18n (ru/en), dark/light theme, QR codes, all 6 sprints
  */
 'use strict';
@@ -259,8 +259,8 @@ function navigateTo(page) {
     case 'users':       loadUsers();       break;
     case 'settings':    loadSettings();    break;
     case 'monitoring':  loadMonitoring();  break;
-    case 'logs':        loadLogs('caddy'); break;
-    case 'diagnostics': break;
+    case 'logs':        loadLogs(currentLogService); break;
+    case 'diagnostics': runDiagnostics();  break;
   }
 
   if (window.innerWidth <= 768) {
@@ -269,7 +269,21 @@ function navigateTo(page) {
 }
 
 function toggleSidebar() {
-  document.getElementById('sidebar').classList.toggle('open');
+  const sidebar = document.getElementById('sidebar');
+  sidebar.classList.toggle('open');
+  // Manage overlay
+  let overlay = document.getElementById('sidebar-overlay');
+  if (!overlay) {
+    overlay = document.createElement('div');
+    overlay.id = 'sidebar-overlay';
+    overlay.className = 'sidebar-overlay';
+    overlay.addEventListener('click', () => {
+      sidebar.classList.remove('open');
+      overlay.classList.remove('active');
+    });
+    document.body.appendChild(overlay);
+  }
+  overlay.classList.toggle('active', sidebar.classList.contains('open'));
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -279,7 +293,7 @@ function toggleSidebar() {
 async function loadConfig() {
   try {
     state.config = await api('GET', '/api/config');
-    document.getElementById('topbar-version').textContent = `v${state.config.version || '1.0.0'}`;
+    document.getElementById('topbar-version').textContent = `v${state.config.version || '1.1.1'}`;
   } catch {}
 }
 
@@ -325,7 +339,7 @@ async function loadDashboard() {
       [t('dashboard.mieruVersion'), status.services.mieru.version || '—'],
     ]);
 
-    document.getElementById('about-version').textContent = `v${status.panel.version || '1.0.0'}`;
+    document.getElementById('about-version').textContent = `v${status.panel.version || '1.1.1'}`;
   } catch (err) {
     console.error('Dashboard error:', err);
   }
@@ -573,11 +587,15 @@ async function loadSettings() {
     el('s-naive-port').value  = cfg.naivePort    || 443;
     el('s-mieru-start').value = cfg.mieruPortStart || 2012;
     el('s-mieru-end').value   = cfg.mieruPortEnd   || 2022;
-    el('s-mtu').value         = cfg.mtu || 1350;
+    el('s-mtu').value         = cfg.mtu || 1400;
     const pattern = cfg.trafficPattern || 'NOOP';
     const radio = document.querySelector(`input[name="traffic-pattern"][value="${pattern}"]`);
     if (radio) radio.checked = true;
-    document.getElementById('about-version').textContent = `v${cfg.version || '1.0.0'}`;
+    const udpBox = el('s-udp-enabled');
+    if (udpBox) udpBox.checked = cfg.udpEnabled === true;
+    const langSel = el('s-language-select');
+    if (langSel) langSel.value = cfg.language || currentLang || 'ru';
+    document.getElementById('about-version').textContent = `v${cfg.version || '1.1.1'}`;
   } catch {}
 }
 
@@ -606,6 +624,18 @@ async function changeMieruPorts() {
   }
 }
 
+async function changeUdpMode() {
+  const enabled = el('s-udp-enabled')?.checked || false;
+  try {
+    const res = await api('POST', '/api/settings/udp-toggle', { enabled });
+    showMsg('udp-msg', res.message || t('settings.udpUpdated'), true);
+    state.config.udpEnabled = enabled;
+    toast(t('settings.udpUpdated'), 'info');
+  } catch (err) {
+    showMsg('udp-msg', err.message, false);
+  }
+}
+
 async function changeTrafficPattern() {
   const pattern = document.querySelector('input[name="traffic-pattern"]:checked')?.value || 'NOOP';
   const mtu = parseInt(el('s-mtu').value, 10);
@@ -622,7 +652,7 @@ async function changePassword() {
   const current  = el('s-cur-pass').value;
   const newPass  = el('s-new-pass').value;
   const confirm2 = el('s-new-pass2').value;
-  if (!current || !newPass) return showMsg('pw-msg', t('settings.allFieldsRequired'), false);
+  if (!current || !newPass || !confirm2) return showMsg('pw-msg', t('settings.allFieldsRequired'), false);
   if (newPass !== confirm2)  return showMsg('pw-msg', t('settings.passwordMismatch'),  false);
   if (newPass.length < 8)   return showMsg('pw-msg', t('settings.passwordTooShort'),  false);
   try {
@@ -634,6 +664,19 @@ async function changePassword() {
     toast(t('settings.passwordChanged'), 'success');
   } catch (err) {
     showMsg('pw-msg', err.message, false);
+  }
+}
+
+async function changeLanguage() {
+  const sel = el('s-language-select');
+  if (!sel) return;
+  const lang = sel.value;
+  try {
+    await api('POST', '/api/settings/language', { language: lang });
+    await setLang(lang);
+    toast(t('settings.applyLanguage') + ': ' + lang.toUpperCase(), 'success');
+  } catch (err) {
+    toast(err.message, 'error');
   }
 }
 

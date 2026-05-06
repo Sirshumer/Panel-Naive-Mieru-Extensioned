@@ -357,30 +357,30 @@ CADDYEOF
 # ── Mieru initial state file ──────────────────────────────────────────────────
 # NOTE: mita does NOT use /etc/mita/server.json directly (internal protobuf store).
 # The panel builds this JSON and applies it via:  mita apply config <file>
+#
+# Correct mita server JSON schema:
+#   portBindings[].protocol — "TCP" only by default (UDP is opt-in via panel)
+#   users[].name / users[].password — plain string (mita hashes internally)
+#   mtu — recommended 1400
+#   NO trafficConfig/trafficPattern field for default NOOP mode
 write_mita_state() {
   log_step "$(t 'Запись начального конфига Mieru' 'Writing initial Mieru state')"
   mkdir -p "$(dirname "$MITA_STATE_FILE")"
 
-  local bindings=""
-  for (( port=MIERU_PORT_START; port<=MIERU_PORT_END; port++ )); do
-    bindings+="    {\"port\": $port, \"protocol\": \"TCP\"},"$'\n'
-    bindings+="    {\"port\": $port, \"protocol\": \"UDP\"},"$'\n'
-  done
-
   python3 - <<PYEOF
-import json, sys
+import json
 start = $MIERU_PORT_START
 end   = $MIERU_PORT_END
+# TCP-only by default; UDP is opt-in via panel settings
 cfg = {
     "portBindings": [
-        {"port": p, "protocol": proto}
+        {"port": p, "protocol": "TCP"}
         for p in range(start, end + 1)
-        for proto in ("TCP", "UDP")
     ],
     "users": [],
     "loggingLevel": "INFO",
-    "mtu": 1350,
-    "trafficConfig": {"pattern": "NOOP"}
+    "mtu": 1400
+    # trafficPattern field omitted = NOOP (default, no obfuscation)
 }
 with open("$MITA_STATE_FILE", "w") as f:
     json.dump(cfg, f, indent=2)
@@ -476,20 +476,34 @@ install_panel() {
 }
 
 # ── config.json ───────────────────────────────────────────────────────────────
+# Blocker #1 fix: admin password hashed with bcrypt (not SHA-256).
+# We use Node.js (already installed at this point) to generate the bcrypt hash,
+# which is the only format server/index.js accepts via bcryptjs.compareSync().
 write_config_json() {
   log_step "$(t 'Запись /etc/rixxx-panel/config.json' 'Writing /etc/rixxx-panel/config.json')"
   mkdir -p /etc/rixxx-panel "$(dirname "$DB_PATH")"
   local server_ip
   server_ip=$(curl -4 -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 
+  # Generate bcrypt hash via Node (rounds=12, same as server uses)
+  local bcrypt_hash
+  bcrypt_hash=$(node -e "
+    const bcrypt = require('bcryptjs');
+    process.stdout.write(bcrypt.hashSync(process.argv[1], 12));
+  " -- "$ADMIN_PASS" 2>/dev/null) || {
+    # Fallback: htpasswd bcrypt (apache2-utils)
+    bcrypt_hash=$(htpasswd -bnBC 12 "" "$ADMIN_PASS" 2>/dev/null | tr -d ':\n' | sed 's/^[^\$]*//')
+  }
+  [[ -z "$bcrypt_hash" ]] && die "$(t 'Не удалось создать bcrypt-хеш пароля' 'Failed to generate bcrypt password hash')"
+
   python3 - <<PYCFG
-import json, hashlib
+import json
 data = {
     "domain":          "$DOMAIN",
     "serverIp":        "$server_ip",
     "adminEmail":      "$ADMIN_EMAIL",
     "adminUser":       "$ADMIN_USER",
-    "adminPassHash":   hashlib.sha256(b"$ADMIN_PASS").hexdigest(),
+    "adminPassHash":   "${bcrypt_hash}",
     "naivePort":       $NAIVE_PORT,
     "mieruPortStart":  $MIERU_PORT_START,
     "mieruPortEnd":    $MIERU_PORT_END,
@@ -501,8 +515,9 @@ data = {
     "caddyfile":       "$CADDYFILE",
     "mitaStateFile":   "$MITA_STATE_FILE",
     "trafficPattern":  "NOOP",
-    "mtu":             1350,
-    "language":        "ru" if True else "en",
+    "mtu":             1400,
+    "udpEnabled":      False,
+    "language":        "ru",
     "version":         "$CURRENT_VERSION",
     "installedAt":     "$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 }
