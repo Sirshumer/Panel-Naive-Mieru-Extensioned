@@ -165,9 +165,12 @@ function saveConfig() {
   } catch (e) { console.error('[CFG]', e.message); }
 }
 
-// ── Bug 1/v1.2.3: buildCaddyfile() ───────────────────────────────────────────
+// ── buildCaddyfile() ─────────────────────────────────────────────────────────
 // Rebuilds the Caddyfile from current cfg and user list.
-// Uses basicauth lines for naive-enabled users.
+// Bug 18: always emits at least one basicauth line (placeholder) so Caddy
+//         never sees an empty basic_auth block and rejects the config.
+// Bug 21: site-level log block removed — the global log block covers all
+//         requests; duplicate log blocks write to the same file and warn.
 // probe_resistance shows fake site to unrecognised clients.
 function buildCaddyfile(config, users) {
   const naiveUsers = users.filter(u => {
@@ -185,11 +188,22 @@ function buildCaddyfile(config, users) {
   const domain      = config.domain      || 'localhost';
   const port        = config.naivePort   || 443;
 
-  // Build basicauth block lines
-  const authLines = naiveUsers
-    .map(u => `      basicauth ${u.username} ${u.password || u.passHash}`)
-    .join('\n');
+  // Bug 18: build basicauth lines; always include at least a placeholder so
+  // the block is never empty (empty basic_auth causes Caddy validation failure).
+  let authLines;
+  if (naiveUsers.length > 0) {
+    authLines = naiveUsers
+      .map(u => `      basicauth ${u.username} ${u.password || u.passHash}`)
+      .join('\n');
+  } else {
+    // Placeholder sentinel — random suffix makes it effectively unreachable.
+    // The panel rebuilds the Caddyfile whenever a real user is added.
+    const crypto = require('crypto');
+    const rnd = crypto.randomBytes(16).toString('hex');
+    authLines = `      basicauth _placeholder_${rnd} _disabled_${rnd}`;
+  }
 
+  // Bug 21: omit site-level log block — global block already captures all traffic.
   const probeResLine = probeSecret
     ? `      probe_resistance ${probeSecret}`
     : '';
@@ -224,11 +238,6 @@ ${probeResLine}
     file_server {
       root ${fakeSiteDir}
     }
-  }
-
-  log {
-    output file ${LOG_CADDY}
-    format json
   }
 }
 `;
