@@ -1,13 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — update.sh  v1.2.3
+# Panel Naive + Mieru by RIXXX — update.sh  v1.2.4
 # Usage: bash update.sh [--dry-run] [--force] [--expose <domain>] [--ssh-only]
 #                       [--status] [--repair] [--help] [-y]
 #
-# v1.2.3: Migrated from standalone naive binary to caddy-forwardproxy-naive.
+# v1.2.4: Fixed Caddyfile template (bugs 23-40); uses caddyTemplate.js.
 #   - --repair calls /api/services/rebuild-all to regenerate Caddyfile
 #   - update_caddy_naive() replaces update_naiveproxy()
-#   - All naive/htpasswd rebuild functions replaced by Caddy equivalents
+#   - rebuild_caddyfile_direct() now uses caddyTemplate.js (Bug 26)
 # ==============================================================================
 set -euo pipefail
 
@@ -22,7 +22,7 @@ log_dry()   { echo -e "${YELLOW}[DRY-RUN]${NC} $*"; }
 die()       { log_error "$*"; exit 1; }
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-TARGET_VERSION="1.2.3"
+TARGET_VERSION="1.2.4"
 PANEL_DIR="/opt/panel-naive-mieru"
 PANEL_CONFIG="/etc/rixxx-panel/config.json"
 VERSION_FILE="/etc/rixxx-panel/version"
@@ -205,7 +205,9 @@ rebuild_via_api() {
   rebuild_mita_state_direct
 }
 
-# ── v1.2.3: Rebuild Caddyfile directly from SQLite DB ────────────────────────
+# ── v1.2.4: Rebuild Caddyfile directly from SQLite DB ────────────────────────
+# Bug 23/26/38/39: uses caddyTemplate.js (single source of truth) so directive
+# syntax and log-rotation settings are always consistent with install.sh.
 rebuild_caddyfile_direct() {
   log_step "Rebuilding Caddyfile from SQLite database"
   [[ ! -f "$DB_PATH" ]] && { log_warn "DB not found at $DB_PATH — skipping Caddyfile rebuild"; return; }
@@ -213,80 +215,106 @@ rebuild_caddyfile_direct() {
 
   mkdir -p "$CADDY_CONFIG_DIR" /var/log/caddy-naive
 
+  local template_js="${PANEL_DIR}/server/caddyTemplate.js"
+
   node -e "
     const Database = require('better-sqlite3');
     const fs       = require('fs');
+    const path     = require('path');
     const db       = new Database('$DB_PATH', { readonly: true });
     const cfg      = JSON.parse(fs.readFileSync('$PANEL_CONFIG', 'utf8'));
 
-    const users = db.prepare('SELECT username, password, protocols FROM users').all()
+    // Bug 34: filter to naive-protocol users; placeholder emitted by template when empty
+    const naiveUsers = db.prepare('SELECT username, password, protocols FROM users').all()
       .filter(u => {
         try { return JSON.parse(u.protocols || '[\"naive\",\"mieru\"]').includes('naive'); }
         catch { return true; }
-      });
-
-    const authLines = users
-      .map(u => '      basicauth ' + u.username + ' ' + (u.password || ''))
-      .join('\n');
+      })
+      .map(u => ({ username: u.username, password: u.password || '' }));
 
     const probeSecret = cfg.probeSecret ||
       (() => { try { return fs.readFileSync('$CADDY_CONFIG_DIR/probe_secret','utf8').trim(); } catch { return ''; } })();
 
-    const probeResLine = probeSecret ? '      probe_resistance ' + probeSecret : '';
-    const email       = cfg.adminEmail || '';
-    const domain      = cfg.domain     || 'localhost';
-    const port        = cfg.naivePort  || 443;
-    const fakeSiteDir = cfg.fakeSiteDir || '$FAKE_SITE_DIR';
-    const logFile     = '/var/log/caddy-naive/access.log';
-
-    const content = \`{
-  email \${email}
-  admin off
-  log {
-    output file \${logFile} {
-      roll_size 50mb
-      roll_keep 5
+    // Bug 26: use shared template for consistency with install.sh
+    const tplPath = '$template_js';
+    let content;
+    if (fs.existsSync(tplPath)) {
+      const tpl = require(tplPath);
+      content = tpl.render({
+        adminEmail:  cfg.adminEmail  || '',
+        domain:      cfg.domain      || 'localhost',
+        naivePort:   cfg.naivePort   || 443,
+        fakeSiteDir: cfg.fakeSiteDir || '$FAKE_SITE_DIR',
+        probeSecret,
+        logFile:     '/var/log/caddy-naive/access.log'
+      }, naiveUsers);
+    } else {
+      // Fallback (template not available): emit correct syntax directly
+      // Bug 23: basic_auth <user> <pass> (no bare keyword)
+      const crypto = require('crypto');
+      let authLines;
+      if (naiveUsers.length > 0) {
+        authLines = naiveUsers.map(u => '    basic_auth ' + u.username + ' ' + u.password).join('\n');
+      } else {
+        const rnd = crypto.randomBytes(20).toString('hex');
+        authLines = '    basic_auth _placeholder_' + rnd.slice(0,16) + ' _disabled_' + rnd.slice(16);
+      }
+      const probeLine = probeSecret ? '\n    probe_resistance ' + probeSecret : '';
+      // Bug 28/30/38: no tls directive, order directive, roll_keep_for
+      content = [
+        '{',
+        '  order forward_proxy before file_server',
+        '  email ' + (cfg.adminEmail || ''),
+        '  admin off',
+        '  log {',
+        '    output file /var/log/caddy-naive/access.log {',
+        '      roll_size     50mb',
+        '      roll_keep_for 720h',
+        '    }',
+        '    format json',
+        '}',
+        '}',
+        '',
+        ':80 {',
+        '  redir https://{host}{uri} permanent',
+        '}',
+        '',
+        (cfg.domain || 'localhost') + ':' + (cfg.naivePort || 443) + ' {',
+        '  route {',
+        '    forward_proxy {',
+        authLines,
+        '      hide_ip',
+        '      hide_via' + probeLine,
+        '    }',
+        '    file_server {',
+        '      root ' + (cfg.fakeSiteDir || '$FAKE_SITE_DIR'),
+        '    }',
+        '  }',
+        '}'
+      ].join('\n');
     }
-    format json
-  }
-}
-
-:80 {
-  redir https://{host}{uri} permanent
-}
-
-\${domain}:\${port} {
-  tls \${email}
-
-  route {
-    forward_proxy {
-      basic_auth
-\${authLines}
-      hide_ip
-      hide_via
-\${probeResLine}
-    }
-    file_server {
-      root \${fakeSiteDir}
-    }
-  }
-
-  log {
-    output file \${logFile}
-    format json
-  }
-}
-\`;
 
     const tmp = '$CADDY_FILE' + '.new';
     fs.writeFileSync(tmp, content, { mode: 0o640 });
     fs.renameSync(tmp, '$CADDY_FILE');
-    console.log('[Caddyfile] rebuilt with', users.length, 'user(s)');
+    console.log('[Caddyfile] rebuilt with', naiveUsers.length, 'user(s)');
     db.close();
-  " 2>/dev/null || {
+  " || {
     log_warn "Node Caddyfile rebuild failed — Caddyfile will be rebuilt on next panel operation"
     return 1
   }
+
+  # Bug 39: validate after rebuild so --repair fails loudly if template is wrong
+  local caddy_bin; caddy_bin=$(jq -r '.caddyBin // "/usr/local/bin/caddy-naive"' "$PANEL_CONFIG" 2>/dev/null || echo '/usr/local/bin/caddy-naive')
+  if [[ -x "$caddy_bin" ]]; then
+    if "$caddy_bin" validate --config "$CADDY_FILE" --adapter caddyfile &>/dev/null; then
+      log_info "Caddyfile validated ✓"
+    else
+      log_error "Caddyfile validation FAILED after rebuild:"
+      "$caddy_bin" validate --config "$CADDY_FILE" --adapter caddyfile 2>&1 | head -20 || true
+      return 1
+    fi
+  fi
   log_info "Caddyfile rebuilt ✓"
 }
 
@@ -337,6 +365,8 @@ rebuild_mita_state_direct() {
 ensure_caddy_service() {
   if [[ ! -f /etc/systemd/system/caddy-naive.service ]]; then
     log_step "Creating caddy-naive.service"
+    # Bug 37: run as unprivileged caddy user
+    id caddy &>/dev/null || useradd --system --no-create-home --shell /usr/sbin/nologin caddy 2>/dev/null || true
     cat > /etc/systemd/system/caddy-naive.service <<SVCCADDY
 [Unit]
 Description=Caddy forwardproxy-naive Server
@@ -346,7 +376,8 @@ Requires=network-online.target
 
 [Service]
 Type=notify
-User=root
+User=caddy
+Group=caddy
 ExecStart=${CADDY_BIN} run --config ${CADDY_FILE} --adapter caddyfile
 ExecReload=/bin/kill -USR1 \$MAINPID
 TimeoutStopSec=5
@@ -355,7 +386,8 @@ RestartSec=5
 LimitNOFILE=1048576
 PrivateTmp=true
 ProtectSystem=full
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ReadWritePaths=/var/log/caddy-naive /etc/caddy-naive
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -635,8 +667,9 @@ do_status() {
   # Caddyfile
   echo -e "${BOLD}Caddyfile (${CADDY_FILE}):${NC}"
   if [[ -f "$CADDY_FILE" ]]; then
-    local user_count; user_count=$(grep -cE '^\s*basicauth\s+\S+\s+\S+' "$CADDY_FILE" 2>/dev/null || echo 0)
-    echo "  Present — $user_count basicauth user(s)"
+    # Bug 23: directive is now "basic_auth" (underscore), not "basicauth"
+    local user_count; user_count=$(grep -cE '^\s*basic_auth\s+\S+\s+\S+' "$CADDY_FILE" 2>/dev/null || echo 0)
+    echo "  Present — $user_count basic_auth user(s)"
     grep -E 'probe_resistance|tls\s' "$CADDY_FILE" 2>/dev/null | head -5 | sed 's/^/  /' || true
   else
     echo "  Caddyfile NOT FOUND"

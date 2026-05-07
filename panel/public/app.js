@@ -1,8 +1,8 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.2.3
+ * Panel Naive + Mieru — Frontend Application v1.2.4
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
- * v1.2.3: probe-secret setting, disabled-button+spinner on all submit handlers,
+ * v1.2.4: probe-secret setting, disabled-button+spinner on all submit handlers,
  *         dashboard shows caddy-naive version label, config version bump
  */
 'use strict';
@@ -371,7 +371,7 @@ function toggleSidebar() {
 async function loadConfig() {
   try {
     state.config = await api('GET', '/api/config');
-    document.getElementById('topbar-version').textContent = `v${state.config.version || '1.2.3'}`;
+    document.getElementById('topbar-version').textContent = `v${state.config.version || '1.2.4'}`;
   } catch {}
 }
 
@@ -417,7 +417,7 @@ async function loadDashboard() {
       [t('dashboard.mieruVersion'), status.services.mieru.version || '—'],
     ]);
 
-    document.getElementById('about-version').textContent = `v${status.panel.version || '1.2.3'}`;
+    document.getElementById('about-version').textContent = `v${status.panel.version || '1.2.4'}`;
   } catch (err) {
     console.error('Dashboard error:', err);
   }
@@ -540,7 +540,7 @@ async function saveUser() {
   const body = { email, username, expiry, protocols, quotaMB };
   if (password) body.password = password;
 
-  // v1.2.3: disabled-button + spinner pattern
+  // v1.2.4: disabled-button + spinner pattern
   const saveBtn = el('btn-save-user');
   setBtnBusy(saveBtn, true);
 
@@ -688,10 +688,10 @@ async function loadSettings() {
     if (udpBox) udpBox.checked = cfg.udpEnabled === true;
     const langSel = el('s-language-select');
     if (langSel) langSel.value = cfg.language || currentLang || 'ru';
-    // v1.2.3: probe secret (masked)
+    // v1.2.4: probe secret (masked)
     const probeEl = el('s-probe-secret');
     if (probeEl) probeEl.placeholder = cfg.probeSecret ? '••••••••' : (t('settings.probeSecretPlaceholder') || 'Enter probe secret');
-    document.getElementById('about-version').textContent = `v${cfg.version || '1.2.3'}`;
+    document.getElementById('about-version').textContent = `v${cfg.version || '1.2.4'}`;
   } catch {}
 }
 
@@ -789,7 +789,7 @@ async function changePassword() {
   }
 }
 
-// v1.2.3: Probe secret update — rebuilds Caddyfile and reloads Caddy
+// v1.2.4: Probe secret update — rebuilds Caddyfile and reloads Caddy
 async function changeProbeSecret() {
   const secret = el('s-probe-secret')?.value?.trim();
   if (!secret || secret.length < 8) {
@@ -931,7 +931,7 @@ async function runDiagnostics() {
         </div>
       </div>`;
 
-    // v1.2.3: caddy-forwardproxy-naive — show Caddyfile + probe_secret status
+    // v1.2.4: caddy-forwardproxy-naive — show Caddyfile + probe_secret status
     const naiveOk = data.naiveVersionOk && data.naiveConfigExists;
     const caddyfileUsers = data.caddyfileUsers ?? data.htpasswdUsers ?? 0;
     const probeSet = data.probeSecretSet ? '✓ set' : '✗ not set';
@@ -1060,7 +1060,7 @@ function redirectToLogin() {
 function el(id) { return document.getElementById(id); }
 
 /**
- * v1.2.3: disabled-button + spinner pattern for all submit handlers.
+ * v1.2.4: disabled-button + spinner pattern for all submit handlers.
  * Prevents double-submit and gives visual feedback during async ops.
  */
 function setBtnBusy(btn, busy) {

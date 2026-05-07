@@ -7,6 +7,75 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.4] — 2026-05-07
+
+### Fixed (release-blockers — regression from v1.2.3 on Ubuntu 24.04 amd64)
+
+- **Bug 23 (P0, `panel/server/index.js` + `update.sh`)**: Caddyfile validation failed on every fresh install with:
+  ```
+  wrong argument count or unexpected line ending after 'basic_auth'
+  ```
+  Root cause 1: `buildCaddyfile()` in `index.js` emitted a standalone `basic_auth` token with no arguments as a *block opener* — this is invalid in `caddy-forwardproxy-naive`; the directive is not a block, it is a flat per-user line.
+  Root cause 2: per-user credential lines used the wrong spelling `basicauth` (no underscore); the correct directive is `basic_auth <username> <password>`.
+  **Fix**: `buildCaddyfile()` in `panel/server/index.js` now delegates to `panel/server/caddyTemplate.js` (single source of truth, Bug 26). The standalone bare `basic_auth` token is completely removed; each user produces exactly one `basic_auth <user> <pass>` line. The inline fallback (used before `install_panel()` has run) applies the same rules. Diagnostic counter regex in `/api/diagnostics` and `do_status` in `update.sh` updated from `basicauth` → `basic_auth`.
+
+- **Bug 24 (P0, `install.sh`)**: `write_caddyfile()` called `log_warn` on `caddy validate` failure — install continued with an invalid Caddyfile, causing `caddy-naive` to fail silently later. **Fix**: validation failure now calls `die` (fatal), prints the full validator output, and aborts the install immediately.
+
+- **Bug 25 (P0, `install.sh`)**: `start_services()` did not check whether `caddy-naive` became active after `systemctl restart`. **Fix**: added `systemctl is-active --quiet caddy-naive` check after a 2-second wait; on failure, dumps `journalctl -u caddy-naive -n 40` and calls `die`.
+
+### Fixed (P1 — correctness)
+
+- **Bug 26 (P1, `panel/server/index.js`)**: `buildCaddyfile()` and `rebuild_caddyfile_direct()` in `update.sh` each had an independent inline template that could drift from `install.sh`'s template. **Fix**: `panel/server/index.js` now `require()`s `panel/server/caddyTemplate.js` and calls `tpl.render(cfg, naiveUsers)`; `update.sh` already used the template. The inline fallback in each file mirrors the template exactly and is clearly marked as a fallback.
+
+- **Bug 27 (P1, `install.sh`)**: `write_caddyfile()` silently overwrote any existing Caddyfile on `--force` reinstall, discarding DB users. **Fix**: existing Caddyfile is backed up to `${CADDY_FILE}.bak.YYYYMMDD-HHMMSS` before overwrite; DB users are read from SQLite (via Node) and imported into the new Caddyfile.
+
+- **Bug 28 (P1, `panel/server/index.js` + `caddyTemplate.js`)**: site block contained a redundant `tls <email>` directive — Caddy's automatic HTTPS handles TLS entirely from the global `email` directive; the redundant line caused a warning. **Fix**: `tls` directive removed from site block in both `index.js` inline fallback and `caddyTemplate.js`.
+
+- **Bug 29 (P1, `panel/server/index.js` + `caddyTemplate.js`)**: directive order inside `forward_proxy` was `basic_auth → (bare keyword) → hide_ip → hide_via → probe_resistance` — the wrong ordering can cause parse errors in strict Caddy versions. **Fix**: enforced order is `basic_auth <user> <pass>` lines → `hide_ip` → `hide_via` → `probe_resistance <secret>` (only when secret is set).
+
+- **Bug 30 (P1, `panel/server/index.js` + `caddyTemplate.js`)**: `order forward_proxy before file_server` was missing from the global block in `index.js` inline template. **Fix**: added to both `caddyTemplate.js` and the `index.js` inline fallback.
+
+- **Bug 33 (P1, `install.sh`)**: no DNS pre-flight check; installer could succeed while Caddy immediately failed ACME because the domain did not resolve to the server. **Fix**: `write_caddyfile()` now resolves `$DOMAIN` via `getent hosts` and compares against `api.ipify.org` server IP, logging a warning if they differ or if DNS has no record.
+
+### Fixed (P2 — lower priority)
+
+- **Bug 34 (P2, `panel/server/index.js` + `caddyTemplate.js`)**: placeholder credential line was emitted even when real users existed in some edge cases. **Fix**: placeholder is emitted only when `naiveUsers.length === 0`; as soon as the first real user is created the panel rebuilds the Caddyfile and the placeholder is replaced.
+
+- **Bug 36 (P2, `install.sh`)**: UFW `--force reset` silently wiped all existing rules without warning. **Fix**: current UFW rules are backed up to `/etc/rixxx-panel/backups/ufw-before-install-*.rules` before reset; interactive mode prompts the user for confirmation before proceeding.
+
+- **Bug 37 (P2, `install.sh`)**: `caddy-naive.service` ran as `root`. **Fix**: `write_caddy_service()` now sets `User=caddy Group=caddy` with `AmbientCapabilities=CAP_NET_BIND_SERVICE`; `start_services()` creates the `caddy` system user if absent and sets correct ownership/permissions on the binary, config dir, and log dir.
+
+- **Bug 38 (P2, `panel/server/index.js` + `caddyTemplate.js`)**: log rotation used `roll_keep 5` (fixed file count). **Fix**: changed to `roll_keep_for 720h` (30-day age-based retention) in both `caddyTemplate.js` and the `index.js` inline fallback.
+
+### Added
+
+- **`panel/server/caddyTemplate.js`** (Bug 26): canonical Caddyfile renderer shared by `install.sh` (via `node -e "require('./caddyTemplate').render(cfg, [])"`) and `panel/server/index.js`. All template-level bugs (23, 28, 29, 30, 34, 38) are fixed in exactly one place. See module JSDoc for parameter spec.
+
+- **`tests/e2e.sh`**: comprehensive end-to-end regression suite covering all v1.2.4 acceptance criteria:
+  1. Non-interactive install → `caddy validate` → service health (Bugs 23–25).
+  2. Caddyfile structure checks: no bare `basic_auth`, no `tls` in site block, `order` directive present, `roll_keep_for` present, single log block (Bugs 21, 23, 28–30, 38).
+  3. Service state: `caddy-naive` active, runs as `caddy` user not root (Bug 37); `mita` enabled but inactive before first user (Bug 4).
+  4. HTTP → 308 redirect; HTTPS → 200 with fake-site HTML (Bug 20).
+  5. API login → create user → Caddyfile re-validate → `basic_auth <user> <pass>` line present → placeholder removed → mita starts (Bugs 23, 34).
+  6. Naive config link uses `naive+https://`; Mieru sing-box config has `transport: TCP`, `server_ports` array.
+  7. `update.sh --repair` → Caddyfile re-validate.
+  8. Idempotent `--force` reinstall → Caddyfile valid.
+  9. `uninstall.sh` → assert all files/services/UFW rules removed.
+  10. Version consistency across all files (install.sh, update.sh, index.js, index.html, app.js, package.json, CHANGELOG.md).
+
+  Run: `sudo bash tests/e2e.sh --domain vpn.example.com --email admin@example.com`
+
+### Changed
+
+- `panel/server/index.js` version comment → `v1.2.4`; `DEFAULT_CONFIG.version` → `1.2.4`.
+- `panel/package.json` version → `1.2.4`.
+- `panel/public/index.html` version labels → `v1.2.4`.
+- `panel/public/app.js` version comment → `v1.2.4`.
+- `install.sh` header → `v1.2.4`; `CURRENT_VERSION="1.2.4"`.
+- `update.sh` header → `v1.2.4`; `TARGET_VERSION="1.2.4"`.
+
+---
+
 ## [v1.2.3] — 2026-05-07
 
 ### Breaking Changes
