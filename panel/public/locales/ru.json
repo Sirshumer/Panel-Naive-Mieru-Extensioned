@@ -4,6 +4,7 @@
 
   "login": {
     "title": "RIXXX Панель",
+    "sessionExpired": "Сессия истекла — войдите снова",
     "subtitle": "Naive + Mieru Управление",
     "username": "Имя пользователя",
     "password": "Пароль",
@@ -196,7 +197,8 @@
 
   "logs": {
     "title": "Логи",
-    "caddy": "Caddy",
+    "caddy": "Naive",
+    "naive": "Naive",
     "mieru": "Mieru",
     "panel": "Панель",
     "refresh": "Обновить",
@@ -222,6 +224,8 @@
     "closed": "Закрыт",
     "caddyValid": "Caddyfile валиден ✓",
     "caddyInvalid": "Caddyfile недействителен",
+    "naiveValid": "naive OK",
+    "naiveInvalid": "naive — предупреждение",
     "noOutput": "(нет вывода)",
     "naivePort": "Порт NaiveProxy {{port}}",
     "mieruPort": "Порт Mieru {{port}}"

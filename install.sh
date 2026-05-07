@@ -422,46 +422,69 @@ gather_config() {
   log_info "$(t 'Конфигурация собрана ✓' 'Configuration gathered ✓')"
 }
 
-# ── Blocker 13: Certbot TLS certificate ──────────────────────────────────────
+# ── Bug 2+5 fix: Certbot TLS certificate ────────────────────────────────────
+# Bug 2: certbot certonly does NOT accept --cert-path/--key-path; certs always
+#         land in /etc/letsencrypt/live/<domain>/. Use those paths directly.
+# Bug 5: Grant the naive process read access to letsencrypt dirs via chmod o+x
+#         (execute bit on directories so the path is traversable by root).
 obtain_tls_cert() {
   log_step "$(t 'Получение TLS-сертификата (Certbot)' 'Obtaining TLS certificate (Certbot)')"
 
   # Stop any service on port 80 temporarily
   systemctl stop naive 2>/dev/null || true
 
+  local le_cert="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
+  local le_key="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
+
+  # Bug 2 fix: certonly stores certs at LE default paths — no --cert-path/--key-path
   if certbot certonly \
        --standalone \
        --non-interactive \
        --agree-tos \
        --email "$ADMIN_EMAIL" \
        -d "$DOMAIN" \
-       --cert-path "${NAIVE_CONFIG_DIR}/tls/cert.pem" \
-       --key-path  "${NAIVE_CONFIG_DIR}/tls/key.pem" \
        2>/dev/null; then
-    CERT_PATH="${NAIVE_CONFIG_DIR}/tls/cert.pem"
-    KEY_PATH="${NAIVE_CONFIG_DIR}/tls/key.pem"
+    CERT_PATH="$le_cert"
+    KEY_PATH="$le_key"
     log_info "$(t "Сертификат получен → $CERT_PATH ✓" "Certificate obtained → $CERT_PATH ✓")"
+  elif [[ -f "$le_cert" ]]; then
+    # Certbot failed but an existing cert is already present (e.g. renewal)
+    CERT_PATH="$le_cert"
+    KEY_PATH="$le_key"
+    log_info "$(t "Используется существующий сертификат: $CERT_PATH ✓" "Using existing cert: $CERT_PATH ✓")"
   else
-    # Certbot failed (e.g. DNS not pointed yet, CI environment) — use Let's Encrypt default paths
-    local le_cert="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-    local le_key="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-    if [[ -f "$le_cert" ]]; then
-      CERT_PATH="$le_cert"
-      KEY_PATH="$le_key"
-      log_info "$(t "Используется существующий сертификат: $CERT_PATH ✓" "Using existing cert: $CERT_PATH ✓")"
-    else
-      CERT_PATH=""
-      KEY_PATH=""
-      log_warn "$(t 'Certbot не смог получить сертификат — naive будет использовать системный TLS.' \
-                   'Certbot failed to obtain cert — naive will handle TLS automatically.')"
-    fi
+    CERT_PATH=""
+    KEY_PATH=""
+    log_warn "$(t 'Certbot не смог получить сертификат — naive будет использовать системный TLS.' \
+                 'Certbot failed to obtain cert — naive will handle TLS automatically.')"
   fi
 
-  # Blocker 13: renewal hook to restart naive after cert renewal
+  # Bug 5 fix: ensure root-run naive can traverse /etc/letsencrypt dirs
+  # (directories need +x; archive dir needs group-read for renewal symlinks)
+  if [[ -d /etc/letsencrypt ]]; then
+    chmod o+x /etc/letsencrypt /etc/letsencrypt/live 2>/dev/null || true
+    [[ -d "/etc/letsencrypt/archive/${DOMAIN}" ]] && \
+      chmod o+x "/etc/letsencrypt/archive/${DOMAIN}" 2>/dev/null || true
+    # Make the cert files group-readable so non-root naive users work too
+    [[ -d "/etc/letsencrypt/live/${DOMAIN}" ]] && \
+      chmod o+r "/etc/letsencrypt/live/${DOMAIN}/"*.pem 2>/dev/null || true
+    [[ -d "/etc/letsencrypt/archive/${DOMAIN}" ]] && \
+      chmod o+r "/etc/letsencrypt/archive/${DOMAIN}/"*.pem 2>/dev/null || true
+  fi
+
+  # Renewal hook: restart naive and re-apply LE permissions after renewal
   mkdir -p /etc/letsencrypt/renewal-hooks/deploy
   cat > /etc/letsencrypt/renewal-hooks/deploy/restart-naive.sh <<'HOOKEOF'
 #!/usr/bin/env bash
 # Restart naive after Certbot certificate renewal
+# Re-apply read permissions so naive (running as root) can access updated certs
+DOMAIN=$(basename "$(ls -d /etc/letsencrypt/live/*/  2>/dev/null | head -1)")
+[[ -n "$DOMAIN" ]] && {
+  chmod o+x /etc/letsencrypt /etc/letsencrypt/live "/etc/letsencrypt/live/${DOMAIN}" \
+             "/etc/letsencrypt/archive/${DOMAIN}" 2>/dev/null || true
+  chmod o+r "/etc/letsencrypt/live/${DOMAIN}/"*.pem \
+             "/etc/letsencrypt/archive/${DOMAIN}/"*.pem 2>/dev/null || true
+}
 systemctl restart naive 2>/dev/null || true
 HOOKEOF
   chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-naive.sh
@@ -586,6 +609,20 @@ MITSVC
   fi
 }
 
+# ── Bug 3 fix: UFW helper — handles single-port (start==end) correctly ────────
+# UFW rejects "N:N/proto" range syntax when start equals end; use single-port
+# rule instead. This fixes the crash in --non-interactive mode with --mieru-start
+# and --mieru-end set to the same value.
+_ufw_mieru_rule() {
+  # Usage: _ufw_mieru_rule <start> <end> <proto> <comment>
+  local s=$1 e=$2 proto=$3 comment=$4
+  if [[ "$s" -eq "$e" ]]; then
+    ufw allow "${s}/${proto}" comment "${comment}" 2>/dev/null || true
+  else
+    ufw allow "${s}:${e}/${proto}" comment "${comment}" 2>/dev/null || true
+  fi
+}
+
 # ── UFW ───────────────────────────────────────────────────────────────────────
 setup_ufw() {
   log_step "$(t 'Настройка UFW' 'Configuring UFW firewall')"
@@ -593,11 +630,12 @@ setup_ufw() {
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow ssh
-  ufw allow "${NAIVE_PORT}/tcp"   comment "NaiveProxy HTTPS"
-  ufw allow "${MIERU_PORT_START}:${MIERU_PORT_END}/tcp" comment "Mieru TCP"
-  # Blocker: UDP port opened at OS level; mita only binds UDP when udpEnabled=true in panel
-  ufw allow "${MIERU_PORT_START}:${MIERU_PORT_END}/udp" comment "Mieru UDP"
-  # Port 80 for Certbot renewal
+  ufw allow "${NAIVE_PORT}/tcp" comment "NaiveProxy HTTPS"
+  # Bug 3 fix: single-port safe helper
+  _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" tcp "Mieru TCP"
+  # UDP opened at OS level; mita only binds UDP when udpEnabled=true in panel
+  _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" udp "Mieru UDP"
+  # Port 80 for Certbot HTTP-01 challenge
   ufw allow 80/tcp comment "Certbot HTTP-01"
   [[ "${EXPOSE_PANEL^^}" =~ ^(Y|Д)$ ]] && ufw allow 8080/tcp comment "Panel Web UI"
   ufw --force enable
@@ -696,15 +734,7 @@ start_services() {
   log_step "$(t 'Запуск сервисов' 'Starting services')"
   systemctl daemon-reload
 
-  # Apply mita config
-  if mita apply config "$MITA_STATE_FILE" 2>/dev/null; then
-    log_info "$(t 'mita config применён ✓' 'mita config applied ✓')"
-  else
-    log_warn "$(t 'mita apply config вернул ошибку (нормально при первом запуске)' \
-               'mita apply config returned non-zero (normal on first run)')"
-  fi
-
-  # Blocker 4: naive.service
+  # naive.service
   write_naive_service
   systemctl enable naive
   systemctl restart naive && \
@@ -712,13 +742,38 @@ start_services() {
     log_warn "$(t 'naive не запустился — journalctl -u naive -n 30' \
                'naive failed — journalctl -u naive -n 30')"
 
-  # mita
+  # Bug 4 fix: mita crashes when first started with an empty users[] array.
+  # Apply the portBindings config first (so mita knows the port range), but
+  # only actually start the service when there is at least one user in the
+  # state file.  The panel's rebuildServices() will start mita automatically
+  # when the first user is added through the web UI.
   write_mita_service
-  systemctl enable mita
-  systemctl restart mita && \
-    log_info "$(t 'mita запущен ✓' 'mita started ✓')" || \
-    log_warn "$(t 'mita не запустился — journalctl -u mita -n 30' \
-               'mita failed — journalctl -u mita -n 30')"
+  systemctl enable mita 2>/dev/null || true
+  if mita apply config "$MITA_STATE_FILE" 2>/dev/null; then
+    log_info "$(t 'mita config применён ✓' 'mita config applied ✓')"
+  else
+    log_warn "$(t 'mita apply config вернул ошибку — проверьте: mita status' \
+               'mita apply config returned non-zero — check: mita status')"
+  fi
+  # Count users in state file
+  local _mita_users
+  _mita_users=$(python3 -c "
+import json, sys
+try:
+    d = json.load(open('$MITA_STATE_FILE'))
+    print(len(d.get('users', [])))
+except Exception:
+    print(0)
+" 2>/dev/null || echo 0)
+  if [[ "$_mita_users" -gt 0 ]]; then
+    systemctl restart mita && \
+      log_info "$(t 'mita запущен ✓' 'mita started ✓')" || \
+      log_warn "$(t 'mita не запустился — journalctl -u mita -n 30' \
+                 'mita failed — journalctl -u mita -n 30')"
+  else
+    log_info "$(t 'mita: нет пользователей — сервис запустится автоматически после добавления первого пользователя через панель' \
+               'mita: no users yet — service will start automatically after first user is added via panel')"
+  fi
 
   # PM2 panel
   cd "$PANEL_DIR"

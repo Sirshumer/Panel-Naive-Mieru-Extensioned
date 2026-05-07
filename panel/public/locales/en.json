@@ -4,6 +4,7 @@
 
   "login": {
     "title": "RIXXX Panel",
+    "sessionExpired": "Session expired — please log in again",
     "subtitle": "Naive + Mieru Management",
     "username": "Username",
     "password": "Password",
@@ -196,7 +197,8 @@
 
   "logs": {
     "title": "Logs",
-    "caddy": "Caddy",
+    "caddy": "Naive",
+    "naive": "Naive",
     "mieru": "Mieru",
     "panel": "Panel",
     "refresh": "Refresh",
@@ -222,6 +224,8 @@
     "closed": "Closed",
     "caddyValid": "Caddyfile valid ✓",
     "caddyInvalid": "Caddyfile invalid",
+    "naiveValid": "naive OK",
+    "naiveInvalid": "naive WARN",
     "noOutput": "(no output)",
     "naivePort": "NaiveProxy port {{port}}",
     "mieruPort": "Mieru port {{port}}"
