@@ -6,7 +6,7 @@
 
 # 🛡 Panel Naive + Mieru by RIXXX
 
-**v1.0.0** — Веб-панель управления NaiveProxy + Mieru для Ubuntu/Debian VPS
+**v1.2.0** — Веб-панель управления NaiveProxy + Mieru для Ubuntu/Debian VPS
 
 [![Telegram](https://img.shields.io/badge/Telegram-@russian__paradice__vpn-2CA5E0?logo=telegram&logoColor=white)](https://t.me/russian_paradice_vpn)
 [![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-181717?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
@@ -24,7 +24,7 @@
 | Sprint | Функционал |
 |--------|-----------|
 | 1 | Авто-установщик: определение архитектуры, NaiveProxy, Mieru .deb, systemd, NTP, UFW, config.json |
-| 2 | CRUD пользователей: SQLite, перестройка Caddyfile / Mieru-конфига, cron удаления просроченных |
+| 2 | CRUD пользователей: SQLite, перестройка htpasswd / Mieru-конфига, cron удаления просроченных |
 | 3 | Настройки сервера: смена портов, паттерны трафика, MTU, авто-обновление UFW |
 | 4 | Клиентские конфиги: Naive-ссылка, Mieru sing-box JSON, универсальный конфиг, QR-коды |
 | 5 | Мониторинг: WebSocket метрики в реальном времени, трафик, квоты, история снимков |
@@ -90,11 +90,14 @@ sudo bash update.sh --expose vpn.example.com
 | `/etc/rixxx-panel/config.json` | Конфигурация панели |
 | `/etc/rixxx-panel/version` | Установленная версия |
 | `/etc/rixxx-panel/backups/` | Резервные копии (хранится последние 10) |
-| `/etc/caddy-naive/Caddyfile` | Конфиг Caddy NaiveProxy |
+| `/etc/naive/config.json` | Конфиг NaiveProxy (listen, name, auth, cert/key) |
+| `/etc/naive/htpasswd` | Пользователи NaiveProxy (bcrypt, управляется панелью) |
+| `/var/log/naive/access.log` | Лог доступа NaiveProxy |
+| `/var/log/rixxx-panel-install.log` | Лог установки |
 | `/var/lib/rixxx-panel/mita-state.json` | JSON-файл Mieru (применяется через `mita apply config`) |
 | `/var/lib/rixxx-panel/db.sqlite` | SQLite база данных пользователей |
 | `/opt/panel-naive-mieru/` | Файлы приложения панели |
-| `/usr/local/bin/caddy-naive` | Бинарный файл Caddy с плагином naive |
+| `/usr/local/bin/naive` | Бинарный файл NaiveProxy |
 
 > ⚠️ **Важно:** `/etc/mita/` — внутреннее хранилище Mieru в формате protobuf, **не редактируется вручную**.  
 > Панель использует `/var/lib/rixxx-panel/mita-state.json` и применяет его командой `mita apply config <file>`.
@@ -105,8 +108,8 @@ sudo bash update.sh --expose vpn.example.com
 
 ```bash
 # Управление сервисами
-systemctl status caddy-naive mita
-systemctl restart caddy-naive
+systemctl status naive mita
+systemctl restart naive
 systemctl restart mita
 
 # Панель (PM2)

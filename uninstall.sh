@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — uninstall.sh
+# Panel Naive + Mieru by RIXXX — uninstall.sh  v1.2.0
 # Removes all panel components, services, and configs.
 # ==============================================================================
 set -euo pipefail
@@ -16,7 +16,7 @@ die()       { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 [[ $EUID -ne 0 ]] && die "Run as root"
 
 echo -e "\n${RED}${BOLD}╔══════════════════════════════════════════════════════╗${NC}"
-echo -e "${RED}${BOLD}║   Panel Naive + Mieru — UNINSTALL                    ║${NC}"
+echo -e "${RED}${BOLD}║   Panel Naive + Mieru — UNINSTALL  v1.2.0            ║${NC}"
 echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════╝${NC}\n"
 
 echo -e "${YELLOW}WARNING: This will remove all panel data, users, and configurations.${NC}"
@@ -29,26 +29,35 @@ pm2 stop panel-naive-mieru   2>/dev/null || true
 pm2 delete panel-naive-mieru 2>/dev/null || true
 pm2 save 2>/dev/null || true
 
+# New: naive.service
+systemctl stop    naive 2>/dev/null || true
+systemctl disable naive 2>/dev/null || true
+
+# Legacy: caddy-naive (migration cleanup)
 systemctl stop    caddy-naive 2>/dev/null || true
 systemctl disable caddy-naive 2>/dev/null || true
-systemctl stop    mita        2>/dev/null || true
 
-# Note: mita service itself is managed by .deb — we leave mita installed
-# to avoid breaking other potential uses. User can run: apt remove mita
+# mita
+systemctl stop    mita 2>/dev/null || true
+# Note: mita .deb manages its own service; we leave mita installed
 
-# ── Remove systemd unit ───────────────────────────────────────
-log_step "Removing systemd unit"
-rm -f /etc/systemd/system/caddy-naive.service
+# ── Remove systemd units ──────────────────────────────────────
+log_step "Removing systemd units"
+rm -f /etc/systemd/system/naive.service
+rm -f /etc/systemd/system/caddy-naive.service   # legacy cleanup
 systemctl daemon-reload
+log_info "Systemd units removed ✓"
 
 # ── Remove binaries ───────────────────────────────────────────
 log_step "Removing binaries"
-rm -f /usr/local/bin/caddy-naive
-log_info "caddy-naive removed ✓"
+rm -f /usr/local/bin/naive
+rm -f /usr/local/bin/caddy-naive   # legacy cleanup
+log_info "Binaries removed ✓"
 
 # ── Remove config directories ─────────────────────────────────
 log_step "Removing configuration"
-rm -rf /etc/caddy-naive
+rm -rf /etc/naive             # new naive config dir
+rm -rf /etc/caddy-naive       # legacy caddy-naive dir (migration cleanup)
 rm -rf /etc/rixxx-panel
 log_info "Config directories removed ✓"
 
@@ -66,9 +75,14 @@ log_info "Database removed ✓"
 
 # ── Remove logs ───────────────────────────────────────────────
 log_step "Removing logs"
-rm -rf /var/log/caddy-naive
+rm -rf /var/log/naive
+rm -rf /var/log/caddy-naive   # legacy
 rm -f  /var/log/panel-naive-mieru.log
+rm -f  /var/log/rixxx-panel-install.log
 log_info "Logs removed ✓"
+
+# ── Remove Certbot renewal hook ───────────────────────────────
+rm -f /etc/letsencrypt/renewal-hooks/deploy/restart-naive.sh 2>/dev/null || true
 
 # ── Remove sysctl tuning ──────────────────────────────────────
 rm -f /etc/sysctl.d/99-rixxx-panel.conf
@@ -81,6 +95,8 @@ if [[ "${UFW_CLEAN^^}" == "Y" ]]; then
   ufw delete allow comment "NaiveProxy HTTPS" 2>/dev/null || true
   ufw delete allow comment "Mieru TCP"        2>/dev/null || true
   ufw delete allow comment "Mieru UDP"        2>/dev/null || true
+  ufw delete allow comment "Panel Web UI"     2>/dev/null || true
+  ufw delete allow comment "Certbot HTTP-01"  2>/dev/null || true
   ufw delete allow 8080/tcp 2>/dev/null || true
   log_info "UFW rules cleaned"
 fi
@@ -92,4 +108,5 @@ echo -e "  Notes:"
 echo -e "  - Mieru (mita) is still installed. To remove: ${CYAN}apt remove mita${NC}"
 echo -e "  - Node.js and PM2 are still installed."
 echo -e "  - Mieru config at /etc/mita/ is preserved."
+echo -e "  - Let's Encrypt certificates preserved at /etc/letsencrypt/ (if any)."
 echo ""
