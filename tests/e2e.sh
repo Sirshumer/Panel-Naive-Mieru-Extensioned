@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# tests/e2e.sh — End-to-end regression test for Panel Naive + Mieru v1.2.4
+# tests/e2e.sh — End-to-end regression test for Panel Naive + Mieru v1.2.5
 #
 # Tests:
 #   install → validate → service-check → create-user-via-API → re-validate →
@@ -102,7 +102,7 @@ detect_admin_pass() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-log_step "E2E test suite — Panel Naive + Mieru v1.2.4"
+log_step "E2E test suite — Panel Naive + Mieru v1.2.5"
 echo "  Domain:    $DOMAIN"
 echo "  Email:     $EMAIL"
 echo "  Port:      $NAIVE_PORT"
@@ -178,6 +178,12 @@ if [[ -x "$CADDY_BIN" ]]; then
   else
     fail "Caddyfile has $log_count log blocks — duplicate (Bug 21)"
   fi
+  # Bug 60: caddy fmt should have been run — check no mixed-indent artifacts
+  if "$CADDY_BIN" fmt --diff "$CADDY_FILE" 2>/dev/null | grep -q '^[-+]'; then
+    log_warn "Caddyfile has fmt differences (Bug 60 — caddy fmt may not have run)"
+  else
+    pass "Caddyfile: caddy fmt shows no differences (Bug 60)"
+  fi
 else
   skip "caddy binary not found at $CADDY_BIN — skipping validation"
 fi
@@ -189,13 +195,13 @@ log_step "Step 3: Service health"
 assert "caddy-naive.service active"          "systemctl is-active caddy-naive"
 assert "caddy-naive runs as user 'caddy' (Bug 37)" \
        "systemctl show caddy-naive -p User | grep -q 'User=caddy'"
-assert "mita.service enabled"                "systemctl is-enabled mita"
+assert "mita.service enabled (Bug 64)"       "systemctl is-enabled mita"
 assert "mita.service not active (no users yet)" "! systemctl is-active --quiet mita"
 assert "Panel process running (PM2)"         "pm2 list 2>/dev/null | grep -q panel-naive-mieru"
 assert "Panel responds on :3000"             "curl -sf '$PANEL_URL/' -o /dev/null"
 assert "config.json present"                 "[[ -f '$PANEL_CONFIG' ]]"
 assert "version file present"                "[[ -f '$VERSION_FILE' ]]"
-assert "panel version in file is 1.2.4"      "grep -q '1.2.4' '$VERSION_FILE'"
+assert "panel version in file is 1.2.5"      "grep -q '1.2.5' '$VERSION_FILE'"
 assert "DB present"                          "[[ -f '$DB_PATH' ]]"
 assert "mita-state.json present"             "[[ -f '$MITA_STATE_FILE' ]]"
 
@@ -424,7 +430,7 @@ fi
 # STEP 9 — Version consistency check (without install)
 # ══════════════════════════════════════════════════════════════════════════════
 log_step "Step 9: Version consistency across all files"
-VERSION_EXPECTED="1.2.4"
+VERSION_EXPECTED="1.2.5"
 check_version_in() {
   local label="$1" file="$2" pattern="$3"
   if [[ -f "$file" ]] && grep -qP "$pattern" "$file" 2>/dev/null; then
@@ -433,13 +439,14 @@ check_version_in() {
     fail "Version $VERSION_EXPECTED NOT found in $label"
   fi
 }
-check_version_in "install.sh"            "$REPO_ROOT/install.sh"                   "1\\.2\\.4"
-check_version_in "update.sh"             "$REPO_ROOT/update.sh"                    "TARGET_VERSION=\"1\\.2\\.4\""
-check_version_in "panel/server/index.js" "$REPO_ROOT/panel/server/index.js"        "v1\\.2\\.4"
-check_version_in "panel/public/index.html" "$REPO_ROOT/panel/public/index.html"    "v1\\.2\\.4"
-check_version_in "panel/public/app.js"   "$REPO_ROOT/panel/public/app.js"          "v1\\.2\\.4"
-check_version_in "panel/package.json"    "$REPO_ROOT/panel/package.json"           "\"version\": \"1\\.2\\.4\""
-check_version_in "CHANGELOG.md"          "$REPO_ROOT/CHANGELOG.md"                 "\[v1\\.2\\.4\]"
+check_version_in "install.sh"            "$REPO_ROOT/install.sh"                   "1\\.2\\.5"
+check_version_in "update.sh"             "$REPO_ROOT/update.sh"                    "TARGET_VERSION=\"1\\.2\\.5\""
+check_version_in "panel/server/index.js" "$REPO_ROOT/panel/server/index.js"        "v1\\.2\\.5"
+check_version_in "panel/public/index.html" "$REPO_ROOT/panel/public/index.html"    "v1\\.2\\.5"
+check_version_in "panel/public/app.js"   "$REPO_ROOT/panel/public/app.js"          "v1\\.2\\.5"
+check_version_in "panel/package.json"    "$REPO_ROOT/panel/package.json"           "\"version\": \"1\\.2\\.5\""
+check_version_in "CHANGELOG.md"          "$REPO_ROOT/CHANGELOG.md"                 "\[v1\\.2\\.5\]"
+check_version_in "caddyTemplate.js"      "$REPO_ROOT/panel/server/caddyTemplate.js" "v1\\.2\\.5"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Summary

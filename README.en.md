@@ -6,7 +6,7 @@
 
 # 🛡 Panel Naive + Mieru by RIXXX
 
-**v1.2.3** — Web management panel for NaiveProxy + Mieru on Ubuntu/Debian VPS
+**v1.2.5** — Web management panel for NaiveProxy + Mieru on Ubuntu/Debian VPS
 
 [![Telegram](https://img.shields.io/badge/Telegram-@russian__paradice__vpn-2CA5E0?logo=telegram&logoColor=white)](https://t.me/russian_paradice_vpn)
 [![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-181717?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
@@ -104,6 +104,12 @@ sudo bash update.sh --expose vpn.example.com
 
 > ⚠️ **Note:** `/etc/mita/` is Mieru's internal protobuf store — **never edit manually**.  
 > The panel uses `/var/lib/rixxx-panel/mita-state.json` and applies it via `mita apply config <file>`.
+
+> 🔐 **Security Warning (Bug 45):** The panel stores **plaintext passwords** for NaiveProxy users  
+> in SQLite (`/var/lib/rixxx-panel/db.sqlite`). This is required because `caddy-forwardproxy-naive`  
+> hashes passwords internally at startup and needs the original plaintext. **Protect the database  
+> file:** it is already mode `600 root:root`, but ensure your VPS is not compromised. Do **not**  
+> reuse VPN passwords on other services.
 
 ---
 

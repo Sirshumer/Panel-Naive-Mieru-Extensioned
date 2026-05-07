@@ -7,6 +7,56 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.5] — 2026-05-07
+
+### Fixed (P0 — release blockers)
+
+- **Bug 41 (P0, `install.sh`)**: `write_config_json()` ran before `install_panel()`, so `bcryptjs` (from `panel/node_modules`) was not yet available when the admin-password hash was generated via `node -e "require('bcryptjs')"`. **Fix**: `install_panel` is called before `write_config_json` in `main()`.
+
+- **Bug 42 (P0, `install.sh`)**: `/var/log/caddy-naive` was created by `write_caddyfile()` (running as root) before the `caddy` system user existed, leaving it owned by `root`. When Caddy later ran as `caddy`, it could not write the access log. **Fix**: `write_caddyfile()` no longer creates that directory; `start_services()` creates `/var/log/caddy-naive` and `/var/lib/caddy` **after** the `caddy` system user is created, setting `caddy:caddy 755/700` ownership.
+
+- **Bug 43 (P0, `install.sh`)**: Caddy could not store ACME certificates because `/var/lib/caddy` did not exist and `XDG_DATA_HOME` was not set in the systemd unit. **Fix**: `start_services()` creates and chowns `/var/lib/caddy`; `write_caddy_service()` adds `Environment=XDG_DATA_HOME=/var/lib/caddy`, `Environment=XDG_CONFIG_HOME=/var/lib/caddy`, and `ReadWritePaths=/var/log/caddy-naive /etc/caddy-naive /var/lib/caddy` to the unit.
+
+- **Bug 44 (P0, `panel/server/index.js`)**: `buildCaddyfile()` fell back to `passHash` (a bcrypt hash) when `password` was absent, and fed the bcrypt string directly to the Caddyfile. `caddy-forwardproxy-naive` hashes passwords internally and cannot accept a pre-hashed value, causing auth failures. **Fix**: users without a non-empty `password` field are silently skipped with a `console.warn` log line. A placeholder credential is still emitted when the filtered list is empty (Bug 34 behaviour preserved).
+
+### Fixed (P1 — correctness)
+
+- **Bug 45 (P1, `README.md` + `README.en.md`)**: No documentation warned operators about the plaintext-password storage model. `caddy-forwardproxy-naive` requires plaintext passwords at startup (it hashes them internally), so the panel must store them in SQLite. **Fix**: a `🔐 Security Warning` block added to both README files explaining the model, advising `600 root:root` permissions, and recommending against password reuse.
+
+- **Bug 50 (P1, `panel/server/index.js`)**: `reloadCaddy()` used `systemctl reload … || kill -USR1 $(pgrep -x caddy-naive …)` — the `pgrep -x` fallback matched on the exact comm-name which may differ from the binary name, sending SIGUSR1 to the wrong PID or failing silently. **Fix**: `reloadCaddy()` now calls only `systemctl reload caddy-naive`; the broken fallback is removed.
+
+- **Bug 51 (P1, `panel/server/index.js`)**: `buildMitaStateFile()` iterated `cfg.mieruPortStart … cfg.mieruPortEnd` without guarding against `undefined`/`NaN`, causing an infinite loop if the config file was missing or corrupt. **Fix**: `parseInt(...) || 2000` / `|| 2010` safe defaults applied before the loop.
+
+- **Bug 52 (P1, `panel/server/index.js`)**: `POST /api/settings/naive-port` called `restartCaddy()` and returned `{ ok }` based on the function's return value, but `restartCaddy()` returns `false` only on a Node `execSync` exception — not when `systemctl restart` exits 0 but Caddy then dies. **Fix**: after `restartCaddy()`, `systemctl is-active caddy-naive` is checked; on failure the endpoint returns HTTP 500 with an actionable error message.
+
+- **Bug 53 (P1, `panel/server/index.js`)**: `saveConfig()` called `fs.writeFileSync()` directly on the live `config.json` — a process kill mid-write left a truncated/corrupt file. **Fix**: `saveConfig()` writes to `config.json.new` first, then atomically renames to `config.json`.
+
+### Fixed (P2 — lower priority)
+
+- **Bug 55 (P2, `install.sh`)**: `caddy-naive` binary was `chmod 750`, preventing non-root users from running `caddy validate`. **Fix**: `start_services()` uses `chmod 755` (already applied in v1.2.4 code, now formally documented here).
+
+- **Bug 60 (P2, `install.sh`)**: `write_caddyfile()` did not run `caddy fmt`, leaving the Caddyfile with mixed indentation that generated fmt warnings on every service start. **Fix**: `caddy fmt --overwrite "$CADDY_FILE"` is called immediately after the atomic write; errors are logged (non-fatal) to `$INSTALL_LOG`.
+
+- **Bug 62 (P2, `install.sh`)**: `caddy-naive.service` lacked restart-storm protection; repeated ACME failures could hammer Let's Encrypt rate limits. **Fix**: `StartLimitBurst=5`, `StartLimitIntervalSec=300`, `RestartSec=10` added to the unit (already applied in v1.2.4 code; now formally documented).
+
+- **Bug 63 (P2, `panel/server/caddyTemplate.js`)**: `roll_size` value used extra trailing spaces (`roll_size     50mb`) that `caddy fmt` normalised on every reload, producing noisy diffs. **Fix**: aligned spacing reduced to single space (`roll_size 50mb`).
+
+- **Bug 64 (P2, `install.sh`)**: `mita.service` was enabled in `start_services()` but not verified with `systemctl enable`. **Fix**: `systemctl enable mita 2>/dev/null || true` is already present and correct; now explicitly tested in `e2e.sh`.
+
+### Added / Changed
+
+- `panel/server/caddyTemplate.js` version comment → `v1.2.5`.
+- `panel/server/index.js` version comment → `v1.2.5`; `DEFAULT_CONFIG.version` → `1.2.5`.
+- `panel/package.json` version → `1.2.5`.
+- `panel/public/index.html` version labels → `v1.2.5`.
+- `panel/public/app.js` version comment → `v1.2.5`.
+- `install.sh` header → `v1.2.5`; `CURRENT_VERSION="1.2.5"`.
+- `update.sh` header → `v1.2.5`; `TARGET_VERSION="1.2.5"`.
+- `README.md` / `README.en.md` version badges → `v1.2.5`.
+- `tests/e2e.sh` version checks updated to `1.2.5`; added check for `mita.service` enabled (Bug 64).
+
+---
+
 ## [v1.2.4] — 2026-05-07
 
 ### Fixed (release-blockers — regression from v1.2.3 on Ubuntu 24.04 amd64)

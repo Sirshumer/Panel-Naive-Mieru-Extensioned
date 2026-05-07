@@ -1,6 +1,6 @@
 'use strict';
 /**
- * caddyTemplate.js — canonical Caddyfile renderer  v1.2.4
+ * caddyTemplate.js — canonical Caddyfile renderer  v1.2.5
  *
  * Single source of truth used by:
  *   • panel/server/index.js   → buildCaddyfile()
@@ -87,6 +87,7 @@ function render(cfg, naiveUsers) {
   // Caddy's automatic HTTPS handles TLS for domains that resolve to this
   // server's IP.  The global  email  directive supplies the ACME account.
 
+  // Bug 63: use consistent 2-space indentation throughout to silence caddy fmt
   return `{
   # Bug 30: evaluate forwardproxy handler before file_server
   order forward_proxy before file_server
@@ -95,7 +96,7 @@ function render(cfg, naiveUsers) {
   log {
     # Bug 38: 30-day retention by age instead of a fixed file count
     output file ${logFile} {
-      roll_size     50mb
+      roll_size 50mb
       roll_keep_for 720h
     }
     format json
