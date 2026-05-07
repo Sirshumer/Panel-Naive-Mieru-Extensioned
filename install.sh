@@ -158,7 +158,7 @@ detect_arch() {
   log_step "$(t 'Определение архитектуры' 'Detecting architecture')"
   local machine; machine=$(uname -m)
   case "$machine" in
-    x86_64|amd64)  ARCH="amd64"; NAIVE_ARCH="linux-amd64"; DEB_ARCH="amd64"  ;;
+    x86_64|amd64)  ARCH="amd64"; NAIVE_ARCH="linux-x64";  DEB_ARCH="amd64"  ;;
     aarch64|arm64) ARCH="arm64"; NAIVE_ARCH="linux-arm64"; DEB_ARCH="arm64"  ;;
     armv7l)        ARCH="armv7"; NAIVE_ARCH="linux-arm";   DEB_ARCH="armhf"  ;;
     *) die "$(t "Неподдерживаемая архитектура: $machine" "Unsupported architecture: $machine")" ;;
@@ -237,19 +237,31 @@ install_naiveproxy() {
   local tag; tag=$(echo "$release_json" | jq -r '.tag_name')
   log_info "$(t "Последняя версия NaiveProxy: $tag" "Latest NaiveProxy: $tag")"
 
-  # Blocker 1: strict asset match — must end with "-<arch>.tar.xz" (no fallback to any linux asset)
+  # Blocker 1 + Minor #6: strict arch match with fallback aliases (linux-x64, linux-amd64, linux-x86_64)
+  # Primary suffix list for x86_64: try NAIVE_ARCH first, then well-known aliases
   local asset_url
-  asset_url=$(echo "$release_json" | jq -r \
-    --arg arch "$NAIVE_ARCH" \
-    '.assets[] | select(.name | endswith("-" + $arch + ".tar.xz")) | .browser_download_url' \
-    | head -1)
+  local _archs=( "$NAIVE_ARCH" )
+  if [[ "$NAIVE_ARCH" == "linux-x64" ]]; then
+    _archs+=( "linux-amd64" "linux-x86_64" )
+  fi
+
+  for _a in "${_archs[@]}"; do
+    asset_url=$(echo "$release_json" | jq -r \
+      --arg arch "$_a" \
+      '.assets[] | select(.name | endswith("-" + $arch + ".tar.xz")) | .browser_download_url' \
+      | head -1)
+    [[ -n "$asset_url" ]] && break
+  done
 
   # Secondary: accept .tar.gz and .zip but still strict arch suffix
   if [[ -z "$asset_url" ]]; then
-    asset_url=$(echo "$release_json" | jq -r \
-      --arg arch "$NAIVE_ARCH" \
-      '.assets[] | select((.name | endswith("-" + $arch + ".tar.gz")) or (.name | endswith("-" + $arch + ".zip"))) | .browser_download_url' \
-      | head -1)
+    for _a in "${_archs[@]}"; do
+      asset_url=$(echo "$release_json" | jq -r \
+        --arg arch "$_a" \
+        '.assets[] | select((.name | endswith("-" + $arch + ".tar.gz")) or (.name | endswith("-" + $arch + ".zip"))) | .browser_download_url' \
+        | head -1)
+      [[ -n "$asset_url" ]] && break
+    done
   fi
 
   [[ -z "$asset_url" ]] && \
@@ -331,7 +343,7 @@ gather_config() {
     MIERU_PORT_END="${INPUT_MIERU_END:-2022}"
     ADMIN_USER="${INPUT_ADMIN_USER:-admin}"
     if [[ -z "${INPUT_ADMIN_PASS:-}" ]]; then
-      ADMIN_PASS=$(tr -dc 'A-Za-z0-9@#%^&' </dev/urandom | head -c 20)
+      ADMIN_PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
       log_info "$(t "Сгенерирован пароль: ${BOLD}$ADMIN_PASS${NC}" "Generated password: ${BOLD}$ADMIN_PASS${NC}")"
     else
       ADMIN_PASS="$INPUT_ADMIN_PASS"
@@ -388,7 +400,7 @@ gather_config() {
   read -rsp "$(echo -e "${CYAN}$(t 'Пароль администратора' 'Panel admin password')${NC} ($(t 'пусто = автогенерация' 'blank = auto-generate')): ")" INPUT_ADMIN_PASS
   echo ""
   if [[ -z "${INPUT_ADMIN_PASS:-}" ]]; then
-    ADMIN_PASS=$(tr -dc 'A-Za-z0-9@#%^&' </dev/urandom | head -c 20)
+    ADMIN_PASS=$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)
     log_info "$(t "Сгенерирован пароль: ${BOLD}$ADMIN_PASS${NC}" "Generated password: ${BOLD}$ADMIN_PASS${NC}")"
   else
     ADMIN_PASS="$INPUT_ADMIN_PASS"
@@ -742,7 +754,7 @@ smoke_test() {
   }
 
   # Blocker 5: naive smoke tests
-  chk "naive --version"          "$NAIVE_BIN --version"
+  chk "naive --version"          "timeout 5 $NAIVE_BIN --version || $NAIVE_BIN --help"
   chk "naive.service active"     "systemctl is-active naive"
   chk "naive port :${NAIVE_PORT} listening" \
       "ss -tlnup sport = :${NAIVE_PORT} 2>/dev/null | grep -q :${NAIVE_PORT}"

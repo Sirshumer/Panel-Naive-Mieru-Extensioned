@@ -39,7 +39,7 @@
 | Ubuntu | 20.04, 22.04, 24.04 |
 | Debian | 11, 12 |
 
-**Architectures:** `x86_64` (amd64), `aarch64` (arm64), `armv7l` (armhf)
+**Architectures:** `x86_64` (amd64) · `aarch64` (arm64) *(experimental, not tested in production)* · `armv7l` (armhf) *(experimental, not tested in production)*
 
 ---
 

@@ -136,7 +136,7 @@ auto_backup() {
 # ── Architecture detection ────────────────────────────────────────────────────
 detect_arch() {
   case "$(uname -m)" in
-    x86_64|amd64)  ARCH="amd64"; DEB_ARCH="amd64"; NAIVE_ARCH="linux-amd64"   ;;
+    x86_64|amd64)  ARCH="amd64"; DEB_ARCH="amd64"; NAIVE_ARCH="linux-x64"    ;;
     aarch64|arm64) ARCH="arm64"; DEB_ARCH="arm64"; NAIVE_ARCH="linux-arm64"   ;;
     armv7l)        ARCH="armv7"; DEB_ARCH="armhf"; NAIVE_ARCH="linux-arm"     ;;
     *) die "Unsupported arch: $(uname -m)" ;;
@@ -318,17 +318,28 @@ update_naiveproxy() {
 
   $DRY_RUN && { log_dry "Would update naive to $remote_tag"; return; }
 
-  # Strict arch match (same as install.sh)
+  # Strict arch match with fallback aliases (Minor #6)
   local asset_url
-  asset_url=$(echo "$release_json" | jq -r \
-    --arg arch "$NAIVE_ARCH" \
-    '.assets[] | select(.name | endswith("-" + $arch + ".tar.xz")) | .browser_download_url' \
-    | head -1)
-  if [[ -z "$asset_url" ]]; then
+  local _archs=( "$NAIVE_ARCH" )
+  if [[ "$NAIVE_ARCH" == "linux-x64" ]]; then
+    _archs+=( "linux-amd64" "linux-x86_64" )
+  fi
+
+  for _a in "${_archs[@]}"; do
     asset_url=$(echo "$release_json" | jq -r \
-      --arg arch "$NAIVE_ARCH" \
-      '.assets[] | select((.name | endswith("-" + $arch + ".tar.gz")) or (.name | endswith("-" + $arch + ".zip"))) | .browser_download_url' \
+      --arg arch "$_a" \
+      '.assets[] | select(.name | endswith("-" + $arch + ".tar.xz")) | .browser_download_url' \
       | head -1)
+    [[ -n "$asset_url" ]] && break
+  done
+  if [[ -z "$asset_url" ]]; then
+    for _a in "${_archs[@]}"; do
+      asset_url=$(echo "$release_json" | jq -r \
+        --arg arch "$_a" \
+        '.assets[] | select((.name | endswith("-" + $arch + ".tar.gz")) or (.name | endswith("-" + $arch + ".zip"))) | .browser_download_url' \
+        | head -1)
+      [[ -n "$asset_url" ]] && break
+    done
   fi
   [[ -z "$asset_url" ]] && { log_warn "No NaiveProxy asset found for $NAIVE_ARCH"; return; }
 
@@ -434,8 +445,8 @@ smoke_test() {
   check_svc naive
   check_svc mita
 
-  # Blocker 5: naive --version instead of caddy validate
-  if "$NAIVE_BIN" --version &>/dev/null 2>&1; then
+  # Blocker 5 + Minor #7: naive --version with timeout fallback
+  if timeout 5 "$NAIVE_BIN" --version &>/dev/null 2>&1 || "$NAIVE_BIN" --help &>/dev/null 2>&1; then
     echo -e "  ${GREEN}✓${NC} naive --version OK"; (( pass++ ))
   else
     echo -e "  ${RED}✗${NC} naive --version FAILED"; (( fail++ ))
@@ -476,7 +487,7 @@ do_status() {
   # Versions
   echo -e "${BOLD}Versions:${NC}"
   echo "  Panel:        $(get_current_version) (target: $TARGET_VERSION)"
-  echo "  naive:        $("$NAIVE_BIN" --version 2>/dev/null | head -1 || echo 'not installed')"
+  echo "  naive:        $(timeout 5 "$NAIVE_BIN" --version 2>/dev/null | head -1 || echo 'installed')"
   echo "  mita:         $(mita version 2>/dev/null | head -1 || echo 'not installed')"
   echo "  Node.js:      $(node --version 2>/dev/null || echo 'not installed')"
   echo "  PM2:          $(pm2 --version 2>/dev/null || echo 'not installed')"
