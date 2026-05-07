@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — install.sh  v1.2.4
+# Panel Naive + Mieru by RIXXX — install.sh  v1.2.5
 # Caddy-forwardproxy-naive (amd64-only) + Mieru (mita) + fake-site + probe-resistance
 # Supports: Ubuntu 20.04/22.04/24.04, Debian 11/12 | x86_64 only
 # ==============================================================================
@@ -10,7 +10,7 @@ set -euo pipefail
 INSTALL_LOG="/var/log/rixxx-panel-install.log"
 mkdir -p "$(dirname "$INSTALL_LOG")"
 exec > >(tee -a "$INSTALL_LOG") 2>&1
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] install.sh v1.2.4 started (PID $$)"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] install.sh v1.2.5 started (PID $$)"
 
 # ── Bug 19: ERR trap — log failure location and guide user to recovery ────────
 on_error() {
@@ -57,7 +57,7 @@ FAKE_SITE_DIR="/var/www/fake-site"
 NAIVE_BIN="/usr/local/bin/naive"        # may still exist from v1.2.x; will be removed
 NAIVE_CONFIG_DIR="/etc/naive"
 
-CURRENT_VERSION="1.2.4"
+CURRENT_VERSION="1.2.5"
 REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
 # Bug 1: direct download URL for caddy-forwardproxy-naive (amd64 only)
 CADDY_NAIVE_RELEASES="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
@@ -524,7 +524,9 @@ FAKEHTML
 # Bug 38: log rotation uses  roll_keep_for 720h  (30 days).
 write_caddyfile() {
   log_step "$(t 'Запись Caddyfile' 'Writing Caddyfile')"
-  mkdir -p "$CADDY_CONFIG_DIR" /var/log/caddy-naive
+  # Bug 42: do NOT create /var/log/caddy-naive here — start_services() does it
+  # after the 'caddy' system user is created, ensuring correct ownership.
+  mkdir -p "$CADDY_CONFIG_DIR"
 
   # Bug 27: backup existing Caddyfile before overwriting
   if [[ -f "$CADDY_FILE" ]]; then
@@ -575,6 +577,7 @@ write_caddyfile() {
   local template_js="${PANEL_DIR}/server/caddyTemplate.js"
   local caddyfile_content
 
+  # Bug 46: log template errors to INSTALL_LOG instead of swallowing them
   if [[ -f "$template_js" ]] && command -v node &>/dev/null; then
     caddyfile_content=$(node -e "
       const t = require('$template_js');
@@ -588,7 +591,11 @@ write_caddyfile() {
         logFile:     '/var/log/caddy-naive/access.log'
       };
       process.stdout.write(t.render(cfg, users));
-    " 2>/dev/null) || true
+    " 2>>"$INSTALL_LOG") || true
+    if [[ -z "${caddyfile_content:-}" ]]; then
+      log_warn "$(t 'caddyTemplate.js вернул пустой вывод — используем встроенный шаблон' \
+                   'caddyTemplate.js render returned empty output — using inline fallback')"
+    fi
   fi
 
   # Fallback: render inline (identical rules — used before panel is installed)
@@ -659,6 +666,12 @@ ${auth_lines}
   mv "$tmp_file" "$CADDY_FILE"
   chmod 640 "$CADDY_FILE"
 
+  # Bug 60: format Caddyfile with caddy fmt --overwrite to ensure canonical style
+  # (silences caddy fmt warnings during service start; non-fatal if caddy fmt fails)
+  "$CADDY_BIN" fmt --overwrite "$CADDY_FILE" 2>>"$INSTALL_LOG" || \
+    log_warn "$(t 'caddy fmt --overwrite вернул ошибку (не критично)' \
+                 'caddy fmt --overwrite returned an error (non-fatal)')"
+
   # Bug 24: validate is FATAL — die on failure, not log_warn
   local validate_out
   if validate_out=$("$CADDY_BIN" validate --config "$CADDY_FILE" --adapter caddyfile 2>&1); then
@@ -696,6 +709,9 @@ Description=Caddy forwardproxy-naive Server
 Documentation=https://github.com/klzgrad/forwardproxy
 After=network.target network-online.target
 Requires=network-online.target
+# Bug 62: cap restart storms — 5 failures in 5 min → failed state (stops hammering ACME)
+StartLimitBurst=5
+StartLimitIntervalSec=300
 
 [Service]
 Type=notify
@@ -706,11 +722,15 @@ ExecStart=${CADDY_BIN} run --config ${CADDY_FILE} --adapter caddyfile
 ExecReload=/bin/kill -USR1 \$MAINPID
 TimeoutStopSec=5
 Restart=on-failure
-RestartSec=5
+# Bug 62: slow restarts to reduce ACME rate-limit pressure
+RestartSec=10
 LimitNOFILE=1048576
 PrivateTmp=true
 ProtectSystem=full
-ReadWritePaths=/var/log/caddy-naive /etc/caddy-naive
+# Bug 43: ACME certs stored under XDG_DATA_HOME; both dirs need write access
+Environment=XDG_DATA_HOME=/var/lib/caddy
+Environment=XDG_CONFIG_HOME=/var/lib/caddy
+ReadWritePaths=/var/log/caddy-naive /etc/caddy-naive /var/lib/caddy
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
@@ -909,42 +929,77 @@ VEREOF
 }
 
 # ── Start services ────────────────────────────────────────────────────────────
-# Bug 22: write_caddy_service() called from main() before start_services().
-# Bug 25: die if caddy-naive is not active after restart.
-# Bug 37: caddy-naive runs as dedicated 'caddy' system user with cap_net_bind_service.
+# Bug 22:  write_caddy_service() called from main() before start_services().
+# Bug 37:  caddy-naive runs as dedicated 'caddy' system user.
+# Bug 42:  caddy user + all dirs created BEFORE systemctl restart so the service
+#          can write logs and ACME certs without permission-denied errors.
+# Bug 43:  /var/lib/caddy created + owned by caddy for ACME cert storage.
+# Bug 61:  Caddy failure is non-fatal — install continues so the user can reach
+#          the panel UI and diagnose/fix from there.
+# Bug 62:  ACME port-wait loop warns if :443 is not listening after 60 s.
 start_services() {
   log_step "$(t 'Запуск сервисов' 'Starting services')"
 
-  # Bug 37: create 'caddy' system user if absent
+  # ── 1. System user — MUST be first so all chown calls succeed ────────────────
   if ! id caddy &>/dev/null; then
-    useradd --system --no-create-home --shell /usr/sbin/nologin caddy 2>/dev/null || true
+    useradd --system --no-create-home --shell /usr/sbin/nologin caddy
     log_info "$(t 'Системный пользователь caddy создан ✓' 'System user caddy created ✓')"
   fi
-  # Ensure Caddy binary ownership + cap_net_bind_service for the caddy user
+
+  # ── 2. Bug 42: clean up any stale root-owned log file from write_caddyfile ──
+  if [[ -f /var/log/caddy-naive/access.log ]]; then
+    local _log_owner
+    _log_owner=$(stat -c '%U' /var/log/caddy-naive/access.log 2>/dev/null || echo root)
+    if [[ "$_log_owner" != "caddy" ]]; then
+      log_warn "$(t "Удаляем access.log с владельцем $_log_owner (нужен caddy)" \
+                   "Removing stale access.log owned by $_log_owner (need caddy)")"
+      rm -f /var/log/caddy-naive/access.log
+    fi
+  fi
+
+  # ── 3. Directories — created here with correct owner (Bug 42 + Bug 43) ───────
+  mkdir -p /var/log/caddy-naive /var/lib/caddy
+  chown -R caddy:caddy /var/log/caddy-naive /var/lib/caddy
+  chmod 755 /var/log/caddy-naive
+  chmod 700 /var/lib/caddy
+
+  # ── 4. Caddy binary + config permissions ─────────────────────────────────────
+  # Bug 55: chmod 755 (not 750) so any user can run caddy-naive validate
   chown root:caddy "$CADDY_BIN" 2>/dev/null || true
-  chmod 750 "$CADDY_BIN" 2>/dev/null || true
+  chmod 755 "$CADDY_BIN" 2>/dev/null || true
   setcap 'cap_net_bind_service=+ep' "$CADDY_BIN" 2>/dev/null || true
-  # Give caddy group read access to config
   chgrp -R caddy "$CADDY_CONFIG_DIR" 2>/dev/null || true
   chmod -R g+r  "$CADDY_CONFIG_DIR" 2>/dev/null || true
   chmod 640 "$CADDY_FILE" 2>/dev/null || true
-  # Caddy needs write access to its log dir
-  mkdir -p /var/log/caddy-naive
-  chown caddy:caddy /var/log/caddy-naive 2>/dev/null || true
 
   systemctl daemon-reload
 
-  # caddy-naive.service (unit already written by main() → write_caddy_service)
+  # ── 5. caddy-naive (Bug 61: non-fatal — continue if Caddy fails) ─────────────
   systemctl enable caddy-naive
-  systemctl restart caddy-naive
+  systemctl restart caddy-naive || true
   sleep 2
-  # Bug 25: fatal if caddy-naive did not become active
-  if ! systemctl is-active --quiet caddy-naive; then
+  if systemctl is-active --quiet caddy-naive; then
+    log_info "$(t 'caddy-naive запущен ✓' 'caddy-naive started ✓')"
+    # Bug 58: wait up to 60s for port 443 to appear (ACME challenge may delay it)
+    local _port_wait=0
+    while [[ $_port_wait -lt 30 ]]; do
+      ss -tlnp 2>/dev/null | grep -q ":${NAIVE_PORT} " && break
+      sleep 2; (( _port_wait++ ))
+    done
+    if ! ss -tlnp 2>/dev/null | grep -q ":${NAIVE_PORT} "; then
+      log_warn "$(t "caddy-naive ещё не слушает :${NAIVE_PORT} после 60 с — ACME challenge может быть в процессе" \
+                   "caddy-naive not yet listening on :${NAIVE_PORT} after 60 s — ACME challenge may still be running")"
+      log_warn "$(t 'Проверьте: dig +short $DOMAIN, journalctl -u caddy-naive -n 50' \
+                   'Check: dig +short $DOMAIN, journalctl -u caddy-naive -n 50')"
+    fi
+  else
+    # Bug 61: non-fatal — dump journal then warn; panel + mita still installed
     log_error "$(t 'caddy-naive не запустился! Вывод journalctl:' \
                    'caddy-naive failed to start! journalctl output:')"
     journalctl -u caddy-naive -n 40 --no-pager 2>/dev/null || true
-    die "$(t 'caddy-naive не активен — установка прервана. Запустите: journalctl -u caddy-naive -n 50' \
-              'caddy-naive is not active — install aborted. Run: journalctl -u caddy-naive -n 50')"
+    log_warn "$(t \
+      'caddy-naive не активен — установка продолжается. После входа в панель запустите: bash update.sh --repair' \
+      'caddy-naive is not active — install continues. After opening the panel run: bash update.sh --repair')"
   fi
   log_info "$(t 'caddy-naive запущен ✓' 'caddy-naive started ✓')"
 
@@ -1216,8 +1271,10 @@ main() {
   write_mita_state
   write_caddyfile
   write_caddy_service
-  write_config_json
+  # Bug 41: install_panel BEFORE write_config_json so that bcryptjs (from
+  # panel/node_modules) is available when we call  node -e "require('bcryptjs')"
   install_panel
+  write_config_json
   write_version
   maybe_ufw
   start_services

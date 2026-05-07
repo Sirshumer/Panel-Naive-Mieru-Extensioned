@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — update.sh  v1.2.4
+# Panel Naive + Mieru by RIXXX — update.sh  v1.2.5
 # Usage: bash update.sh [--dry-run] [--force] [--expose <domain>] [--ssh-only]
 #                       [--status] [--repair] [--help] [-y]
 #
@@ -8,6 +8,11 @@
 #   - --repair calls /api/services/rebuild-all to regenerate Caddyfile
 #   - update_caddy_naive() replaces update_naiveproxy()
 #   - rebuild_caddyfile_direct() now uses caddyTemplate.js (Bug 26)
+# v1.2.5: Hotfixes 41-64 — /var/lib/caddy perms, atomic saveConfig(),
+#   plaintext-password guard (Bug 44), reloadCaddy() simplified (Bug 50),
+#   mieruPort safe defaults (Bug 51), naive-port active check (Bug 52),
+#   caddy fmt (Bug 60), caddyTemplate indentation (Bug 63), README security
+#   notice (Bug 45).
 # ==============================================================================
 set -euo pipefail
 
@@ -22,7 +27,7 @@ log_dry()   { echo -e "${YELLOW}[DRY-RUN]${NC} $*"; }
 die()       { log_error "$*"; exit 1; }
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-TARGET_VERSION="1.2.4"
+TARGET_VERSION="1.2.5"
 PANEL_DIR="/opt/panel-naive-mieru"
 PANEL_CONFIG="/etc/rixxx-panel/config.json"
 VERSION_FILE="/etc/rixxx-panel/version"
@@ -552,6 +557,14 @@ update_panel() {
 }
 
 # ── Smoke tests ───────────────────────────────────────────────────────────────
+smoke_test() {
+  log_step "Running smoke tests"
+  sleep 3
+
+  local pass=0 fail=0
+
+  check_svc() {
+    if systemctl is-active --qu��────
 smoke_test() {
   log_step "Running smoke tests"
   sleep 3

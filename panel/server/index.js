@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru by RIXXX — Express backend  v1.2.3
+ * Panel Naive + Mieru by RIXXX — Express backend  v1.2.5
  * Node.js 20 LTS + Express + better-sqlite3 + WebSocket + node-cron
  *
  * v1.2.3: Migrated from standalone naive binary to caddy-forwardproxy-naive.
@@ -7,6 +7,13 @@
  *   reloadCaddy()              — systemctl reload caddy-naive (graceful, zero downtime)
  *   applyAllConfigs()          — rebuilds Caddyfile + applies Mita config in one call
  *   /api/services/rebuild-all  — endpoint used by update.sh --repair
+ *
+ * v1.2.5 hotfixes:
+ *   Bug 44: buildCaddyfile() skips users without plaintext password (logs warning)
+ *   Bug 50: reloadCaddy() uses only systemctl reload — pgrep fallback removed
+ *   Bug 51: buildMitaStateFile() uses safe defaults for mieruPortStart/End
+ *   Bug 52: /api/settings/naive-port verifies caddy-naive is active after restart
+ *   Bug 53: saveConfig() performs atomic write via .new tmp file then rename
  *
  * Bug 5:  Sing-Box outbound uses `transport` field (not `protocol`)
  * Bug 7:  UFW single-port vs range helper (ufwMieruRule)
@@ -66,7 +73,7 @@ try {
     probeSecret:   '',
     mitaStateFile: MITA_STATE_FILE,
     trafficPattern: 'NOOP', mtu: 1400, udpEnabled: false,
-    language: 'ru', version: '1.2.4'
+    language: 'ru', version: '1.2.5'
   };
 }
 
@@ -158,10 +165,15 @@ function deleteUser(id) {
 }
 
 // ── Persist config ────────────────────────────────────────────────────────────
+// Bug 53: atomic write via .new temp file then rename — prevents partial reads
+//         if the process is interrupted during the write.
 function saveConfig() {
   try {
-    fs.mkdirSync(path.dirname(PANEL_CONFIG), { recursive: true });
-    fs.writeFileSync(PANEL_CONFIG, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+    const dir = path.dirname(PANEL_CONFIG);
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = PANEL_CONFIG + '.new';
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, PANEL_CONFIG);   // atomic replace
   } catch (e) { console.error('[CFG]', e.message); }
 }
 
@@ -194,11 +206,20 @@ function saveConfig() {
 // Bug 21: no site-level log block — global block covers all traffic.
 function buildCaddyfile(config, users) {
   // Filter to naive-protocol users only
+  // Bug 44: skip users without a plaintext password — caddy-forwardproxy-naive
+  //         hashes the password internally; we cannot feed it a bcrypt hash.
+  //         Log a warning so operators know which users are missing.
   const naiveUsers = users.filter(u => {
     try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
     catch { return true; }
-  // Normalise to {username, password} shape expected by caddyTemplate.js
-  }).map(u => ({ username: u.username, password: u.password || u.passHash || '' }));
+  }).map(u => {
+    const pass = (u.password || '').trim();
+    if (!pass) {
+      console.warn(`[CADDY] Bug 44: user '${u.username}' has no plaintext password — skipped from Caddyfile`);
+      return null;
+    }
+    return { username: u.username, password: pass };
+  }).filter(Boolean);
 
   // Read probe secret from config or from the file written by install.sh
   const probeSecret = (config.probeSecret || '').trim() ||
@@ -291,11 +312,12 @@ function writeCaddyfileAtomic(content) {
 }
 
 // ── reloadCaddy() — graceful reload (zero downtime) ──────────────────────────
+// Bug 50: use only systemctl reload — the old pgrep fallback was unreliable
+//         because 'pgrep -x caddy-naive' matches on exact comm-name which may
+//         differ from the binary name, causing SIGUSR1 to miss the process.
 function reloadCaddy() {
   try {
-    // systemctl reload sends SIGUSR1 to caddy (graceful config reload)
-    execSync('systemctl reload caddy-naive 2>/dev/null || kill -USR1 $(pgrep -x caddy-naive 2>/dev/null) 2>/dev/null || true',
-             { timeout: 10000 });
+    execSync('systemctl reload caddy-naive', { timeout: 10000 });
     return true;
   } catch { return false; }
 }
@@ -318,6 +340,7 @@ function ufwMieruRule(action, start, end, proto, comment) {
 }
 
 // ── Mieru state JSON builder ──────────────────────────────────────────────────
+// Bug 51: use safe defaults for mieruPortStart/End in case config values absent
 function buildMitaStateFile() {
   const allUsers = getAllUsers();
   const mieruUsers = allUsers.filter(u => {
@@ -325,9 +348,13 @@ function buildMitaStateFile() {
     catch { return true; }
   });
 
+  // Bug 51: parseInt guards against undefined/NaN causing infinite loops
+  const portStart = parseInt(cfg.mieruPortStart, 10) || 2000;
+  const portEnd   = parseInt(cfg.mieruPortEnd,   10) || 2010;
+
   // TCP-only by default; UDP is opt-in via cfg.udpEnabled
   const portBindings = [];
-  for (let p = cfg.mieruPortStart; p <= cfg.mieruPortEnd; p++) {
+  for (let p = portStart; p <= portEnd; p++) {
     portBindings.push({ port: p, protocol: 'TCP' });
     if (cfg.udpEnabled) portBindings.push({ port: p, protocol: 'UDP' });
   }
@@ -679,6 +706,7 @@ app.delete('/api/users/:id', requireAuth, (req, res) => {
 // ── Server settings ───────────────────────────────────────────────────────────
 
 // Caddy port: rebuild Caddyfile + full restart (port binding change)
+// Bug 52: verify caddy-naive is active after restart; return HTTP 500 if not
 app.post('/api/settings/naive-port', requireAuth, (req, res) => {
   const p = parseInt(req.body.port, 10);
   if (!p || p < 1 || p > 65535)
@@ -687,8 +715,17 @@ app.post('/api/settings/naive-port', requireAuth, (req, res) => {
   try {
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
-    const ok = restartCaddy();
-    res.json({ ok, message: `NaiveProxy port changed to ${p}. Clients must download new configs.` });
+    restartCaddy();
+    // Bug 52: confirm the service is actually running after restart
+    let active = false;
+    try { execSync('systemctl is-active caddy-naive', { timeout: 8000 }); active = true; } catch {}
+    if (!active) {
+      return res.status(500).json({
+        ok: false,
+        error: 'caddy-naive failed to start after port change — run: journalctl -u caddy-naive -n 30'
+      });
+    }
+    res.json({ ok: true, message: `NaiveProxy port changed to ${p}. Clients must download new configs.` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -957,7 +994,7 @@ app.get('/api/status', requireAuth, async (req, res) => {
         os:   osInfo.distro + ' ' + osInfo.release,
         arch: osInfo.arch
       },
-      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.2.4' },
+      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.2.5' },
       domain:   cfg.domain,
       serverIp: cfg.serverIp,
       language: cfg.language || 'ru'
@@ -1182,7 +1219,7 @@ server.listen(PORT, HOST, () => {
     '  ██║  ██║ ██║ ██╔╝ ██╗ ██╔╝ ██╗ ██╔╝ ██╗',
     '  ╚═╝  ╚═╝ ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝',
     '',
-    `  Panel Naive + Mieru v${cfg.version || '1.2.4'} by RIXXX  (Caddy-forwardproxy-naive)`,
+    `  Panel Naive + Mieru v${cfg.version || '1.2.5'} by RIXXX  (Caddy-forwardproxy-naive)`,
     `  http://${HOST}:${PORT}/`,
     HOST === '127.0.0.1' ? `  ⚠  SSH-only: ssh -L 3000:127.0.0.1:3000 root@<server>` : '',
     ''
