@@ -125,6 +125,13 @@
 
   "settings": {
     "title": "Server Settings",
+    "probeSecretTitle": "Probe Resistance Secret",
+    "probeSecretDesc": "Secret token clients present in headers. Unrecognised clients see the fake site instead.",
+    "probeSecretLabel": "Probe Secret (min 8 chars)",
+    "probeSecretPlaceholder": "Enter probe secret",
+    "applyProbeSecret": "Apply Secret",
+    "probeSecretUpdated": "Probe secret updated — Caddy reloaded",
+    "probeSecretTooShort": "Probe secret must be at least 8 characters",
     "naivePortTitle": "NaiveProxy Port",
     "naivePortDesc": "Change the HTTPS port for NaiveProxy. Reloads Caddy only — no service restart.",
     "naivePortLabel": "Port (1–65535)",

@@ -1,19 +1,17 @@
 /**
- * Panel Naive + Mieru by RIXXX — Express backend  v1.2.0
+ * Panel Naive + Mieru by RIXXX — Express backend  v1.2.3
  * Node.js 20 LTS + Express + better-sqlite3 + WebSocket + node-cron
  *
- * IMPORTANT: Mieru (mita) uses an internal protobuf config store at /etc/mita/.
- * JSON is NEVER written there directly. Instead, the panel:
- *   1. Builds a complete JSON state file at MITA_STATE_FILE
- *   2. Applies it via: mita apply config <file>
- *   3. Reloads without dropping connections: mita reload
- *   4. Full restart (port changes only): mita stop && mita start
+ * v1.2.3: Migrated from standalone naive binary to caddy-forwardproxy-naive.
+ *   buildCaddyfile(cfg, users) — rebuilds /etc/caddy-naive/Caddyfile atomically
+ *   reloadCaddy()              — systemctl reload caddy-naive (graceful, zero downtime)
+ *   applyAllConfigs()          — rebuilds Caddyfile + applies Mita config in one call
+ *   /api/services/rebuild-all  — endpoint used by update.sh --repair
  *
- * Blocker 7: NaiveProxy now uses a standalone 'naive' binary with config.json
- *   + htpasswd file for multi-user auth. No Caddyfile is generated.
- *   buildNaiveConfig() — rewrites /etc/naive/config.json atomically
- *   buildHtpasswd()    — rewrites /etc/naive/htpasswd (bcrypt, one user per line)
- *   After any user CRUD: buildHtpasswd() → reloadNaive() (or restartNaive())
+ * Bug 5:  Sing-Box outbound uses `transport` field (not `protocol`)
+ * Bug 7:  UFW single-port vs range helper (ufwMieruRule)
+ * Bug 12: server_ports array in Mieru Sing-Box config
+ * Bug 13: version synced via scripts/sync-version.sh
  */
 'use strict';
 
@@ -35,16 +33,18 @@ const si             = require('systeminformation');
 // ── Paths ─────────────────────────────────────────────────────────────────────
 const PANEL_CONFIG    = '/etc/rixxx-panel/config.json';
 const DB_PATH         = '/var/lib/rixxx-panel/db.sqlite';
-// Panel-owned JSON applied via `mita apply config <file>` (NOT /etc/mita/ directly)
 const MITA_STATE_FILE = '/var/lib/rixxx-panel/mita-state.json';
 
-// Blocker 7: naive binary paths (replaces caddy-naive / Caddyfile)
-const NAIVE_BIN         = '/usr/local/bin/naive';
-const NAIVE_CONFIG_DIR  = '/etc/naive';
-const NAIVE_CONFIG_FILE = '/etc/naive/config.json';
-const NAIVE_HTPASSWD    = '/etc/naive/htpasswd';
-const LOG_NAIVE         = '/var/log/naive/access.log';
+// v1.2.3: Caddy-forwardproxy-naive paths (replaces standalone naive binary)
+const CADDY_BIN         = '/usr/local/bin/caddy-naive';
+const CADDY_CONFIG_DIR  = '/etc/caddy-naive';
+const CADDY_FILE        = '/etc/caddy-naive/Caddyfile';
+const FAKE_SITE_DIR     = '/var/www/fake-site';
+const LOG_CADDY         = '/var/log/caddy-naive/access.log';
 const LOG_PANEL         = '/var/log/panel-naive-mieru.log';
+
+// Legacy path kept for migration detection only
+const LEGACY_NAIVE_BIN = '/usr/local/bin/naive';
 
 // ── Load system config ────────────────────────────────────────────────────────
 let cfg = {};
@@ -58,21 +58,25 @@ try {
     naivePort: 443, mieruPortStart: 2012, mieruPortEnd: 2022,
     panelPort: 3000, panelHost: '127.0.0.1', exposePanel: false,
     dbPath:        DB_PATH,
-    naiveConfig:   NAIVE_CONFIG_FILE,
-    naiveHtpasswd: NAIVE_HTPASSWD,
-    naiveBin:      NAIVE_BIN,
+    caddyBin:      CADDY_BIN,
+    caddyFile:     CADDY_FILE,
+    caddyConfigDir: CADDY_CONFIG_DIR,
+    fakeSiteDir:   FAKE_SITE_DIR,
+    fakeSiteUrl:   'https://www.example.com',
+    probeSecret:   '',
     mitaStateFile: MITA_STATE_FILE,
     trafficPattern: 'NOOP', mtu: 1400, udpEnabled: false,
-    language: 'ru', version: '1.2.0'
+    language: 'ru', version: '1.2.3'
   };
 }
 
 // Resolved paths (prefer config values, fall back to constants)
 const resolvedDb        = cfg.dbPath        || DB_PATH;
 const resolvedMitaFile  = cfg.mitaStateFile || MITA_STATE_FILE;
-const resolvedNaiveCfg  = cfg.naiveConfig   || NAIVE_CONFIG_FILE;
-const resolvedHtpasswd  = cfg.naiveHtpasswd || NAIVE_HTPASSWD;
-const resolvedNaiveBin  = cfg.naiveBin      || NAIVE_BIN;
+const resolvedCaddyFile = cfg.caddyFile     || CADDY_FILE;
+const resolvedCaddyBin  = cfg.caddyBin      || CADDY_BIN;
+const resolvedCaddyCfgDir = cfg.caddyConfigDir || CADDY_CONFIG_DIR;
+const resolvedFakeSiteDir = cfg.fakeSiteDir  || FAKE_SITE_DIR;
 
 // ── SQLite (better-sqlite3) ───────────────────────────────────────────────────
 let db = null;
@@ -108,7 +112,7 @@ try {
       value TEXT
     );
   `);
-  // Migrate: add password column if missing (upgrade from v1.0.0)
+  // Migrate: add password column if missing (upgrade from v1.0.x)
   try { db.exec(`ALTER TABLE users ADD COLUMN password TEXT NOT NULL DEFAULT ''`); } catch {}
 } catch (err) {
   console.error('[DB] SQLite unavailable:', err.message, '— using in-memory store');
@@ -161,72 +165,108 @@ function saveConfig() {
   } catch (e) { console.error('[CFG]', e.message); }
 }
 
-// ── Blocker 7: buildHtpasswd() ────────────────────────────────────────────────
-// Writes /etc/naive/htpasswd with bcrypt-hashed lines (username:$2y$12$…)
-// Naive reads this file on reload/restart.
-function buildHtpasswd(users) {
+// ── Bug 1/v1.2.3: buildCaddyfile() ───────────────────────────────────────────
+// Rebuilds the Caddyfile from current cfg and user list.
+// Uses basicauth lines for naive-enabled users.
+// probe_resistance shows fake site to unrecognised clients.
+function buildCaddyfile(config, users) {
   const naiveUsers = users.filter(u => {
     try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
     catch { return true; }
   });
-  const lines = naiveUsers.map(u => `${u.username}:${u.passHash}`).join('\n');
-  fs.mkdirSync(path.dirname(resolvedHtpasswd), { recursive: true });
-  const tmp = resolvedHtpasswd + '.new';
-  fs.writeFileSync(tmp, lines + (lines ? '\n' : ''), { mode: 0o640 });
-  fs.renameSync(tmp, resolvedHtpasswd);   // atomic replace
-}
 
-// ── Blocker 7: buildNaiveConfig() ────────────────────────────────────────────
-// Writes /etc/naive/config.json atomically.
-// Schema: { listen, name, auth (htpasswd path), padding, log, cert?, key? }
-function buildNaiveConfig() {
-  fs.mkdirSync(NAIVE_CONFIG_DIR, { recursive: true });
-  const naiveCfg = {
-    listen:  `https://:${cfg.naivePort}`,
-    name:    cfg.domain || 'localhost',
-    auth:    resolvedHtpasswd,
-    padding: true,
-    log:     LOG_NAIVE
-  };
-  // Include TLS cert/key paths when present (Certbot)
-  if (cfg.certPath && fs.existsSync(cfg.certPath)) {
-    naiveCfg.cert = cfg.certPath;
-    naiveCfg.key  = cfg.keyPath;
-  }
-  const tmp = resolvedNaiveCfg + '.new';
-  fs.mkdirSync(path.dirname(resolvedNaiveCfg), { recursive: true });
-  fs.writeFileSync(tmp, JSON.stringify(naiveCfg, null, 2), { mode: 0o640 });
-  fs.renameSync(tmp, resolvedNaiveCfg);   // atomic replace
-}
+  const probeSecret = config.probeSecret ||
+    (fs.existsSync(path.join(resolvedCaddyCfgDir, 'probe_secret'))
+      ? fs.readFileSync(path.join(resolvedCaddyCfgDir, 'probe_secret'), 'utf8').trim()
+      : '');
 
-// ── Bug 3 fix: UFW single-port helper ───────────────────────────────────────
-// UFW rejects "N:N/proto" when start===end; use a single-port rule instead.
-function ufwMieruRule(action, start, end, proto, comment) {
-  if (start === end) {
-    execSync(`ufw ${action} allow ${start}/${proto}${comment ? ` comment "${comment}"` : ''} 2>/dev/null || true`, { timeout: 5000 });
-  } else {
-    execSync(`ufw ${action} allow ${start}:${end}/${proto}${comment ? ` comment "${comment}"` : ''} 2>/dev/null || true`, { timeout: 5000 });
+  const fakeSiteDir = resolvedFakeSiteDir;
+  const email       = config.adminEmail  || '';
+  const domain      = config.domain      || 'localhost';
+  const port        = config.naivePort   || 443;
+
+  // Build basicauth block lines
+  const authLines = naiveUsers
+    .map(u => `      basicauth ${u.username} ${u.password || u.passHash}`)
+    .join('\n');
+
+  const probeResLine = probeSecret
+    ? `      probe_resistance ${probeSecret}`
+    : '';
+
+  return `{
+  email ${email}
+  admin off
+  log {
+    output file ${LOG_CADDY} {
+      roll_size 50mb
+      roll_keep 5
+    }
+    format json
   }
 }
 
-// ── Blocker 7: Service helpers — naive ───────────────────────────────────────
-// Reload naive (SIGHUP for hot-reload without dropping connections)
-function reloadNaive() {
+:80 {
+  redir https://{host}{uri} permanent
+}
+
+${domain}:${port} {
+  tls ${email}
+
+  route {
+    forward_proxy {
+      basic_auth
+${authLines}
+      hide_ip
+      hide_via
+${probeResLine}
+    }
+    file_server {
+      root ${fakeSiteDir}
+    }
+  }
+
+  log {
+    output file ${LOG_CADDY}
+    format json
+  }
+}
+`;
+}
+
+// ── writeCaddyfileAtomic() ────────────────────────────────────────────────────
+function writeCaddyfileAtomic(content) {
+  fs.mkdirSync(resolvedCaddyCfgDir, { recursive: true });
+  const tmp = resolvedCaddyFile + '.new';
+  fs.writeFileSync(tmp, content, { mode: 0o640 });
+  fs.renameSync(tmp, resolvedCaddyFile);   // atomic replace
+}
+
+// ── reloadCaddy() — graceful reload (zero downtime) ──────────────────────────
+function reloadCaddy() {
   try {
-    execSync('systemctl reload naive 2>/dev/null || kill -HUP $(pgrep -x naive 2>/dev/null) 2>/dev/null || true',
+    // systemctl reload sends SIGUSR1 to caddy (graceful config reload)
+    execSync('systemctl reload caddy-naive 2>/dev/null || kill -USR1 $(pgrep -x caddy-naive 2>/dev/null) 2>/dev/null || true',
              { timeout: 10000 });
     return true;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
-// Full naive restart (needed for port/TLS changes)
-function restartNaive() {
+// ── restartCaddy() — full restart (needed for port/domain changes) ───────────
+function restartCaddy() {
   try {
-    execSync('systemctl restart naive 2>/dev/null', { timeout: 15000 });
+    execSync('systemctl restart caddy-naive 2>/dev/null', { timeout: 15000 });
     return true;
   } catch { return false; }
+}
+
+// ── Bug 7: UFW single-port helper ────────────────────────────────────────────
+function ufwMieruRule(action, start, end, proto, comment) {
+  const commentPart = comment ? ` comment "${comment}"` : '';
+  const cmd = (start === end)
+    ? `ufw ${action} allow ${start}/${proto}${commentPart} 2>/dev/null || true`
+    : `ufw ${action} allow ${start}:${end}/${proto}${commentPart} 2>/dev/null || true`;
+  try { execSync(cmd, { timeout: 5000 }); } catch {}
 }
 
 // ── Mieru state JSON builder ──────────────────────────────────────────────────
@@ -254,7 +294,6 @@ function buildMitaStateFile() {
     mtu: cfg.mtu || 1400
   };
 
-  // Only add trafficPattern when not NOOP (omitting = NOOP default)
   const pat = cfg.trafficPattern || 'NOOP';
   if (pat !== 'NOOP') {
     const patMap = {
@@ -268,7 +307,7 @@ function buildMitaStateFile() {
   fs.mkdirSync(path.dirname(resolvedMitaFile), { recursive: true });
   const tmp = resolvedMitaFile + '.new';
   fs.writeFileSync(tmp, JSON.stringify(mieruCfg, null, 2), { mode: 0o600 });
-  fs.renameSync(tmp, resolvedMitaFile);       // atomic replace
+  fs.renameSync(tmp, resolvedMitaFile);
 
   shredFile(resolvedMitaFile + '.last');
   try { fs.copyFileSync(resolvedMitaFile, resolvedMitaFile + '.last'); } catch {}
@@ -276,7 +315,6 @@ function buildMitaStateFile() {
   return resolvedMitaFile;
 }
 
-// Apply config (no connection drop) — used for user add/update/delete
 function applyMitaConfig() {
   const file = buildMitaStateFile();
   try {
@@ -284,12 +322,9 @@ function applyMitaConfig() {
     execSync('mita reload 2>/dev/null', { timeout: 15000 });
     shredFile(file + '.last');
     return true;
-  } catch {
-    return false;
-  }
+  } catch { return false; }
 }
 
-// Full restart — required ONLY when port range changes
 function restartMieru() {
   try {
     execSync('mita stop 2>/dev/null || true', { timeout: 10000 });
@@ -307,6 +342,21 @@ function shredFile(fp) {
   catch { try { fs.unlinkSync(fp); } catch {} }
 }
 
+// ── applyAllConfigs() — unified pipeline ─────────────────────────────────────
+// Rebuilds Caddyfile, reloads Caddy, rebuilds mita state, applies mita config.
+// Called after every user CRUD operation.
+function applyAllConfigs() {
+  let caddyOk = false, mitaOk = false;
+  try {
+    const content = buildCaddyfile(cfg, getAllUsers());
+    writeCaddyfileAtomic(content);
+    caddyOk = reloadCaddy();
+  } catch (e) { console.error('[CADDY]', e.message); }
+  try { mitaOk = applyMitaConfig(); }
+  catch (e) { console.error('[MITA]', e.message); }
+  return { caddyOk, mitaOk, servicesReloaded: caddyOk && mitaOk };
+}
+
 // ── Express app ───────────────────────────────────────────────────────────────
 const app    = express();
 const server = http.createServer(app);
@@ -314,19 +364,20 @@ const server = http.createServer(app);
 app.use(helmet({
   contentSecurityPolicy: {
     directives: {
-      defaultSrc: ["'self'"],
-      scriptSrc:  ["'self'", "'unsafe-inline'",
-                   'https://fonts.googleapis.com',
-                   'https://cdn.jsdelivr.net'],
-      styleSrc:   ["'self'", "'unsafe-inline'",
-                   'https://fonts.googleapis.com',
-                   'https://fonts.gstatic.com'],
-      fontSrc:    ["'self'", 'https://fonts.gstatic.com'],
-      connectSrc: ["'self'", 'ws:', 'wss:', 'https://fonts.googleapis.com'],
-      imgSrc:     ["'self'", 'data:', 'blob:'],
-      mediaSrc:   ["'none'"],
-      objectSrc:  ["'none'"],
-      frameAncestors: ["'none'"]
+      defaultSrc:      ["'self'"],
+      scriptSrc:       ["'self'",
+                        'https://cdn.jsdelivr.net'],
+      // Bug CSP: script-src-attr 'none' prevents inline event handlers
+      scriptSrcAttr:   ["'none'"],
+      styleSrc:        ["'self'", "'unsafe-inline'",
+                        'https://fonts.googleapis.com',
+                        'https://fonts.gstatic.com'],
+      fontSrc:         ["'self'", 'https://fonts.gstatic.com'],
+      connectSrc:      ["'self'", 'ws:', 'wss:', 'https://fonts.googleapis.com'],
+      imgSrc:          ["'self'", 'data:', 'blob:'],
+      mediaSrc:        ["'none'"],
+      objectSrc:       ["'none'"],
+      frameAncestors:  ["'none'"]
     }
   },
   crossOriginEmbedderPolicy: false
@@ -378,7 +429,6 @@ app.post('/api/login', loginLimiter, (req, res) => {
   if (!username || !password)
     return res.status(400).json({ error: 'Missing credentials' });
 
-  // Bcrypt-only — no SHA-256 fallback
   const isAdmin =
     username === cfg.adminUser &&
     cfg.adminPassHash &&
@@ -406,7 +456,8 @@ app.get('/api/config', requireAuth, (req, res) => {
 
 app.post('/api/config', requireAuth, (req, res) => {
   ['domain','naivePort','mieruPortStart','mieruPortEnd',
-   'trafficPattern','mtu','udpEnabled','adminEmail','language'].forEach(k => {
+   'trafficPattern','mtu','udpEnabled','adminEmail','language',
+   'probeSecret','fakeSiteUrl'].forEach(k => {
     if (req.body[k] !== undefined) cfg[k] = req.body[k];
   });
   saveConfig();
@@ -425,7 +476,7 @@ app.post('/api/config/password', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
-// ── Validation helpers ───────────────────────────────────────────────────────
+// ── Validation helpers ────────────────────────────────────────────────────────
 const VALID_PROTOCOLS = ['naive', 'mieru'];
 const USERNAME_RE     = /^[a-zA-Z0-9_.-]{1,64}$/;
 const EMAIL_RE        = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
@@ -433,7 +484,6 @@ const EMAIL_RE        = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 /**
  * Bug 8: normalise quota — accept quotaMB or quotaGb (gb * 1024 → MB).
  * Bug 9: validate all user input fields.
- * Returns { error } string on failure, or { quotaMB, protocols } on success.
  */
 function validateUserInput({ email, username, password, protocols, quotaMB, quotaGb }, requirePassword) {
   if (!username || !USERNAME_RE.test(username))
@@ -474,7 +524,6 @@ function validateUserInput({ email, username, password, protocols, quotaMB, quot
 
 /**
  * Bug 7: parse all TEXT JSON columns back to JS types when returning user rows.
- * Bug 6: helper that rebuilds services and returns reloaded status.
  */
 function parseUserRow(u) {
   return {
@@ -485,17 +534,7 @@ function parseUserRow(u) {
   };
 }
 
-function rebuildServices() {
-  let naiveOk = false, mitaOk = false;
-  try { buildHtpasswd(getAllUsers()); naiveOk = reloadNaive(); }
-  catch (e) { console.error('[NAIVE]', e.message); }
-  try { mitaOk = applyMitaConfig(); }
-  catch (e) { console.error('[MITA]', e.message); }
-  return { naiveOk, mitaOk, servicesReloaded: naiveOk && mitaOk };
-}
-
 // ── Users API ─────────────────────────────────────────────────────────────────
-// Bug 7: parse protocols (TEXT → Array) in GET /api/users
 app.get('/api/users', requireAuth, (req, res) => {
   const users = getAllUsers().map(u => {
     const { passHash, password, ...rest } = u;
@@ -505,7 +544,6 @@ app.get('/api/users', requireAuth, (req, res) => {
 });
 
 app.post('/api/users', requireAuth, (req, res) => {
-  // Bug 9: full validation; Bug 8: quotaGb support
   const { email, username, password, expiry, protocols, quotaMB, quotaGb } = req.body;
   const validation = validateUserInput(
     { email, username, password, protocols, quotaMB, quotaGb }, true);
@@ -515,7 +553,6 @@ app.post('/api/users', requireAuth, (req, res) => {
   if (getUserByUsername(username))
     return res.status(409).json({ error: 'Username already exists' });
 
-  // Validate expiry if provided
   if (expiry && isNaN(Date.parse(expiry)))
     return res.status(400).json({ error: 'expiry must be a valid ISO date string' });
 
@@ -523,8 +560,8 @@ app.post('/api/users', requireAuth, (req, res) => {
   const user = {
     id:        uuidv4(),
     email, username,
-    passHash:  bcrypt.hashSync(password, 12),  // for naive htpasswd
-    password,                                   // plain text for mita apply config
+    passHash:  bcrypt.hashSync(password, 12),
+    password,
     expiry:    expiry || null,
     protocols: JSON.stringify(validation.protocols),
     quotaMB:   validation.quotaMB,
@@ -533,12 +570,11 @@ app.post('/api/users', requireAuth, (req, res) => {
   };
   upsertUser(user);
 
-  // Bug 6: rebuild htpasswd + reload naive; rebuild mita state; report status
-  const svcStatus = rebuildServices();
+  // Bug 6: rebuild Caddyfile + reload Caddy; rebuild mita state; report status
+  const svcStatus = applyAllConfigs();
 
   const { passHash, password: _p, ...safe } = user;
-  // Bug 7: return protocols as array
-  res.status(201).json({ ...parseUserRow(safe), ...svcStatus });
+  res.status(201).json({ ok: true, ...parseUserRow(safe), ...svcStatus });
 });
 
 app.put('/api/users/:id', requireAuth, (req, res) => {
@@ -546,7 +582,6 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   if (!user) return res.status(404).json({ error: 'User not found' });
 
   const { email, username, password, expiry, protocols, quotaMB, quotaGb } = req.body;
-  // Bug 9: validate; Bug 8: quotaGb support
   const validation = validateUserInput(
     { email: email ?? user.email,
       username: username ?? user.username,
@@ -579,39 +614,37 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   }
   upsertUser(updated);
 
-  // Bug 6: rebuild services and report status
-  const svcStatus = rebuildServices();
+  const svcStatus = applyAllConfigs();
 
   const { passHash, password: _p, ...safe } = updated;
-  // Bug 7: return protocols as array
-  res.json({ ...parseUserRow(safe), ...svcStatus });
+  res.json({ ok: true, ...parseUserRow(safe), ...svcStatus });
 });
 
 app.delete('/api/users/:id', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   deleteUser(req.params.id);
-  // Bug 6: rebuild services and report status
-  const svcStatus = rebuildServices();
+  const svcStatus = applyAllConfigs();
   res.json({ ok: true, ...svcStatus });
 });
 
-// ── Server settings — Sprint 3 ────────────────────────────────────────────────
+// ── Server settings ───────────────────────────────────────────────────────────
 
-// Naive port: rebuild config + full restart (port binding change)
+// Caddy port: rebuild Caddyfile + full restart (port binding change)
 app.post('/api/settings/naive-port', requireAuth, (req, res) => {
   const p = parseInt(req.body.port, 10);
   if (!p || p < 1 || p > 65535)
     return res.status(400).json({ error: 'Invalid port (1–65535)' });
   cfg.naivePort = p; saveConfig();
   try {
-    buildNaiveConfig();
-    const ok = restartNaive();
+    const content = buildCaddyfile(cfg, getAllUsers());
+    writeCaddyfileAtomic(content);
+    const ok = restartCaddy();
     res.json({ ok, message: `NaiveProxy port changed to ${p}. Clients must download new configs.` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Mieru ports: UFW update + FULL restart
+// Mieru ports: UFW update + full restart
 app.post('/api/settings/mieru-ports', requireAuth, (req, res) => {
   const s = parseInt(req.body.portStart, 10);
   const e = parseInt(req.body.portEnd,   10);
@@ -622,7 +655,7 @@ app.post('/api/settings/mieru-ports', requireAuth, (req, res) => {
   cfg.mieruPortStart = s; cfg.mieruPortEnd = e; saveConfig();
 
   try {
-    // Bug 3 fix: use single-port helper to avoid UFW crash when start===end
+    // Bug 7: use single-port helper to avoid UFW crash when start===end
     ufwMieruRule('delete', oldS, oldE, 'tcp', '');
     ufwMieruRule('delete', oldS, oldE, 'udp', '');
     ufwMieruRule('',       s,    e,    'tcp', 'Mieru TCP');
@@ -659,7 +692,7 @@ app.post('/api/settings/udp-toggle', requireAuth, (req, res) => {
   cfg.udpEnabled = enable; saveConfig();
   try {
     const s = cfg.mieruPortStart, e = cfg.mieruPortEnd;
-    // Bug 3 fix: use single-port helper to avoid UFW crash when start===end
+    // Bug 7: use single-port helper to avoid UFW crash when start===end
     if (enable) {
       ufwMieruRule('', s, e, 'udp', 'Mieru UDP');
     } else {
@@ -669,7 +702,7 @@ app.post('/api/settings/udp-toggle', requireAuth, (req, res) => {
   try {
     const ok = restartMieru();
     res.json({ ok, udpEnabled: enable,
-      message: `UDP ${enable ? 'enabled' : 'disabled'}. Mieru restarted. Clients must download new configs.` });
+      message: `UDP ${enable ? 'enabled' : 'disabled'}. Mieru restarted.` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
@@ -683,21 +716,60 @@ app.post('/api/settings/language', requireAuth, (req, res) => {
   res.json({ ok: true, language });
 });
 
-// ── Client configs — Sprint 4 ─────────────────────────────────────────────────
+// Probe secret update — rebuilds Caddyfile and reloads Caddy
+app.post('/api/settings/probe-secret', requireAuth, (req, res) => {
+  const { probeSecret } = req.body;
+  if (!probeSecret || probeSecret.length < 8)
+    return res.status(400).json({ error: 'probe_secret must be at least 8 characters' });
+  cfg.probeSecret = probeSecret; saveConfig();
+  // Persist to file for install.sh smoke tests
+  try {
+    fs.writeFileSync(path.join(resolvedCaddyCfgDir, 'probe_secret'), probeSecret, { mode: 0o600 });
+  } catch {}
+  try {
+    const content = buildCaddyfile(cfg, getAllUsers());
+    writeCaddyfileAtomic(content);
+    const ok = reloadCaddy();
+    res.json({ ok, message: 'Probe secret updated. Caddy reloaded.' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
 
-// Sprint 4 canonical routes
+// Bug 15: /api/services/rebuild-all — used by update.sh --repair
+app.post('/api/services/rebuild-all', requireAuth, (req, res) => {
+  try {
+    const content = buildCaddyfile(cfg, getAllUsers());
+    writeCaddyfileAtomic(content);
+    const caddyOk = reloadCaddy();
+    const mitaOk  = applyMitaConfig();
+    res.json({ ok: true, caddyOk, mitaOk,
+      message: 'Caddyfile and mita-state.json rebuilt from database.' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Client configs ────────────────────────────────────────────────────────────
+
+// Naive link (used with caddy-forwardproxy)
 app.get('/api/users/:id/config/naive', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
+  // naive+https:// link for caddy-forwardproxy-naive
   const link = `naive+https://${user.username}:${encodeURIComponent(password)}@${cfg.domain}:${cfg.naivePort}`;
   res.json({ link, username: user.username });
 });
 
+// Bug 5: transport field (not protocol); Bug 12: server_ports array
 app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
+
+  // Build server_ports array (Bug 12)
+  const serverPorts = [];
+  for (let p = cfg.mieruPortStart; p <= cfg.mieruPortEnd; p++) {
+    serverPorts.push(p);
+  }
+
   const singboxCfg = {
     log: { level: 'info', timestamp: true },
     outbounds: [
@@ -705,8 +777,11 @@ app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
         server_port: cfg.mieruPortStart,
+        // Bug 12: include server_ports for full range awareness
+        server_ports: serverPorts,
         username: user.username, password,
-        protocol: 'TCP',
+        // Bug 5: transport field (TCP/UDP) — not protocol
+        transport: 'TCP',
         multiplex: { enabled: false }
       },
       { type: 'direct', tag: 'direct' },
@@ -727,6 +802,13 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
+
+  // Bug 12: server_ports for Mieru outbound
+  const serverPorts = [];
+  for (let p = cfg.mieruPortStart; p <= cfg.mieruPortEnd; p++) {
+    serverPorts.push(p);
+  }
+
   const universalCfg = {
     log: { level: 'info', timestamp: true },
     dns: {
@@ -745,6 +827,7 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
         interval: '3m', tolerance: 50
       },
       {
+        // Naive via Caddy-forwardproxy: uses HTTP CONNECT over TLS
         type: 'http', tag: 'naive-out',
         server: cfg.domain, server_port: cfg.naivePort,
         username: user.username, password,
@@ -754,8 +837,11 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
         server_port: cfg.mieruPortStart,
+        // Bug 12: server_ports array
+        server_ports: serverPorts,
         username: user.username, password,
-        protocol: 'TCP',
+        // Bug 5: transport field
+        transport: 'TCP',
         multiplex: { enabled: false }
       },
       { type: 'direct', tag: 'direct' },
@@ -778,17 +864,17 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
 });
 
 // Back-compat aliases
-app.get('/api/users/:id/naive-link',       requireAuth, (req, res) => {
+app.get('/api/users/:id/naive-link', requireAuth, (req, res) => {
   res.redirect(307, `/api/users/${req.params.id}/config/naive${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`);
 });
-app.get('/api/users/:id/mieru-config',     requireAuth, (req, res) => {
+app.get('/api/users/:id/mieru-config', requireAuth, (req, res) => {
   res.redirect(307, `/api/users/${req.params.id}/config/mieru${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`);
 });
 app.get('/api/users/:id/universal-config', requireAuth, (req, res) => {
   res.redirect(307, `/api/users/${req.params.id}/config/universal${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`);
 });
 
-// ── Monitoring — Sprint 5 ─────────────────────────────────────────────────────
+// ── Monitoring — /api/status ──────────────────────────────────────────────────
 app.get('/api/status', requireAuth, async (req, res) => {
   try {
     const [cpu, mem, disk, osInfo] = await Promise.all([
@@ -796,13 +882,21 @@ app.get('/api/status', requireAuth, async (req, res) => {
     ]);
     const exec_ = cmd => { try { return execSync(cmd, { timeout: 3000 }).toString().trim(); } catch { return ''; } };
 
+    // v1.2.3: check caddy-naive service (not legacy naive)
+    const caddyActive  = exec_('systemctl is-active caddy-naive') === 'active';
+    const caddyVersion = exec_(`${resolvedCaddyBin} version 2>/dev/null | head -1`) ||
+                         exec_(`${resolvedCaddyBin} --version 2>/dev/null | head -1`);
+
     res.json({
       services: {
-        // Blocker 7: naive service (not caddy-naive)
-        naive: { active: exec_('systemctl is-active naive') === 'active',
-                 version: exec_(`${resolvedNaiveBin} --version 2>/dev/null | head -1`) },
-        mieru: { active: exec_('systemctl is-active mita') === 'active',
-                 version: exec_('mita version 2>/dev/null | head -1') },
+        naive: {   // kept as 'naive' key for front-end compatibility
+          active:  caddyActive,
+          version: caddyVersion
+        },
+        mieru: {
+          active:  exec_('systemctl is-active mita') === 'active',
+          version: exec_('mita version 2>/dev/null | head -1')
+        },
         panel: { active: true }
       },
       system: {
@@ -815,7 +909,7 @@ app.get('/api/status', requireAuth, async (req, res) => {
         os:   osInfo.distro + ' ' + osInfo.release,
         arch: osInfo.arch
       },
-      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.2.0' },
+      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.2.3' },
       domain:   cfg.domain,
       serverIp: cfg.serverIp,
       language: cfg.language || 'ru'
@@ -823,7 +917,7 @@ app.get('/api/status', requireAuth, async (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// User traffic stats (merged DB + live mita describe users)
+// User traffic stats
 app.get('/api/stats/users', requireAuth, (req, res) => {
   const exec_ = cmd => { try { return execSync(cmd, { timeout: 8000 }).toString(); } catch { return ''; } };
   const raw   = exec_('mita describe users 2>/dev/null');
@@ -845,7 +939,6 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
   res.json(users);
 });
 
-// Parse `mita describe users` output
 function parseMitaUsers(raw) {
   const users = [];
   if (!raw) return users;
@@ -879,9 +972,11 @@ app.get('/api/logs/:service', requireAuth, (req, res) => {
   const lines = Math.min(parseInt(req.query.lines || '100', 10), 1000);
   let cmd;
   switch (service) {
-    // Blocker 7: naive logs (not caddy-naive)
+    // v1.2.3: caddy-naive logs (supports legacy 'naive' and 'caddy' aliases)
+    case 'naive':
     case 'caddy':
-    case 'naive': cmd = `journalctl -u naive -n ${lines} --no-pager 2>/dev/null || tail -n ${lines} ${LOG_NAIVE} 2>/dev/null`; break;
+      cmd = `journalctl -u caddy-naive -n ${lines} --no-pager 2>/dev/null || tail -n ${lines} ${LOG_CADDY} 2>/dev/null`;
+      break;
     case 'mieru': cmd = `journalctl -u mita -n ${lines} --no-pager 2>/dev/null || mita describe log 2>/dev/null`; break;
     case 'panel': cmd = `tail -n ${lines} ${LOG_PANEL} 2>/dev/null`; break;
     default: return res.status(400).json({ error: 'Unknown service' });
@@ -894,7 +989,6 @@ app.get('/api/logs/:service', requireAuth, (req, res) => {
 app.get('/api/diagnostics', requireAuth, async (_req, res) => {
   const exec_ = cmd => { try { return execSync(cmd, { timeout: 4000 }).toString().trim(); } catch { return ''; } };
 
-  // Blocker 8: port-listen check helper
   const chkPort = p => {
     try {
       return parseInt(
@@ -903,14 +997,14 @@ app.get('/api/diagnostics', requireAuth, async (_req, res) => {
     } catch { return false; }
   };
 
-  // Blocker 5: naive --version instead of caddy validate
-  let naiveVersionOk = false, naiveVersionStr = '';
+  // v1.2.3: caddy-naive version check (replaces naive --version)
+  let caddyVersionOk = false, caddyVersionStr = '';
   try {
-    naiveVersionStr = execSync(`${resolvedNaiveBin} --version 2>&1`, { timeout: 6000 }).toString().trim();
-    naiveVersionOk  = naiveVersionStr.length > 0;
-  } catch (e) { naiveVersionStr = e.message; }
+    caddyVersionStr = execSync(`${resolvedCaddyBin} version 2>&1`, { timeout: 6000 }).toString().trim() ||
+                     execSync(`${resolvedCaddyBin} --version 2>&1`, { timeout: 6000 }).toString().trim();
+    caddyVersionOk  = caddyVersionStr.length > 0;
+  } catch (e) { caddyVersionStr = e.message; }
 
-  // Blocker 8: check all Mieru ports in range (sample first and last)
   const mieruPortsListening = [];
   for (const p of [cfg.mieruPortStart, cfg.mieruPortEnd]) {
     if (p && chkPort(p)) mieruPortsListening.push(p);
@@ -920,31 +1014,35 @@ app.get('/api/diagnostics', requireAuth, async (_req, res) => {
     ports: {
       naive:       chkPort(cfg.naivePort),
       mieru:       chkPort(cfg.mieruPortStart),
-      // Blocker 8: extended Mieru port check
       mieruPorts:  mieruPortsListening
     },
-    // Blocker 5: naive --version replaces caddy validate
-    naiveVersionOk,
-    naiveVersion:      naiveVersionStr,
-    naiveConfigExists: fs.existsSync(resolvedNaiveCfg),
-    htpasswdExists:    fs.existsSync(resolvedHtpasswd),
-    htpasswdUsers:     fs.existsSync(resolvedHtpasswd)
-      ? fs.readFileSync(resolvedHtpasswd, 'utf8').split('\n').filter(l => l.trim()).length
-      : 0,
+    naiveVersionOk:    caddyVersionOk,
+    naiveVersion:      caddyVersionStr,    // kept as 'naiveVersion' for front-end compat
+    naiveConfigExists: fs.existsSync(resolvedCaddyFile),
+    htpasswdExists:    false,              // htpasswd removed in v1.2.3 (users in Caddyfile)
+    htpasswdUsers:     0,
+    caddyfileExists:   fs.existsSync(resolvedCaddyFile),
+    caddyfileUsers:    (() => {
+      if (!fs.existsSync(resolvedCaddyFile)) return 0;
+      const content = fs.readFileSync(resolvedCaddyFile, 'utf8');
+      return (content.match(/^\s*basicauth\s+\S+\s+\S+/gm) || []).length;
+    })(),
     mitaStatus:   exec_('mita status 2>/dev/null'),
     mitaConfig:   exec_('mita describe config 2>/dev/null'),
     timeSynced:   exec_('timedatectl status 2>/dev/null').includes('synchronized: yes'),
-    mitaStateFile: resolvedMitaFile
+    mitaStateFile: resolvedMitaFile,
+    probeSecretSet: !!(cfg.probeSecret)
   });
 });
 
 // ── Service control ───────────────────────────────────────────────────────────
 app.post('/api/service/:name/:action', requireAuth, (req, res) => {
   const { name, action } = req.params;
-  // Accept both 'naive' (new) and 'caddy-naive' (legacy alias) for back-compat
-  const svcName = name === 'caddy-naive' ? 'naive' : name;
-  if (!['naive','mita'].includes(svcName))
-    return res.status(400).json({ error: 'Unknown service (valid: naive, mita)' });
+  // Map legacy 'naive' name to 'caddy-naive'; keep 'mita' as-is
+  const svcMap = { 'naive': 'caddy-naive', 'caddy-naive': 'caddy-naive', 'mita': 'mita' };
+  const svcName = svcMap[name];
+  if (!svcName)
+    return res.status(400).json({ error: 'Unknown service (valid: naive/caddy-naive, mita)' });
   if (!['start','stop','restart','reload'].includes(action))
     return res.status(400).json({ error: 'Unknown action' });
   try {
@@ -953,7 +1051,7 @@ app.post('/api/service/:name/:action', requireAuth, (req, res) => {
   } catch (e) { res.status(500).json({ error: e.stdout?.toString() || e.message }); }
 });
 
-// ── WebSocket — real-time metrics (5 s interval) ──────────────────────────────
+// ── WebSocket — real-time metrics ─────────────────────────────────────────────
 const wss = new WebSocketServer({ server, path: '/ws' });
 wss.on('connection', ws => {
   const exec_ = cmd => { try { return execSync(cmd, { timeout: 2000 }).toString().trim(); } catch { return ''; } };
@@ -968,9 +1066,9 @@ wss.on('connection', ws => {
         cpu:        Math.round(cpu.currentLoad),
         ramUsedMB:  Math.round((mem.total - mem.available) / 1048576),
         ramTotalMB: Math.round(mem.total / 1048576),
-        // Blocker 7: check 'naive' service (not caddy-naive)
-        naive:      exec_('systemctl is-active naive') === 'active',
-        mieru:      exec_('systemctl is-active mita')  === 'active'
+        // v1.2.3: check caddy-naive service
+        naive:      exec_('systemctl is-active caddy-naive') === 'active',
+        mieru:      exec_('systemctl is-active mita')        === 'active'
       }));
     } catch {}
   };
@@ -992,9 +1090,12 @@ cron.schedule('*/5 * * * *', () => {
     }
   });
   if (changed) {
-    // Blocker 7: rebuild htpasswd + reload naive instead of Caddyfile
-    try { buildHtpasswd(getAllUsers()); reloadNaive(); } catch {}
-    try { applyMitaConfig(); }                          catch {}
+    try {
+      const content = buildCaddyfile(cfg, getAllUsers());
+      writeCaddyfileAtomic(content);
+      reloadCaddy();
+    } catch {}
+    try { applyMitaConfig(); } catch {}
   }
 });
 
@@ -1032,7 +1133,7 @@ server.listen(PORT, HOST, () => {
     '  ██║  ██║ ██║ ██╔╝ ██╗ ██╔╝ ██╗ ██╔╝ ██╗',
     '  ╚═╝  ╚═╝ ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝',
     '',
-    `  Panel Naive + Mieru v${cfg.version || '1.2.0'} by RIXXX`,
+    `  Panel Naive + Mieru v${cfg.version || '1.2.3'} by RIXXX  (Caddy-forwardproxy-naive)`,
     `  http://${HOST}:${PORT}/`,
     HOST === '127.0.0.1' ? `  ⚠  SSH-only: ssh -L 3000:127.0.0.1:3000 root@<server>` : '',
     ''

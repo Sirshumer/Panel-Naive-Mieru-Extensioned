@@ -125,6 +125,13 @@
 
   "settings": {
     "title": "Настройки сервера",
+    "probeSecretTitle": "Секрет защиты от зондирования",
+    "probeSecretDesc": "Секретный токен, который клиенты передают в заголовках. Нераспознанные клиенты видят фейковый сайт.",
+    "probeSecretLabel": "Probe Secret (мин. 8 символов)",
+    "probeSecretPlaceholder": "Введите probe secret",
+    "applyProbeSecret": "Применить секрет",
+    "probeSecretUpdated": "Probe secret обновлён — Caddy перезагружен",
+    "probeSecretTooShort": "Probe secret должен быть не менее 8 символов",
     "naivePortTitle": "Порт NaiveProxy",
     "naivePortDesc": "Изменить HTTPS-порт NaiveProxy. Только перезагрузка Caddy — без рестарта сервиса.",
     "naivePortLabel": "Порт (1–65535)",

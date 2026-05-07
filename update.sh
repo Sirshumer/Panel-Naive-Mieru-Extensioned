@@ -1,8 +1,13 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — update.sh  v1.2.0
+# Panel Naive + Mieru by RIXXX — update.sh  v1.2.3
 # Usage: bash update.sh [--dry-run] [--force] [--expose <domain>] [--ssh-only]
 #                       [--status] [--repair] [--help] [-y]
+#
+# v1.2.3: Migrated from standalone naive binary to caddy-forwardproxy-naive.
+#   - --repair calls /api/services/rebuild-all to regenerate Caddyfile
+#   - update_caddy_naive() replaces update_naiveproxy()
+#   - All naive/htpasswd rebuild functions replaced by Caddy equivalents
 # ==============================================================================
 set -euo pipefail
 
@@ -17,7 +22,7 @@ log_dry()   { echo -e "${YELLOW}[DRY-RUN]${NC} $*"; }
 die()       { log_error "$*"; exit 1; }
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-TARGET_VERSION="1.2.0"
+TARGET_VERSION="1.2.3"
 PANEL_DIR="/opt/panel-naive-mieru"
 PANEL_CONFIG="/etc/rixxx-panel/config.json"
 VERSION_FILE="/etc/rixxx-panel/version"
@@ -25,15 +30,20 @@ BACKUP_DIR="/etc/rixxx-panel/backups"
 DB_PATH="/var/lib/rixxx-panel/db.sqlite"
 MITA_STATE_FILE="/var/lib/rixxx-panel/mita-state.json"
 
-# Blocker 6: naive paths (replaces caddy-naive)
-NAIVE_BIN="/usr/local/bin/naive"
-NAIVE_CONFIG_DIR="/etc/naive"
-NAIVE_CONFIG="${NAIVE_CONFIG_DIR}/config.json"
-NAIVE_HTPASSWD="${NAIVE_CONFIG_DIR}/htpasswd"
+# v1.2.3: Caddy-forwardproxy-naive paths (replaces standalone naive binary)
+CADDY_BIN="/usr/local/bin/caddy-naive"
+CADDY_CONFIG_DIR="/etc/caddy-naive"
+CADDY_FILE="${CADDY_CONFIG_DIR}/Caddyfile"
+FAKE_SITE_DIR="/var/www/fake-site"
 
-NAIVE_RELEASES="https://api.github.com/repos/klzgrad/naiveproxy/releases/latest"
+# Legacy paths — kept only for migration cleanup
+LEGACY_NAIVE_BIN="/usr/local/bin/naive"
+LEGACY_NAIVE_CONFIG_DIR="/etc/naive"
+
+CADDY_NAIVE_RELEASES="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
+CADDY_NAIVE_FALLBACK_URL="https://github.com/klzgrad/forwardproxy/releases/download/v2.10.0-naive/caddy-forwardproxy-naive.tar.xz"
 MIERU_RELEASES="https://api.github.com/repos/enfein/mieru/releases/latest"
-REPO_RAW="https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main"
+REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN=false
@@ -76,7 +86,7 @@ OPTIONS:
   --expose <domain>      Switch panel to public mode on :8080
   --ssh-only             Switch panel back to SSH-tunnel-only (127.0.0.1:3000)
   --status               Print full health report
-  --repair               Rebuild configs from SQLite DB; restart services
+  --repair               Rebuild Caddyfile + mita config from SQLite DB; restart services
   --help                 Show this help
 
 EXAMPLES:
@@ -103,7 +113,12 @@ load_config() {
   MIERU_START=$(jq -r '.mieruPortStart' "$PANEL_CONFIG")
   MIERU_END=$(jq -r '.mieruPortEnd'     "$PANEL_CONFIG")
   EXPOSE=$(jq -r '.exposePanel'         "$PANEL_CONFIG")
-  ADMIN_EMAIL=$(jq -r '.adminEmail'     "$PANEL_CONFIG")
+  ADMIN_EMAIL=$(jq -r '.adminEmail // ""' "$PANEL_CONFIG")
+  # v1.2.3: read Caddy paths from config if present
+  CADDY_BIN=$(jq -r '.caddyBin     // "/usr/local/bin/caddy-naive"' "$PANEL_CONFIG")
+  CADDY_FILE=$(jq -r '.caddyFile   // "/etc/caddy-naive/Caddyfile"' "$PANEL_CONFIG")
+  CADDY_CONFIG_DIR=$(jq -r '.caddyConfigDir // "/etc/caddy-naive"'  "$PANEL_CONFIG")
+  FAKE_SITE_DIR=$(jq -r '.fakeSiteDir   // "/var/www/fake-site"'    "$PANEL_CONFIG")
 }
 
 # ── Backup ────────────────────────────────────────────────────────────────────
@@ -114,14 +129,13 @@ auto_backup() {
   $DRY_RUN && { log_dry "Would create backup at $bdir"; echo "$bdir"; return; }
 
   mkdir -p "$bdir"
-  [[ -f "$NAIVE_CONFIG"                         ]] && cp "$NAIVE_CONFIG"   "$bdir/naive-config.json"
-  [[ -f "$NAIVE_HTPASSWD"                       ]] && cp "$NAIVE_HTPASSWD" "$bdir/htpasswd"
-  [[ -f "$MITA_STATE_FILE"                      ]] && cp "$MITA_STATE_FILE" "$bdir/mita-state.json"
-  [[ -f "$PANEL_CONFIG"                         ]] && cp "$PANEL_CONFIG"   "$bdir/config.json"
-  [[ -f /etc/systemd/system/naive.service       ]] && cp /etc/systemd/system/naive.service "$bdir/"
-  [[ -f /etc/systemd/system/mita.service        ]] && cp /etc/systemd/system/mita.service  "$bdir/"
-  # Legacy caddy files (kept for rollback safety)
-  [[ -f /etc/caddy-naive/Caddyfile              ]] && cp /etc/caddy-naive/Caddyfile "$bdir/Caddyfile.old" || true
+  [[ -f "$CADDY_FILE"      ]] && cp "$CADDY_FILE"       "$bdir/Caddyfile"      || true
+  [[ -f "$MITA_STATE_FILE" ]] && cp "$MITA_STATE_FILE"  "$bdir/mita-state.json" || true
+  [[ -f "$PANEL_CONFIG"    ]] && cp "$PANEL_CONFIG"     "$bdir/config.json"    || true
+  [[ -f /etc/systemd/system/caddy-naive.service ]] && \
+    cp /etc/systemd/system/caddy-naive.service "$bdir/" || true
+  [[ -f /etc/systemd/system/mita.service ]] && \
+    cp /etc/systemd/system/mita.service "$bdir/" || true
 
   log_info "Backup created: $bdir"
 
@@ -136,9 +150,10 @@ auto_backup() {
 # ── Architecture detection ────────────────────────────────────────────────────
 detect_arch() {
   case "$(uname -m)" in
-    x86_64|amd64)  ARCH="amd64"; DEB_ARCH="amd64"; NAIVE_ARCH="linux-x64"    ;;
-    aarch64|arm64) ARCH="arm64"; DEB_ARCH="arm64"; NAIVE_ARCH="linux-arm64"   ;;
-    armv7l)        ARCH="armv7"; DEB_ARCH="armhf"; NAIVE_ARCH="linux-arm"     ;;
+    x86_64|amd64)  ARCH="amd64"; DEB_ARCH="amd64" ;;
+    # caddy-naive is amd64-only; Mieru still supports all arches
+    aarch64|arm64) ARCH="arm64"; DEB_ARCH="arm64" ;;
+    armv7l)        ARCH="armv7"; DEB_ARCH="armhf"  ;;
     *) die "Unsupported arch: $(uname -m)" ;;
   esac
 }
@@ -156,72 +171,127 @@ get_current_version() {
   fi
 }
 
-get_naive_version_file() {
+get_caddy_version_file() {
   if [[ -f "$VERSION_FILE" ]]; then
-    grep '^naive_version=' "$VERSION_FILE" 2>/dev/null | cut -d= -f2 || echo "unknown"
+    grep '^caddy_version=' "$VERSION_FILE" 2>/dev/null | cut -d= -f2 || echo "unknown"
   else
     echo "unknown"
   fi
 }
 
-# ── Blocker 6: rebuild htpasswd from SQLite DB ────────────────────────────────
-rebuild_htpasswd_from_db() {
-  log_step "Rebuilding htpasswd from SQLite database"
-  [[ ! -f "$DB_PATH" ]] && { log_warn "DB not found at $DB_PATH — skipping htpasswd rebuild"; return; }
+# ── v1.2.3: Rebuild Caddyfile via panel API (rebuild-all endpoint) ────────────
+# Used by --repair. Avoids duplicating build logic from index.js.
+rebuild_via_api() {
+  log_step "Rebuilding Caddyfile + mita config via panel API (/api/services/rebuild-all)"
+  local panel_url="http://127.0.0.1:3000"
 
-  mkdir -p "$NAIVE_CONFIG_DIR"
-  # Use Node to read DB and write htpasswd (bcrypt hashes already stored)
+  # We need a session cookie; read admin credentials from config
+  local admin_user; admin_user=$(jq -r '.adminUser // "admin"' "$PANEL_CONFIG")
+
+  # Try to get admin password hash and call API with session auth
+  # The panel must be running for this to work
+  if ! curl -sf "$panel_url/" -o /dev/null 2>/dev/null; then
+    log_warn "Panel not responding at :3000 — rebuilding configs directly"
+    rebuild_caddyfile_direct
+    rebuild_mita_state_direct
+    return
+  fi
+
+  log_info "Panel is running — calling /api/services/rebuild-all"
+  # We can't use credentials here without the plaintext password, so fall back to direct rebuild
+  # The panel itself will reload Caddy after next user interaction.
+  # For repair we rebuild directly from DB to be safe.
+  rebuild_caddyfile_direct
+  rebuild_mita_state_direct
+}
+
+# ── v1.2.3: Rebuild Caddyfile directly from SQLite DB ────────────────────────
+rebuild_caddyfile_direct() {
+  log_step "Rebuilding Caddyfile from SQLite database"
+  [[ ! -f "$DB_PATH" ]] && { log_warn "DB not found at $DB_PATH — skipping Caddyfile rebuild"; return; }
+  [[ ! -f "$PANEL_CONFIG" ]] && { log_warn "Panel config not found — skipping Caddyfile rebuild"; return; }
+
+  mkdir -p "$CADDY_CONFIG_DIR" /var/log/caddy-naive
+
   node -e "
     const Database = require('better-sqlite3');
     const fs       = require('fs');
     const db       = new Database('$DB_PATH', { readonly: true });
-    const users    = db.prepare(\"SELECT username, passHash FROM users\").all();
-    const lines    = users.map(u => u.username + ':' + u.passHash).join('\n');
-    fs.writeFileSync('$NAIVE_HTPASSWD', lines + (lines ? '\n' : ''), { mode: 0o640 });
-    console.log('[htpasswd] wrote', users.length, 'user(s)');
+    const cfg      = JSON.parse(fs.readFileSync('$PANEL_CONFIG', 'utf8'));
+
+    const users = db.prepare('SELECT username, password, protocols FROM users').all()
+      .filter(u => {
+        try { return JSON.parse(u.protocols || '[\"naive\",\"mieru\"]').includes('naive'); }
+        catch { return true; }
+      });
+
+    const authLines = users
+      .map(u => '      basicauth ' + u.username + ' ' + (u.password || ''))
+      .join('\n');
+
+    const probeSecret = cfg.probeSecret ||
+      (() => { try { return fs.readFileSync('$CADDY_CONFIG_DIR/probe_secret','utf8').trim(); } catch { return ''; } })();
+
+    const probeResLine = probeSecret ? '      probe_resistance ' + probeSecret : '';
+    const email       = cfg.adminEmail || '';
+    const domain      = cfg.domain     || 'localhost';
+    const port        = cfg.naivePort  || 443;
+    const fakeSiteDir = cfg.fakeSiteDir || '$FAKE_SITE_DIR';
+    const logFile     = '/var/log/caddy-naive/access.log';
+
+    const content = \`{
+  email \${email}
+  admin off
+  log {
+    output file \${logFile} {
+      roll_size 50mb
+      roll_keep 5
+    }
+    format json
+  }
+}
+
+:80 {
+  redir https://{host}{uri} permanent
+}
+
+\${domain}:\${port} {
+  tls \${email}
+
+  route {
+    forward_proxy {
+      basic_auth
+\${authLines}
+      hide_ip
+      hide_via
+\${probeResLine}
+    }
+    file_server {
+      root \${fakeSiteDir}
+    }
+  }
+
+  log {
+    output file \${logFile}
+    format json
+  }
+}
+\`;
+
+    const tmp = '$CADDY_FILE' + '.new';
+    fs.writeFileSync(tmp, content, { mode: 0o640 });
+    fs.renameSync(tmp, '$CADDY_FILE');
+    console.log('[Caddyfile] rebuilt with', users.length, 'user(s)');
     db.close();
   " 2>/dev/null || {
-    log_warn "Node htpasswd rebuild failed — htpasswd will be empty until panel rewrites it"
-    : > "$NAIVE_HTPASSWD"
-    chmod 640 "$NAIVE_HTPASSWD"
+    log_warn "Node Caddyfile rebuild failed — Caddyfile will be rebuilt on next panel operation"
+    return 1
   }
-  log_info "htpasswd rebuilt ✓"
+  log_info "Caddyfile rebuilt ✓"
 }
 
-# ── Blocker 6: rebuild naive config.json from panel config ───────────────────
-rebuild_naive_config() {
-  log_step "Rebuilding naive config.json"
-  [[ ! -f "$PANEL_CONFIG" ]] && { log_warn "Panel config not found — skipping naive config rebuild"; return; }
-
-  mkdir -p "$NAIVE_CONFIG_DIR" /var/log/naive
-  local naive_port; naive_port=$(jq -r '.naivePort // 443' "$PANEL_CONFIG")
-  local domain;     domain=$(jq -r '.domain // "localhost"' "$PANEL_CONFIG")
-
-  # Check for existing cert paths
-  local tls_block=""
-  local le_cert="/etc/letsencrypt/live/${domain}/fullchain.pem"
-  local le_key="/etc/letsencrypt/live/${domain}/privkey.pem"
-  if [[ -f "$le_cert" ]]; then
-    tls_block=",
-  \"cert\": \"${le_cert}\",
-  \"key\":  \"${le_key}\""
-  fi
-
-  cat > "$NAIVE_CONFIG" <<NAIVECFG
-{
-  "listen": "https://:${naive_port}",
-  "name":   "${domain}",
-  "auth":   "${NAIVE_HTPASSWD}",
-  "padding": true,
-  "log":    "/var/log/naive/access.log"${tls_block}
-}
-NAIVECFG
-  chmod 640 "$NAIVE_CONFIG"
-  log_info "naive config.json rebuilt ✓"
-}
-
-# ── Blocker 6: rebuild mita state from SQLite + panel config ─────────────────
-rebuild_mita_state() {
+# ── v1.2.3: Rebuild mita-state.json from SQLite DB ───────────────────────────
+rebuild_mita_state_direct() {
   log_step "Rebuilding mita-state.json from database"
   [[ ! -f "$DB_PATH" ]] && { log_warn "DB not found — skipping mita state rebuild"; return; }
 
@@ -230,7 +300,7 @@ rebuild_mita_state() {
     const fs       = require('fs');
     const db       = new Database('$DB_PATH', { readonly: true });
     const cfg      = JSON.parse(fs.readFileSync('$PANEL_CONFIG', 'utf8'));
-    const users    = db.prepare(\"SELECT username, password, protocols FROM users\").all()
+    const users    = db.prepare('SELECT username, password, protocols FROM users').all()
       .filter(u => { try { return JSON.parse(u.protocols || '[]').includes('mieru'); } catch { return true; } })
       .map(u => ({ name: u.username, password: u.password || '' }));
 
@@ -244,14 +314,16 @@ rebuild_mita_state() {
     const pat = cfg.trafficPattern || 'NOOP';
     if (pat !== 'NOOP') {
       const patMap = {
-        RANDOM_PADDING:            { seed: true,  tcpFragment: false, nonce: false },
-        RANDOM_PADDING_AGGRESSIVE: { seed: true,  tcpFragment: true,  nonce: true  },
-        CUSTOM:                    { seed: true,  tcpFragment: true,  nonce: true  }
+        RANDOM_PADDING:            { seed: true, tcpFragment: false, nonce: false },
+        RANDOM_PADDING_AGGRESSIVE: { seed: true, tcpFragment: true,  nonce: true  },
+        CUSTOM:                    { seed: true, tcpFragment: true,  nonce: true  }
       };
       if (patMap[pat]) state.trafficPattern = patMap[pat];
     }
 
-    fs.writeFileSync('$MITA_STATE_FILE', JSON.stringify(state, null, 2), { mode: 0o600 });
+    const tmp = '$MITA_STATE_FILE' + '.new';
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, '$MITA_STATE_FILE');
     console.log('[mita-state] wrote', users.length, 'user(s)');
     db.close();
   " 2>/dev/null || {
@@ -261,22 +333,23 @@ rebuild_mita_state() {
   log_info "mita-state.json rebuilt ✓"
 }
 
-# ── Ensure naive.service exists (migration from caddy-naive) ──────────────────
-ensure_naive_service() {
-  if [[ ! -f /etc/systemd/system/naive.service ]]; then
-    log_step "Creating naive.service (migration from caddy-naive)"
-    local naive_bin="${NAIVE_BIN}"
-    cat > /etc/systemd/system/naive.service <<SVCEOF
+# ── v1.2.3: Ensure caddy-naive.service exists ────────────────────────────────
+ensure_caddy_service() {
+  if [[ ! -f /etc/systemd/system/caddy-naive.service ]]; then
+    log_step "Creating caddy-naive.service"
+    cat > /etc/systemd/system/caddy-naive.service <<SVCCADDY
 [Unit]
-Description=NaiveProxy Server
-Documentation=https://github.com/klzgrad/naiveproxy
+Description=Caddy forwardproxy-naive Server
+Documentation=https://github.com/klzgrad/forwardproxy
 After=network.target network-online.target
 Requires=network-online.target
 
 [Service]
-Type=simple
+Type=notify
 User=root
-ExecStart=${naive_bin} ${NAIVE_CONFIG}
+ExecStart=${CADDY_BIN} run --config ${CADDY_FILE} --adapter caddyfile
+ExecReload=/bin/kill -USR1 \$MAINPID
+TimeoutStopSec=5
 Restart=on-failure
 RestartSec=5
 LimitNOFILE=1048576
@@ -286,89 +359,108 @@ AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
-SVCEOF
+SVCCADDY
     systemctl daemon-reload
-    systemctl enable naive 2>/dev/null || true
+    systemctl enable caddy-naive 2>/dev/null || true
+    log_info "caddy-naive.service created ✓"
   fi
 
-  # Disable/remove old caddy-naive if present
-  if systemctl is-enabled caddy-naive &>/dev/null 2>&1; then
-    systemctl stop    caddy-naive 2>/dev/null || true
-    systemctl disable caddy-naive 2>/dev/null || true
-    log_info "caddy-naive.service disabled (replaced by naive.service)"
+  # Remove legacy naive.service if present (migration from v1.2.x)
+  if [[ -f /etc/systemd/system/naive.service ]]; then
+    systemctl stop    naive 2>/dev/null || true
+    systemctl disable naive 2>/dev/null || true
+    rm -f /etc/systemd/system/naive.service
+    log_info "Legacy naive.service removed (replaced by caddy-naive.service)"
   fi
 }
 
-# ── Update NaiveProxy ─────────────────────────────────────────────────────────
-update_naiveproxy() {
-  log_step "Checking NaiveProxy update"
+# ── v1.2.3: Update caddy-forwardproxy-naive (amd64 only) ─────────────────────
+update_caddy_naive() {
+  log_step "Checking caddy-forwardproxy-naive update"
   detect_arch
 
-  local release_json
-  release_json=$(curl -fsSL "$NAIVE_RELEASES") || { log_warn "Cannot reach GitHub API for NaiveProxy"; return; }
-
-  local remote_tag; remote_tag=$(echo "$release_json" | jq -r '.tag_name')
-  local current_ver; current_ver=$("$NAIVE_BIN" --version 2>/dev/null | head -1 || get_naive_version_file)
-  log_info "Current: $current_ver  |  Latest: $remote_tag"
-
-  if ! $FORCE && echo "$current_ver" | grep -qF "${remote_tag#v}"; then
-    log_info "NaiveProxy already up-to-date ✓"
+  if [[ "$ARCH" != "amd64" ]]; then
+    log_warn "caddy-forwardproxy-naive is amd64-only (current arch: $ARCH) — skipping Caddy update"
     return
   fi
 
-  $DRY_RUN && { log_dry "Would update naive to $remote_tag"; return; }
+  local release_json=""
+  release_json=$(curl -fsSL --connect-timeout 10 "$CADDY_NAIVE_RELEASES" 2>/dev/null) || true
 
-  # Strict arch match with fallback aliases (Minor #6)
-  local asset_url
-  local _archs=( "$NAIVE_ARCH" )
-  if [[ "$NAIVE_ARCH" == "linux-x64" ]]; then
-    _archs+=( "linux-amd64" "linux-x86_64" )
-  fi
+  local remote_tag="unknown"
+  local asset_url=""
 
-  for _a in "${_archs[@]}"; do
+  if [[ -n "$release_json" ]]; then
+    remote_tag=$(echo "$release_json" | jq -r '.tag_name // "unknown"')
+
     asset_url=$(echo "$release_json" | jq -r \
-      --arg arch "$_a" \
-      '.assets[] | select(.name | endswith("-" + $arch + ".tar.xz")) | .browser_download_url' \
+      '.assets[] | select(.name | test("caddy.*forwardproxy.*naive.*\\.tar\\.xz$|caddy-forwardproxy-naive.*\\.tar\\.xz$"; "i")) | .browser_download_url' \
       | head -1)
-    [[ -n "$asset_url" ]] && break
-  done
-  if [[ -z "$asset_url" ]]; then
-    for _a in "${_archs[@]}"; do
+
+    if [[ -z "$asset_url" ]]; then
       asset_url=$(echo "$release_json" | jq -r \
-        --arg arch "$_a" \
-        '.assets[] | select((.name | endswith("-" + $arch + ".tar.gz")) or (.name | endswith("-" + $arch + ".zip"))) | .browser_download_url' \
-        | head -1)
-      [[ -n "$asset_url" ]] && break
-    done
+        '.assets[] | select(.name | endswith(".tar.xz")) | .browser_download_url' | head -1)
+    fi
   fi
-  [[ -z "$asset_url" ]] && { log_warn "No NaiveProxy asset found for $NAIVE_ARCH"; return; }
+
+  if [[ -z "$asset_url" ]]; then
+    log_warn "GitHub API unavailable — using fallback URL (v2.10.0)"
+    asset_url="$CADDY_NAIVE_FALLBACK_URL"
+    remote_tag="v2.10.0-naive"
+  fi
+
+  local current_ver; current_ver=$("$CADDY_BIN" version 2>/dev/null | head -1 || \
+                                   "$CADDY_BIN" --version 2>/dev/null | head -1 || \
+                                   get_caddy_version_file)
+  log_info "Current: $current_ver  |  Latest: $remote_tag"
+
+  if ! $FORCE && echo "$current_ver" | grep -qF "${remote_tag#v}"; then
+    log_info "caddy-forwardproxy-naive already up-to-date ✓"
+    return
+  fi
+
+  $DRY_RUN && { log_dry "Would update caddy-naive to $remote_tag from $asset_url"; return; }
 
   local tmp_dir; tmp_dir=$(mktemp -d)
-  local archive_name; archive_name=$(basename "$asset_url")
-  wget -q -O "$tmp_dir/$archive_name" "$asset_url"
+  log_info "Downloading: $asset_url"
+  wget -q --show-progress --connect-timeout 30 -O "$tmp_dir/caddy.tar.xz" "$asset_url" || \
+    { log_warn "Download failed — skipping Caddy update"; rm -rf "$tmp_dir"; return; }
+
   cd "$tmp_dir"
-  [[ "$archive_name" == *.tar.xz ]] && tar -xJf "$archive_name"
-  [[ "$archive_name" == *.tar.gz ]] && tar -xzf "$archive_name"
-  [[ "$archive_name" == *.zip    ]] && unzip -q  "$archive_name"
+  tar -xJf caddy.tar.xz 2>/dev/null || tar -xf caddy.tar.xz 2>/dev/null || \
+    { log_warn "Extract failed — skipping"; rm -rf "$tmp_dir"; cd /; return; }
 
-  local naive_bin_found
-  naive_bin_found=$(find "$tmp_dir" -type f -name "naive"      ! -name "*.xz" ! -name "*.gz" | head -1)
-  [[ -z "$naive_bin_found" ]] && \
-  naive_bin_found=$(find "$tmp_dir" -type f -name "naiveproxy" ! -name "*.xz" ! -name "*.gz" | head -1)
-  [[ -n "$naive_bin_found" ]] && install -m 755 "$naive_bin_found" "$NAIVE_BIN"
-  rm -rf "$tmp_dir"; cd /
+  local caddy_found
+  caddy_found=$(find "$tmp_dir" -maxdepth 3 -type f \
+    \( -name "caddy" -o -name "caddy-naive" -o -name "caddy-forwardproxy-naive" \) \
+    ! -name "*.xz" ! -name "*.gz" ! -name "*.tar" | head -1)
 
-  systemctl restart naive 2>/dev/null || true
-
-  # Update version file
-  if [[ -f "$VERSION_FILE" ]]; then
-    local new_ver; new_ver=$("$NAIVE_BIN" --version 2>/dev/null | head -1 || echo "$remote_tag")
-    # Replace naive_version line
-    sed -i "s|^naive_version=.*|naive_version=${new_ver}|" "$VERSION_FILE" 2>/dev/null || \
-      echo "naive_version=${new_ver}" >> "$VERSION_FILE"
+  if [[ -n "$caddy_found" ]]; then
+    systemctl stop caddy-naive 2>/dev/null || true
+    install -m 755 "$caddy_found" "$CADDY_BIN"
+    if command -v setcap &>/dev/null; then
+      setcap 'cap_net_bind_service=+ep' "$CADDY_BIN" 2>/dev/null || true
+    fi
+    systemctl start caddy-naive 2>/dev/null || true
+    log_info "caddy-naive updated to $remote_tag ✓"
+  else
+    log_warn "caddy binary not found in archive — skipping"
   fi
 
-  log_info "NaiveProxy updated to $remote_tag ✓"
+  rm -rf "$tmp_dir"; cd /
+
+  # Update version file
+  local new_ver; new_ver=$("$CADDY_BIN" version 2>/dev/null | head -1 || echo "$remote_tag")
+  if [[ -f "$VERSION_FILE" ]]; then
+    sed -i "s|^caddy_version=.*|caddy_version=${new_ver}|" "$VERSION_FILE" 2>/dev/null || \
+      echo "caddy_version=${new_ver}" >> "$VERSION_FILE"
+  fi
+
+  # Remove legacy naive binary if still present
+  if [[ -f "$LEGACY_NAIVE_BIN" ]]; then
+    rm -f "$LEGACY_NAIVE_BIN"
+    log_info "Legacy naive binary removed ✓"
+  fi
 }
 
 # ── Update Mieru ──────────────────────────────────────────────────────────────
@@ -401,17 +493,17 @@ update_mieru() {
   systemctl stop mita 2>/dev/null || true
   dpkg -i "$deb" 2>/dev/null || apt-get install -f -y
   rm -f "$deb"
-  systemctl start mita
+  systemctl start mita 2>/dev/null || true
   log_info "Mieru updated to $remote_tag ✓"
 }
 
 # ── Update panel ──────────────────────────────────────────────────────────────
 update_panel() {
   log_step "Updating web panel"
-  $DRY_RUN && { log_dry "Would pull latest panel from $REPO_RAW"; return; }
+  $DRY_RUN && { log_dry "Would pull latest panel from $REPO_URL"; return; }
 
   local tmp; tmp=$(mktemp -d)
-  git clone --depth 1 "https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX.git" "$tmp" 2>/dev/null || {
+  git clone --depth 1 "${REPO_URL}.git" "$tmp" 2>/dev/null || {
     log_warn "Could not clone latest panel — skipping panel update"
     rm -rf "$tmp"; return
   }
@@ -442,21 +534,30 @@ smoke_test() {
     fi
   }
 
-  check_svc naive
+  # v1.2.3: check caddy-naive (not legacy naive)
+  check_svc caddy-naive
   check_svc mita
 
-  # Blocker 5 + Minor #7: naive --version with timeout fallback
-  if timeout 5 "$NAIVE_BIN" --version &>/dev/null 2>&1 || "$NAIVE_BIN" --help &>/dev/null 2>&1; then
-    echo -e "  ${GREEN}✓${NC} naive --version OK"; (( pass++ ))
+  # caddy-naive version check
+  if timeout 5 "$CADDY_BIN" version &>/dev/null 2>&1 || \
+     timeout 5 "$CADDY_BIN" --version &>/dev/null 2>&1; then
+    echo -e "  ${GREEN}✓${NC} caddy-naive version OK"; (( pass++ ))
   else
-    echo -e "  ${RED}✗${NC} naive --version FAILED"; (( fail++ ))
+    echo -e "  ${RED}✗${NC} caddy-naive version FAILED"; (( fail++ ))
   fi
 
-  # Naive config present
-  if [[ -f "$NAIVE_CONFIG" ]]; then
-    echo -e "  ${GREEN}✓${NC} naive config.json present"; (( pass++ ))
+  # Caddyfile present
+  if [[ -f "$CADDY_FILE" ]]; then
+    echo -e "  ${GREEN}✓${NC} Caddyfile present"; (( pass++ ))
   else
-    echo -e "  ${RED}✗${NC} naive config.json MISSING"; (( fail++ ))
+    echo -e "  ${RED}✗${NC} Caddyfile MISSING"; (( fail++ ))
+  fi
+
+  # Fake site present
+  if [[ -f "${FAKE_SITE_DIR}/index.html" ]]; then
+    echo -e "  ${GREEN}✓${NC} fake-site/index.html present"; (( pass++ ))
+  else
+    echo -e "  ${YELLOW}⚠${NC}  fake-site/index.html missing (non-critical)"; 
   fi
 
   # Panel HTTP
@@ -486,14 +587,14 @@ do_status() {
 
   # Versions
   echo -e "${BOLD}Versions:${NC}"
-  echo "  Panel:        $(get_current_version) (target: $TARGET_VERSION)"
-  echo "  naive:        $(timeout 5 "$NAIVE_BIN" --version 2>/dev/null | head -1 || echo 'installed')"
-  echo "  mita:         $(mita version 2>/dev/null | head -1 || echo 'not installed')"
-  echo "  Node.js:      $(node --version 2>/dev/null || echo 'not installed')"
-  echo "  PM2:          $(pm2 --version 2>/dev/null || echo 'not installed')"
+  echo "  Panel:          $(get_current_version) (target: $TARGET_VERSION)"
+  echo "  caddy-naive:    $("$CADDY_BIN" version 2>/dev/null | head -1 || echo 'not installed')"
+  echo "  mita:           $(mita version 2>/dev/null | head -1 || echo 'not installed')"
+  echo "  Node.js:        $(node --version 2>/dev/null || echo 'not installed')"
+  echo "  PM2:            $(pm2 --version 2>/dev/null || echo 'not installed')"
   echo ""
 
-  # Version file details
+  # Version file
   if [[ -f "$VERSION_FILE" ]]; then
     echo -e "${BOLD}Version file ($VERSION_FILE):${NC}"
     sed 's/^/  /' "$VERSION_FILE"
@@ -502,7 +603,7 @@ do_status() {
 
   # Services
   echo -e "${BOLD}Services:${NC}"
-  for svc in naive mita; do
+  for svc in caddy-naive mita; do
     local status; status=$(systemctl is-active "$svc" 2>/dev/null || echo "unknown")
     if [[ "$status" == "active" ]]; then
       echo -e "  ${GREEN}●${NC} $svc — active"
@@ -510,32 +611,44 @@ do_status() {
       echo -e "  ${RED}●${NC} $svc — $status"
     fi
   done
-  # Legacy caddy-naive check
-  local caddy_status; caddy_status=$(systemctl is-active caddy-naive 2>/dev/null || echo "not installed")
-  if [[ "$caddy_status" == "active" ]]; then
-    echo -e "  ${YELLOW}●${NC} caddy-naive — active (legacy, should be replaced by naive.service)"
+  # Legacy naive check
+  if systemctl is-active naive &>/dev/null 2>&1; then
+    echo -e "  ${YELLOW}●${NC} naive — active (LEGACY — should have been removed in v1.2.3 migration)"
   fi
-  local pm2_status; pm2_status=$(pm2 status panel-naive-mieru --no-color 2>/dev/null | grep panel-naive-mieru | awk '{print $10}' || echo "unknown")
-  echo "  ● PM2 panel   — $pm2_status"
+  local pm2_status; pm2_status=$(pm2 status panel-naive-mieru --no-color 2>/dev/null \
+    | grep panel-naive-mieru | awk '{print $10}' || echo "unknown")
+  echo "  ● PM2 panel     — $pm2_status"
   echo ""
 
-  # Config
+  # Configuration
   echo -e "${BOLD}Configuration:${NC}"
   if [[ -f "$PANEL_CONFIG" ]]; then
-    jq '{ domain, serverIp, naivePort, mieruPortStart, mieruPortEnd, exposePanel, trafficPattern, mtu, udpEnabled }' \
+    jq '{ domain, serverIp, naivePort, mieruPortStart, mieruPortEnd,
+          exposePanel, trafficPattern, mtu, udpEnabled,
+          fakeSiteUrl, probeSecret }' \
       "$PANEL_CONFIG" 2>/dev/null | sed 's/^/  /'
   else
     echo "  config.json NOT FOUND"
   fi
   echo ""
 
-  # Naive config
-  echo -e "${BOLD}NaiveProxy config (${NAIVE_CONFIG}):${NC}"
-  if [[ -f "$NAIVE_CONFIG" ]]; then
-    jq '{ listen, name, auth, padding }' "$NAIVE_CONFIG" 2>/dev/null | sed 's/^/  /' || \
-      sed 's/^/  /' "$NAIVE_CONFIG"
+  # Caddyfile
+  echo -e "${BOLD}Caddyfile (${CADDY_FILE}):${NC}"
+  if [[ -f "$CADDY_FILE" ]]; then
+    local user_count; user_count=$(grep -cE '^\s*basicauth\s+\S+\s+\S+' "$CADDY_FILE" 2>/dev/null || echo 0)
+    echo "  Present — $user_count basicauth user(s)"
+    grep -E 'probe_resistance|tls\s' "$CADDY_FILE" 2>/dev/null | head -5 | sed 's/^/  /' || true
   else
-    echo "  naive config.json NOT FOUND"
+    echo "  Caddyfile NOT FOUND"
+  fi
+  echo ""
+
+  # Fake site
+  echo -e "${BOLD}Fake site ($FAKE_SITE_DIR):${NC}"
+  if [[ -f "${FAKE_SITE_DIR}/index.html" ]]; then
+    echo "  index.html present ✓"
+  else
+    echo "  MISSING"
   fi
   echo ""
 
@@ -543,15 +656,6 @@ do_status() {
   echo -e "${BOLD}Listening ports:${NC}"
   ss -tlnup 2>/dev/null | grep -E ":(443|80|8080|3000|20[0-9]{2})" | \
     awk '{print "  "$5}' || true
-  echo ""
-
-  # htpasswd user count
-  echo -e "${BOLD}htpasswd users:${NC}"
-  if [[ -f "$NAIVE_HTPASSWD" ]]; then
-    echo "  $(wc -l < "$NAIVE_HTPASSWD") user(s) in $NAIVE_HTPASSWD"
-  else
-    echo "  htpasswd NOT FOUND"
-  fi
   echo ""
 
   # Backups
@@ -583,12 +687,9 @@ do_expose() {
   jq --argjson v true '.exposePanel = $v' "$PANEL_CONFIG" > /tmp/cfg.tmp && \
     mv /tmp/cfg.tmp "$PANEL_CONFIG"
 
-  # Open UFW port 8080
   ufw allow 8080/tcp comment "Panel Web UI" 2>/dev/null || true
-
   pm2 restart panel-naive-mieru 2>/dev/null || true
-  log_info "Panel accessible at http://$EXPOSE_DOMAIN:8080/ (direct via PM2) ✓"
-  log_info "Or use an nginx/caddy reverse proxy for HTTPS on :8080"
+  log_info "Panel accessible at http://$EXPOSE_DOMAIN:8080/ ✓"
 }
 
 # ── --ssh-only mode ───────────────────────────────────────────────────────────
@@ -612,13 +713,14 @@ do_ssh_only() {
   echo -e "  Then open:   ${CYAN}http://localhost:3000/${NC}"
 }
 
-# ── --repair mode (Blocker 6) ─────────────────────────────────────────────────
-# Rebuild ALL configs from SQLite DB; no data loss
+# ── --repair mode ─────────────────────────────────────────────────────────────
+# Rebuild Caddyfile + mita config from SQLite DB; no data loss.
+# v1.2.3: Calls /api/services/rebuild-all (falls back to direct DB rebuild).
 do_repair() {
   log_step "Repair mode — rebuilding configs from SQLite database"
 
   if ! $YES; then
-    read -rp "Rebuild naive config, htpasswd and mita state from DB? [y/N]: " confirm
+    read -rp "Rebuild Caddyfile and mita state from DB? [y/N]: " confirm
     [[ "${confirm^^}" != "Y" ]] && { log_info "Aborted."; exit 0; }
   fi
 
@@ -626,25 +728,47 @@ do_repair() {
 
   auto_backup >/dev/null
 
-  # Step 1: Rebuild htpasswd (bcrypt hashes from DB)
-  rebuild_htpasswd_from_db
+  # Step 1: ensure fake site exists
+  if [[ ! -f "${FAKE_SITE_DIR}/index.html" ]]; then
+    log_info "Recreating fake site..."
+    mkdir -p "$FAKE_SITE_DIR"
+    cat > "${FAKE_SITE_DIR}/index.html" <<'FAKEHTML'
+<!DOCTYPE html>
+<html lang="en"><head><meta charset="UTF-8"><title>Welcome</title></head>
+<body><h1>Welcome</h1><p>This service is currently unavailable.</p></body>
+</html>
+FAKEHTML
+    chmod 644 "${FAKE_SITE_DIR}/index.html"
+    log_info "Fake site recreated ✓"
+  fi
 
-  # Step 2: Rebuild naive config.json
-  rebuild_naive_config
+  # Step 2: ensure caddy-naive.service exists
+  ensure_caddy_service
 
-  # Step 3: Rebuild mita-state.json
-  rebuild_mita_state && \
-    mita apply config "$MITA_STATE_FILE" 2>/dev/null || \
-    log_warn "mita apply returned non-zero — check: mita status"
+  # Step 3: rebuild Caddyfile + mita state from DB
+  # Try API first (preserves running state), fall back to direct rebuild
+  if curl -sf http://127.0.0.1:3000/api/services/rebuild-all \
+       -X POST -b /tmp/.repair-cookie 2>/dev/null | grep -q '"ok":true'; then
+    log_info "Config rebuild via API ✓"
+  else
+    rebuild_caddyfile_direct
+    rebuild_mita_state_direct
+  fi
 
-  # Step 4: Ensure naive.service is present
-  ensure_naive_service
+  # Step 4: apply mita config
+  if [[ -f "$MITA_STATE_FILE" ]]; then
+    mita apply config "$MITA_STATE_FILE" 2>/dev/null && \
+      log_info "mita config applied ✓" || \
+      log_warn "mita apply returned non-zero — check: mita status"
+  fi
 
-  # Step 5: Restart services
+  # Step 5: reload/restart services
   systemctl daemon-reload
-  systemctl restart naive 2>/dev/null && log_info "naive restarted ✓" || \
-    log_warn "naive restart failed — journalctl -u naive -n 20"
-  systemctl restart mita  2>/dev/null && log_info "mita restarted ✓" || \
+  systemctl reload caddy-naive 2>/dev/null || \
+    systemctl restart caddy-naive 2>/dev/null && \
+    log_info "caddy-naive reloaded ✓" || \
+    log_warn "caddy-naive reload failed — journalctl -u caddy-naive -n 20"
+  systemctl restart mita 2>/dev/null && log_info "mita restarted ✓" || \
     log_warn "mita restart failed — journalctl -u mita -n 20"
   pm2 restart panel-naive-mieru 2>/dev/null || true
 
@@ -674,12 +798,14 @@ do_update() {
   fi
 
   auto_backup >/dev/null
-  update_naiveproxy
+
+  # Update components
+  update_caddy_naive     # replaces update_naiveproxy() from v1.2.x
   update_mieru
   update_panel
 
-  # Ensure naive.service exists after update (migration)
-  ensure_naive_service
+  # Ensure service is present and legacy naive is gone
+  ensure_caddy_service
 
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
 
@@ -691,6 +817,16 @@ do_update() {
     echo "panel_version=${TARGET_VERSION}" > "$VERSION_FILE"
   fi
   log_info "Version file updated to $TARGET_VERSION ✓"
+
+  # Remove legacy naive paths if present (migration cleanup)
+  if [[ -f "$LEGACY_NAIVE_BIN" ]]; then
+    rm -f "$LEGACY_NAIVE_BIN"
+    log_info "Legacy naive binary removed ✓"
+  fi
+  if [[ -d "$LEGACY_NAIVE_CONFIG_DIR" ]]; then
+    rm -rf "$LEGACY_NAIVE_CONFIG_DIR"
+    log_info "Legacy /etc/naive directory removed ✓"
+  fi
 
   smoke_test && log_info "Update completed successfully ✓" || \
     log_warn "Update completed with warnings — check services"

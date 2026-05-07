@@ -6,7 +6,7 @@
 
 # 🛡 Panel Naive + Mieru by RIXXX
 
-**v1.0.0** — Web management panel for NaiveProxy + Mieru on Ubuntu/Debian VPS
+**v1.2.3** — Web management panel for NaiveProxy + Mieru on Ubuntu/Debian VPS
 
 [![Telegram](https://img.shields.io/badge/Telegram-@russian__paradice__vpn-2CA5E0?logo=telegram&logoColor=white)](https://t.me/russian_paradice_vpn)
 [![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-181717?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
@@ -23,8 +23,8 @@
 
 | Sprint | Feature |
 |--------|---------|
-| 1 | Auto-installer: arch detection, NaiveProxy binary, Mieru .deb, systemd units, NTP, UFW, config.json |
-| 2 | User CRUD: SQLite model, Caddyfile / Mieru config rebuild on change, expiry cron |
+| 1 | Auto-installer: arch detection (**amd64 only**), caddy-forwardproxy-naive, Mieru .deb, systemd, NTP, UFW, config.json |
+| 2 | User CRUD: SQLite, atomic Caddyfile + Mieru config rebuild on every change, expiry cron |
 | 3 | Server settings: port changes, traffic-pattern presets, MTU, UFW auto-update |
 | 4 | Client configs: Naive link, Mieru sing-box JSON, universal auto-fallback config, QR codes |
 | 5 | Monitoring dashboard: WebSocket live metrics, traffic snapshots, quota alerts |
@@ -39,7 +39,8 @@
 | Ubuntu | 20.04, 22.04, 24.04 |
 | Debian | 11, 12 |
 
-**Architectures:** `x86_64` (amd64) · `aarch64` (arm64) *(experimental, not tested in production)* · `armv7l` (armhf) *(experimental, not tested in production)*
+**Architecture:** `x86_64` (amd64) — **only** *(caddy-forwardproxy-naive supports amd64 only)*  
+> ⚠️ ARM64 and ARMv7 are **not supported** in v1.2.3 — the installer will exit with a clear error message.
 
 ---
 
@@ -57,9 +58,11 @@ sudo bash install.sh
 The wizard will prompt you for:
 - Language (Russian / English) — **first question**
 - Domain / hostname
-- TLS email
+- TLS email (Caddy manages certificates automatically via TLS-ALPN-01)
 - NaiveProxy port (default: `443`)
 - Mieru port range (default: `2012-2022`)
+- Fake site URL (default: `https://www.example.com`)
+- Probe secret (default: auto-generated)
 - Panel admin credentials
 - UFW firewall setup (optional)
 - Panel expose mode (SSH-only vs public)
@@ -90,11 +93,14 @@ sudo bash update.sh --expose vpn.example.com
 | `/etc/rixxx-panel/config.json` | Panel configuration |
 | `/etc/rixxx-panel/version` | Installed version |
 | `/etc/rixxx-panel/backups/` | Timestamped backups (last 10 kept) |
-| `/etc/caddy-naive/Caddyfile` | Caddy NaiveProxy config |
+| `/etc/caddy-naive/Caddyfile` | Caddy forwardproxy config (basicauth users + probe_resistance) |
+| `/etc/caddy-naive/probe_secret` | Probe resistance secret token |
+| `/var/www/fake-site/` | Fake site (shown to unrecognised clients) |
+| `/var/log/caddy-naive/access.log` | caddy-naive access log |
 | `/var/lib/rixxx-panel/mita-state.json` | Mieru JSON state (applied via `mita apply config`) |
 | `/var/lib/rixxx-panel/db.sqlite` | SQLite user database |
 | `/opt/panel-naive-mieru/` | Panel application files |
-| `/usr/local/bin/caddy-naive` | Caddy with naive plugin binary |
+| `/usr/local/bin/caddy-naive` | caddy-forwardproxy-naive binary |
 
 > ⚠️ **Note:** `/etc/mita/` is Mieru's internal protobuf store — **never edit manually**.  
 > The panel uses `/var/lib/rixxx-panel/mita-state.json` and applies it via `mita apply config <file>`.
@@ -129,7 +135,6 @@ caddy-naive reload  --config /etc/caddy-naive/Caddyfile --adapter caddyfile
 bash update.sh --status    # Health check
 bash update.sh --repair    # Fix broken install
 sudo bash uninstall.sh     # Full removal
-sudo bash uninstall.sh --keep-configs  # Remove without configs
 ```
 
 ---
@@ -212,9 +217,6 @@ bash update.sh --help            # Show help
 ```bash
 # Full removal (including configs and database)
 sudo bash uninstall.sh
-
-# Remove without configs (keep /etc/rixxx-panel/ and DB)
-sudo bash uninstall.sh --keep-configs
 ```
 
 ---
@@ -224,6 +226,8 @@ sudo bash uninstall.sh --keep-configs
 - Panel runs on `127.0.0.1:3000` — not exposed to the internet by default
 - Admin password is bcrypt-hashed in `config.json` (chmod 600)
 - SQLite DB in `/var/lib/rixxx-panel/` (root access only)
+- **Probe resistance**: unrecognised clients see the fake site instead of a proxy error
+- **No certbot**: Caddy manages TLS automatically via TLS-ALPN-01 (port 80 not needed)
 - Temporary config files deleted with `shred -u`
 - Login rate limiting: 20 req / 15 min
 - Session cookies are `httpOnly`

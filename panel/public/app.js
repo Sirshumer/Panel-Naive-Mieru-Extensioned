@@ -1,7 +1,9 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.2.2
+ * Panel Naive + Mieru — Frontend Application v1.2.3
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
+ * v1.2.3: probe-secret setting, disabled-button+spinner on all submit handlers,
+ *         dashboard shows caddy-naive version label, config version bump
  */
 'use strict';
 
@@ -231,6 +233,7 @@ function handleDelegatedClick(e) {
     case 'change-udp-mode':      changeUdpMode(); break;
     case 'change-language':      changeLanguage(); break;
     case 'change-password':      changePassword(); break;
+    case 'change-probe-secret':  changeProbeSecret(); break;
 
     // ── Monitoring
     case 'refresh-stats':    refreshStats(); break;
@@ -368,7 +371,7 @@ function toggleSidebar() {
 async function loadConfig() {
   try {
     state.config = await api('GET', '/api/config');
-    document.getElementById('topbar-version').textContent = `v${state.config.version || '1.2.2'}`;
+    document.getElementById('topbar-version').textContent = `v${state.config.version || '1.2.3'}`;
   } catch {}
 }
 
@@ -414,7 +417,7 @@ async function loadDashboard() {
       [t('dashboard.mieruVersion'), status.services.mieru.version || '—'],
     ]);
 
-    document.getElementById('about-version').textContent = `v${status.panel.version || '1.2.2'}`;
+    document.getElementById('about-version').textContent = `v${status.panel.version || '1.2.3'}`;
   } catch (err) {
     console.error('Dashboard error:', err);
   }
@@ -537,6 +540,10 @@ async function saveUser() {
   const body = { email, username, expiry, protocols, quotaMB };
   if (password) body.password = password;
 
+  // v1.2.3: disabled-button + spinner pattern
+  const saveBtn = el('btn-save-user');
+  setBtnBusy(saveBtn, true);
+
   try {
     if (id) {
       const res = await api('PUT', `/api/users/${id}`, body);
@@ -555,6 +562,8 @@ async function saveUser() {
     loadUsers();
   } catch (err) {
     showUserError(err.message);
+  } finally {
+    setBtnBusy(saveBtn, false);
   }
 }
 
@@ -679,7 +688,10 @@ async function loadSettings() {
     if (udpBox) udpBox.checked = cfg.udpEnabled === true;
     const langSel = el('s-language-select');
     if (langSel) langSel.value = cfg.language || currentLang || 'ru';
-    document.getElementById('about-version').textContent = `v${cfg.version || '1.2.2'}`;
+    // v1.2.3: probe secret (masked)
+    const probeEl = el('s-probe-secret');
+    if (probeEl) probeEl.placeholder = cfg.probeSecret ? '••••••••' : (t('settings.probeSecretPlaceholder') || 'Enter probe secret');
+    document.getElementById('about-version').textContent = `v${cfg.version || '1.2.3'}`;
   } catch {}
 }
 
@@ -688,6 +700,8 @@ async function changeNaivePort() {
   if (!port || port < 1 || port > 65535) {
     showMsg('naive-port-msg', t('settings.invalidPort') || 'Invalid port (1–65535)', false); return;
   }
+  const btn = document.querySelector('[data-action="change-naive-port"]');
+  setBtnBusy(btn, true);
   try {
     const res = await api('POST', '/api/settings/naive-port', { port });
     showMsg('naive-port-msg', res.message || 'Port updated', true);
@@ -695,6 +709,8 @@ async function changeNaivePort() {
     toast(t('toast.naivePortUpdated') || `NaiveProxy port → ${port}`, 'info');
   } catch (err) {
     showMsg('naive-port-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
   }
 }
 
@@ -702,17 +718,23 @@ async function changeMieruPorts() {
   const portStart = parseInt(el('s-mieru-start').value, 10);
   const portEnd   = parseInt(el('s-mieru-end').value, 10);
   if (!confirm(t('settings.mieruPortConfirm') || 'Apply Mieru port change?')) return;
+  const btn = document.querySelector('[data-action="change-mieru-ports"]');
+  setBtnBusy(btn, true);
   try {
     const res = await api('POST', '/api/settings/mieru-ports', { portStart, portEnd });
     showMsg('mieru-port-msg', res.message || 'Ports updated', true);
     toast(t('toast.mieruPortsUpdated') || `Mieru ports → ${portStart}–${portEnd}`, 'info');
   } catch (err) {
     showMsg('mieru-port-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
   }
 }
 
 async function changeUdpMode() {
   const enabled = el('s-udp-enabled')?.checked || false;
+  const btn = document.querySelector('[data-action="change-udp-mode"]');
+  setBtnBusy(btn, true);
   try {
     const res = await api('POST', '/api/settings/udp-toggle', { enabled });
     showMsg('udp-msg', res.message || t('settings.udpUpdated'), true);
@@ -720,18 +742,24 @@ async function changeUdpMode() {
     toast(t('settings.udpUpdated') || `UDP ${enabled ? 'enabled' : 'disabled'}`, 'info');
   } catch (err) {
     showMsg('udp-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
   }
 }
 
 async function changeTrafficPattern() {
   const pattern = document.querySelector('input[name="traffic-pattern"]:checked')?.value || 'NOOP';
   const mtu = parseInt(el('s-mtu').value, 10);
+  const btn = document.querySelector('[data-action="change-traffic-pattern"]');
+  setBtnBusy(btn, true);
   try {
     const res = await api('POST', '/api/settings/traffic-pattern', { pattern, mtu });
     showMsg('traffic-msg', `${t('settings.trafficPatternLabel')}: ${res.pattern}, MTU: ${res.mtu}`, true);
     toast(t('toast.trafficPatternUpdated') || 'Traffic pattern updated', 'success');
   } catch (err) {
     showMsg('traffic-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
   }
 }
 
@@ -745,6 +773,8 @@ async function changePassword() {
     return showMsg('pw-msg', t('settings.passwordMismatch'), false);
   if (newPass.length < 8)
     return showMsg('pw-msg', t('settings.passwordTooShort'), false);
+  const btn = document.querySelector('[data-action="change-password"]');
+  setBtnBusy(btn, true);
   try {
     await api('POST', '/api/config/password', { current, newPass });
     showMsg('pw-msg', t('settings.passwordChanged'), true);
@@ -754,6 +784,31 @@ async function changePassword() {
     toast(t('settings.passwordChanged'), 'success');
   } catch (err) {
     showMsg('pw-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// v1.2.3: Probe secret update — rebuilds Caddyfile and reloads Caddy
+async function changeProbeSecret() {
+  const secret = el('s-probe-secret')?.value?.trim();
+  if (!secret || secret.length < 8) {
+    showMsg('probe-secret-msg', t('settings.probeSecretTooShort') || 'Probe secret must be at least 8 characters', false);
+    return;
+  }
+  const btn = document.querySelector('[data-action="change-probe-secret"]');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('POST', '/api/settings/probe-secret', { probeSecret: secret });
+    showMsg('probe-secret-msg', res.message || t('settings.probeSecretUpdated') || 'Probe secret updated', true);
+    el('s-probe-secret').value = '';
+    el('s-probe-secret').placeholder = '••••••••';
+    state.config.probeSecret = secret;
+    toast(t('settings.probeSecretUpdated') || 'Probe secret updated — Caddy reloaded', 'success');
+  } catch (err) {
+    showMsg('probe-secret-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
   }
 }
 
@@ -876,13 +931,15 @@ async function runDiagnostics() {
         </div>
       </div>`;
 
-    // Bug 2 notice: show naive version / config status instead of "caddy valid"
+    // v1.2.3: caddy-forwardproxy-naive — show Caddyfile + probe_secret status
     const naiveOk = data.naiveVersionOk && data.naiveConfigExists;
+    const caddyfileUsers = data.caddyfileUsers ?? data.htpasswdUsers ?? 0;
+    const probeSet = data.probeSecretSet ? '✓ set' : '✗ not set';
     el('diag-config').innerHTML = naiveOk
-      ? `<span class="badge badge-green">${t('diagnostics.naiveValid') || 'naive OK'}</span>
+      ? `<span class="badge badge-green">${t('diagnostics.caddyValid') || 'Caddyfile valid ✓'}</span>
          <small style="display:block;margin-top:4px;color:var(--text-muted)">${esc(data.naiveVersion || '')}</small>
-         <small style="color:var(--text-muted)">htpasswd users: ${data.htpasswdUsers || 0}</small>`
-      : `<span class="badge badge-red">${t('diagnostics.naiveInvalid') || 'naive WARN'}</span>
+         <small style="color:var(--text-muted)">Caddyfile users: ${caddyfileUsers} &nbsp;|&nbsp; probe_secret: ${probeSet}</small>`
+      : `<span class="badge badge-red">${t('diagnostics.naiveInvalid') || 'caddy-naive WARN'}</span>
          <pre class="mini-log mt-2">${esc(data.naiveVersion || 'binary not found or version empty')}</pre>`;
 
     el('diag-mita-status').textContent = data.mitaStatus  || t('diagnostics.noOutput') || '—';
@@ -1001,6 +1058,25 @@ function redirectToLogin() {
 // ══════════════════════════════════════════════════════════════
 
 function el(id) { return document.getElementById(id); }
+
+/**
+ * v1.2.3: disabled-button + spinner pattern for all submit handlers.
+ * Prevents double-submit and gives visual feedback during async ops.
+ */
+function setBtnBusy(btn, busy) {
+  if (!btn) return;
+  if (busy) {
+    btn.dataset.origText = btn.innerHTML;
+    btn.disabled = true;
+    btn.innerHTML = `<span class="spinner" aria-hidden="true"></span>${btn.dataset.origText}`;
+  } else {
+    btn.disabled = false;
+    if (btn.dataset.origText) {
+      btn.innerHTML = btn.dataset.origText;
+      delete btn.dataset.origText;
+    }
+  }
+}
 
 function esc(str) {
   if (!str) return '';
