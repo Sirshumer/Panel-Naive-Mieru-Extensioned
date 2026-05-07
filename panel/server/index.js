@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru by RIXXX — Express backend  v1.1.1
+ * Panel Naive + Mieru by RIXXX — Express backend  v1.2.0
  * Node.js 20 LTS + Express + better-sqlite3 + WebSocket + node-cron
  *
  * IMPORTANT: Mieru (mita) uses an internal protobuf config store at /etc/mita/.
@@ -8,6 +8,12 @@
  *   2. Applies it via: mita apply config <file>
  *   3. Reloads without dropping connections: mita reload
  *   4. Full restart (port changes only): mita stop && mita start
+ *
+ * Blocker 7: NaiveProxy now uses a standalone 'naive' binary with config.json
+ *   + htpasswd file for multi-user auth. No Caddyfile is generated.
+ *   buildNaiveConfig() — rewrites /etc/naive/config.json atomically
+ *   buildHtpasswd()    — rewrites /etc/naive/htpasswd (bcrypt, one user per line)
+ *   After any user CRUD: buildHtpasswd() → reloadNaive() (or restartNaive())
  */
 'use strict';
 
@@ -29,12 +35,16 @@ const si             = require('systeminformation');
 // ── Paths ─────────────────────────────────────────────────────────────────────
 const PANEL_CONFIG    = '/etc/rixxx-panel/config.json';
 const DB_PATH         = '/var/lib/rixxx-panel/db.sqlite';
-const CADDYFILE       = '/etc/caddy-naive/Caddyfile';
 // Panel-owned JSON applied via `mita apply config <file>` (NOT /etc/mita/ directly)
 const MITA_STATE_FILE = '/var/lib/rixxx-panel/mita-state.json';
-const CADDY_BIN       = '/usr/local/bin/caddy-naive';
-const LOG_CADDY       = '/var/log/caddy-naive/access.log';
-const LOG_PANEL       = '/var/log/panel-naive-mieru.log';
+
+// Blocker 7: naive binary paths (replaces caddy-naive / Caddyfile)
+const NAIVE_BIN         = '/usr/local/bin/naive';
+const NAIVE_CONFIG_DIR  = '/etc/naive';
+const NAIVE_CONFIG_FILE = '/etc/naive/config.json';
+const NAIVE_HTPASSWD    = '/etc/naive/htpasswd';
+const LOG_NAIVE         = '/var/log/naive/access.log';
+const LOG_PANEL         = '/var/log/panel-naive-mieru.log';
 
 // ── Load system config ────────────────────────────────────────────────────────
 let cfg = {};
@@ -47,17 +57,22 @@ try {
     adminPassHash: bcrypt.hashSync('admin', 12),
     naivePort: 443, mieruPortStart: 2012, mieruPortEnd: 2022,
     panelPort: 3000, panelHost: '127.0.0.1', exposePanel: false,
-    dbPath: DB_PATH, caddyfile: CADDYFILE,
+    dbPath:        DB_PATH,
+    naiveConfig:   NAIVE_CONFIG_FILE,
+    naiveHtpasswd: NAIVE_HTPASSWD,
+    naiveBin:      NAIVE_BIN,
     mitaStateFile: MITA_STATE_FILE,
     trafficPattern: 'NOOP', mtu: 1400, udpEnabled: false,
-    language: 'ru', version: '1.1.1'
+    language: 'ru', version: '1.2.0'
   };
 }
 
 // Resolved paths (prefer config values, fall back to constants)
-const resolvedDb       = cfg.dbPath        || DB_PATH;
-const resolvedMitaFile = cfg.mitaStateFile || MITA_STATE_FILE;
-const resolvedCaddy    = cfg.caddyfile     || CADDYFILE;
+const resolvedDb        = cfg.dbPath        || DB_PATH;
+const resolvedMitaFile  = cfg.mitaStateFile || MITA_STATE_FILE;
+const resolvedNaiveCfg  = cfg.naiveConfig   || NAIVE_CONFIG_FILE;
+const resolvedHtpasswd  = cfg.naiveHtpasswd || NAIVE_HTPASSWD;
+const resolvedNaiveBin  = cfg.naiveBin      || NAIVE_BIN;
 
 // ── SQLite (better-sqlite3) ───────────────────────────────────────────────────
 let db = null;
@@ -146,78 +161,83 @@ function saveConfig() {
   } catch (e) { console.error('[CFG]', e.message); }
 }
 
-// ── Caddyfile builder (full rebuild each call) ────────────────────────────────
-function buildCaddyfile() {
-  const allUsers = getAllUsers();
-  const naiveUsers = allUsers.filter(u => {
-    const p = JSON.parse(u.protocols || '["naive","mieru"]');
-    return p.includes('naive');
+// ── Blocker 7: buildHtpasswd() ────────────────────────────────────────────────
+// Writes /etc/naive/htpasswd with bcrypt-hashed lines (username:$2y$12$…)
+// Naive reads this file on reload/restart.
+function buildHtpasswd(users) {
+  const naiveUsers = users.filter(u => {
+    try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
+    catch { return true; }
   });
+  const lines = naiveUsers.map(u => `${u.username}:${u.passHash}`).join('\n');
+  fs.mkdirSync(path.dirname(resolvedHtpasswd), { recursive: true });
+  const tmp = resolvedHtpasswd + '.new';
+  fs.writeFileSync(tmp, lines + (lines ? '\n' : ''), { mode: 0o640 });
+  fs.renameSync(tmp, resolvedHtpasswd);   // atomic replace
+}
 
-  // basic_auth entries: username bcrypt-hash  (caddy forward_proxy format)
-  const authLines = naiveUsers.map(u => `      basic_auth ${u.username} ${u.passHash}`).join('\n');
+// ── Blocker 7: buildNaiveConfig() ────────────────────────────────────────────
+// Writes /etc/naive/config.json atomically.
+// Schema: { listen, name, auth (htpasswd path), padding, log, cert?, key? }
+function buildNaiveConfig() {
+  fs.mkdirSync(NAIVE_CONFIG_DIR, { recursive: true });
+  const naiveCfg = {
+    listen:  `https://:${cfg.naivePort}`,
+    name:    cfg.domain || 'localhost',
+    auth:    resolvedHtpasswd,
+    padding: true,
+    log:     LOG_NAIVE
+  };
+  // Include TLS cert/key paths when present (Certbot)
+  if (cfg.certPath && fs.existsSync(cfg.certPath)) {
+    naiveCfg.cert = cfg.certPath;
+    naiveCfg.key  = cfg.keyPath;
+  }
+  const tmp = resolvedNaiveCfg + '.new';
+  fs.mkdirSync(path.dirname(resolvedNaiveCfg), { recursive: true });
+  fs.writeFileSync(tmp, JSON.stringify(naiveCfg, null, 2), { mode: 0o640 });
+  fs.renameSync(tmp, resolvedNaiveCfg);   // atomic replace
+}
 
-  const content = `{
-  order forward_proxy before file_server
-  admin off
-  log {
-    output file /var/log/caddy-naive/access.log {
-      roll_size 50mb
-      roll_keep 5
-    }
+// ── Blocker 7: Service helpers — naive ───────────────────────────────────────
+// Reload naive (SIGHUP for hot-reload without dropping connections)
+function reloadNaive() {
+  try {
+    execSync('systemctl reload naive 2>/dev/null || kill -HUP $(pgrep -x naive 2>/dev/null) 2>/dev/null || true',
+             { timeout: 10000 });
+    return true;
+  } catch {
+    return false;
   }
 }
 
-:${cfg.naivePort}, ${cfg.domain}:${cfg.naivePort} {
-  tls ${cfg.adminEmail || 'admin@example.com'}
-  route {
-    forward_proxy {
-${authLines || '      # no users configured yet'}
-      hide_ip
-      hide_via
-      probe_resistance
-    }
-    file_server {
-      root /var/www/html
-    }
-  }
-}
-${cfg.exposePanel ? `\n${cfg.domain}:8080 {\n  reverse_proxy 127.0.0.1:3000\n}\n` : ''}`;
-
-  const tmp = resolvedCaddy + '.new';
-  fs.writeFileSync(tmp, content, { mode: 0o644 });
-  fs.renameSync(tmp, resolvedCaddy);          // atomic replace
+// Full naive restart (needed for port/TLS changes)
+function restartNaive() {
+  try {
+    execSync('systemctl restart naive 2>/dev/null', { timeout: 15000 });
+    return true;
+  } catch { return false; }
 }
 
-// ── Mieru state JSON builder (FULL user list — mita apply replaces everything) ─
+// ── Mieru state JSON builder ──────────────────────────────────────────────────
 function buildMitaStateFile() {
   const allUsers = getAllUsers();
   const mieruUsers = allUsers.filter(u => {
-    const p = JSON.parse(u.protocols || '["naive","mieru"]');
-    return p.includes('mieru');
+    try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('mieru'); }
+    catch { return true; }
   });
 
-  // Blocker #6 fix: TCP-only by default; UDP is opt-in via cfg.udpEnabled
+  // TCP-only by default; UDP is opt-in via cfg.udpEnabled
   const portBindings = [];
   for (let p = cfg.mieruPortStart; p <= cfg.mieruPortEnd; p++) {
     portBindings.push({ port: p, protocol: 'TCP' });
     if (cfg.udpEnabled) portBindings.push({ port: p, protocol: 'UDP' });
   }
 
-  // Mieru server JSON schema (verified against mita source):
-  //   users[].name     = username (string)
-  //   users[].password = plain-text PASSWORD STRING (NOT array — mita hashes internally)
-  // Blocker #3 fix: password is a plain string, not an array
-  //
-  // Blocker #2 fix: trafficPattern field is OMITTED for NOOP (default).
-  //   Only add trafficPattern when a non-default pattern is selected.
-  //   The correct sub-object structure for non-NOOP patterns is handled below.
-  //
-  // Blocker #4 fix: default MTU is 1400 (recommended by Mieru docs)
   const mieruCfg = {
     portBindings,
     users: mieruUsers.map(u => ({
-      name: u.username,
+      name:     u.username,
       password: u.password || ''   // plain string — mita hashes on apply
     })),
     loggingLevel: 'INFO',
@@ -227,11 +247,10 @@ function buildMitaStateFile() {
   // Only add trafficPattern when not NOOP (omitting = NOOP default)
   const pat = cfg.trafficPattern || 'NOOP';
   if (pat !== 'NOOP') {
-    // Correct mita trafficPattern schema: { seed: bool, tcpFragment: bool, nonce: bool }
     const patMap = {
       'RANDOM_PADDING':            { seed: true,  tcpFragment: false, nonce: false },
       'RANDOM_PADDING_AGGRESSIVE': { seed: true,  tcpFragment: true,  nonce: true  },
-      'CUSTOM':                    { seed: true,  tcpFragment: true,  nonce: true  },
+      'CUSTOM':                    { seed: true,  tcpFragment: true,  nonce: true  }
     };
     if (patMap[pat]) mieruCfg.trafficPattern = patMap[pat];
   }
@@ -241,23 +260,10 @@ function buildMitaStateFile() {
   fs.writeFileSync(tmp, JSON.stringify(mieruCfg, null, 2), { mode: 0o600 });
   fs.renameSync(tmp, resolvedMitaFile);       // atomic replace
 
-  // Shred the old backup if present (security)
   shredFile(resolvedMitaFile + '.last');
   try { fs.copyFileSync(resolvedMitaFile, resolvedMitaFile + '.last'); } catch {}
 
   return resolvedMitaFile;
-}
-
-// ── Service helpers ───────────────────────────────────────────────────────────
-function reloadCaddy() {
-  // Reload without service restart (no connection drop)
-  try {
-    execSync(`${CADDY_BIN} reload --config ${resolvedCaddy} --adapter caddyfile --force 2>/dev/null`, { timeout: 10000 });
-    return true;
-  } catch {
-    try { execSync('systemctl reload caddy-naive 2>/dev/null', { timeout: 10000 }); return true; }
-    catch { return false; }
-  }
 }
 
 // Apply config (no connection drop) — used for user add/update/delete
@@ -310,7 +316,7 @@ app.use(helmet({
       imgSrc:     ["'self'", 'data:', 'blob:'],
       mediaSrc:   ["'none'"],
       objectSrc:  ["'none'"],
-      frameAncestors: ["'none'"],
+      frameAncestors: ["'none'"]
     }
   },
   crossOriginEmbedderPolicy: false
@@ -362,7 +368,7 @@ app.post('/api/login', loginLimiter, (req, res) => {
   if (!username || !password)
     return res.status(400).json({ error: 'Missing credentials' });
 
-  // Bcrypt-only comparison — SHA-256 fallback removed (security fix)
+  // Bcrypt-only — no SHA-256 fallback
   const isAdmin =
     username === cfg.adminUser &&
     cfg.adminPassHash &&
@@ -402,7 +408,6 @@ app.post('/api/config/password', requireAuth, (req, res) => {
   const { current, newPass } = req.body;
   if (!current || !newPass) return res.status(400).json({ error: 'Missing fields' });
   if (newPass.length < 8) return res.status(400).json({ error: 'New password must be at least 8 characters' });
-  // Bcrypt-only comparison
   const valid = cfg.adminPassHash && bcrypt.compareSync(current, cfg.adminPassHash);
   if (!valid) return res.status(401).json({ error: 'Current password incorrect' });
   cfg.adminPassHash = bcrypt.hashSync(newPass, 12);
@@ -412,7 +417,6 @@ app.post('/api/config/password', requireAuth, (req, res) => {
 
 // ── Users API ─────────────────────────────────────────────────────────────────
 app.get('/api/users', requireAuth, (req, res) => {
-  // Never expose passHash or plain password
   const users = getAllUsers().map(({ passHash, password, ...u }) => u);
   res.json(users);
 });
@@ -430,7 +434,7 @@ app.post('/api/users', requireAuth, (req, res) => {
   const user = {
     id:        uuidv4(),
     email, username,
-    passHash:  bcrypt.hashSync(password, 12),  // for Caddy basic_auth
+    passHash:  bcrypt.hashSync(password, 12),  // for naive htpasswd
     password,                                   // plain text for mita apply config
     expiry:    expiry || null,
     protocols: JSON.stringify(protocols || ['naive', 'mieru']),
@@ -440,9 +444,9 @@ app.post('/api/users', requireAuth, (req, res) => {
   };
   upsertUser(user);
 
-  // Rebuild both configs atomically
-  try { buildCaddyfile(); reloadCaddy(); }   catch (e) { console.error('[CADDY]', e.message); }
-  try { applyMitaConfig(); }                 catch (e) { console.error('[MITA]',  e.message); }
+  // Blocker 7: rebuild htpasswd + reload naive; rebuild mita state
+  try { buildHtpasswd(getAllUsers()); reloadNaive(); } catch (e) { console.error('[NAIVE]', e.message); }
+  try { applyMitaConfig(); }                          catch (e) { console.error('[MITA]',  e.message); }
 
   const { passHash, password: _p, ...safe } = user;
   res.status(201).json(safe);
@@ -468,8 +472,9 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   }
   upsertUser(updated);
 
-  try { buildCaddyfile(); reloadCaddy(); }  catch {}
-  try { applyMitaConfig(); }                catch {}
+  // Blocker 7: rebuild htpasswd + reload naive; rebuild mita state
+  try { buildHtpasswd(getAllUsers()); reloadNaive(); } catch {}
+  try { applyMitaConfig(); }                          catch {}
 
   const { passHash, password: _p, ...safe } = updated;
   res.json(safe);
@@ -479,28 +484,28 @@ app.delete('/api/users/:id', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   deleteUser(req.params.id);
-  try { buildCaddyfile(); reloadCaddy(); }  catch {}
-  try { applyMitaConfig(); }                catch {}
+  // Blocker 7: rebuild htpasswd + reload naive; rebuild mita state
+  try { buildHtpasswd(getAllUsers()); reloadNaive(); } catch {}
+  try { applyMitaConfig(); }                          catch {}
   res.json({ ok: true });
 });
 
 // ── Server settings — Sprint 3 ────────────────────────────────────────────────
 
-// Naive port: Caddy reload only (no service restart)
+// Naive port: rebuild config + full restart (port binding change)
 app.post('/api/settings/naive-port', requireAuth, (req, res) => {
   const p = parseInt(req.body.port, 10);
   if (!p || p < 1 || p > 65535)
     return res.status(400).json({ error: 'Invalid port (1–65535)' });
   cfg.naivePort = p; saveConfig();
   try {
-    buildCaddyfile();
-    const ok = reloadCaddy();
-    // Notify: clients need new configs
+    buildNaiveConfig();
+    const ok = restartNaive();
     res.json({ ok, message: `NaiveProxy port changed to ${p}. Clients must download new configs.` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// Mieru ports: UFW update + FULL restart (required for port range change)
+// Mieru ports: UFW update + FULL restart
 app.post('/api/settings/mieru-ports', requireAuth, (req, res) => {
   const s = parseInt(req.body.portStart, 10);
   const e = parseInt(req.body.portEnd,   10);
@@ -510,8 +515,6 @@ app.post('/api/settings/mieru-ports', requireAuth, (req, res) => {
   const oldS = cfg.mieruPortStart, oldE = cfg.mieruPortEnd;
   cfg.mieruPortStart = s; cfg.mieruPortEnd = e; saveConfig();
 
-  // UFW: remove old rules, add new
-  // UDP rules only when udpEnabled (opt-in, disabled by default)
   try {
     execSync(`ufw delete allow ${oldS}:${oldE}/tcp 2>/dev/null || true`, { timeout: 5000 });
     execSync(`ufw delete allow ${oldS}:${oldE}/udp 2>/dev/null || true`, { timeout: 5000 });
@@ -521,14 +524,13 @@ app.post('/api/settings/mieru-ports', requireAuth, (req, res) => {
     }
   } catch {}
 
-  // Full restart required for port binding changes
   try {
     const ok = restartMieru();
     res.json({ ok, message: `Mieru ports changed to ${s}–${e}. Service restarted. Clients must download new configs.` });
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// Traffic pattern + MTU: mita reload (no restart needed)
+// Traffic pattern + MTU: mita reload
 app.post('/api/settings/traffic-pattern', requireAuth, (req, res) => {
   const validPatterns = ['NOOP', 'RANDOM_PADDING', 'RANDOM_PADDING_AGGRESSIVE'];
   const { pattern, mtu } = req.body;
@@ -541,17 +543,15 @@ app.post('/api/settings/traffic-pattern', requireAuth, (req, res) => {
   }
   cfg.trafficPattern = pattern; saveConfig();
   try {
-    const ok = applyMitaConfig();   // apply + reload (no restart)
+    const ok = applyMitaConfig();
     res.json({ ok, pattern, mtu: cfg.mtu });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// UDP toggle (opt-in, disabled by default)
-// Requires full Mieru restart because port bindings change
+// UDP toggle: requires full Mieru restart (port bindings change)
 app.post('/api/settings/udp-toggle', requireAuth, (req, res) => {
   const enable = req.body.enabled === true || req.body.enabled === 'true';
   cfg.udpEnabled = enable; saveConfig();
-  // UFW: add or remove UDP rules
   try {
     const s = cfg.mieruPortStart, e = cfg.mieruPortEnd;
     if (enable) {
@@ -560,7 +560,6 @@ app.post('/api/settings/udp-toggle', requireAuth, (req, res) => {
       execSync(`ufw delete allow ${s}:${e}/udp 2>/dev/null || true`, { timeout: 5000 });
     }
   } catch {}
-  // Rebuild bindings and full restart
   try {
     const ok = restartMieru();
     res.json({ ok, udpEnabled: enable,
@@ -568,7 +567,7 @@ app.post('/api/settings/udp-toggle', requireAuth, (req, res) => {
   } catch (err) { res.status(500).json({ error: err.message }); }
 });
 
-// ── Language setting ─────────────────────────────────────────────────────────
+// Language setting
 app.post('/api/settings/language', requireAuth, (req, res) => {
   const { language } = req.body;
   if (!['ru', 'en'].includes(language))
@@ -580,9 +579,7 @@ app.post('/api/settings/language', requireAuth, (req, res) => {
 
 // ── Client configs — Sprint 4 ─────────────────────────────────────────────────
 
-// Sprint 4 canonical aliases: /api/users/:id/config/{naive,mieru,universal}
-// These are the routes called by app.js downloadNaiveLink / downloadMieruConfig /
-// downloadUniversalConfig — the original endpoints also remain for back-compat.
+// Sprint 4 canonical routes
 app.get('/api/users/:id/config/naive', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -628,8 +625,8 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
     log: { level: 'info', timestamp: true },
     dns: {
       servers: [
-        { tag: 'remote', address: 'tls://8.8.8.8',              detour: 'select' },
-        { tag: 'local',  address: 'https://223.5.5.5/dns-query', detour: 'direct' }
+        { tag: 'remote', address: 'tls://8.8.8.8',               detour: 'select' },
+        { tag: 'local',  address: 'https://223.5.5.5/dns-query',  detour: 'direct' }
       ],
       rules:  [{ outbound: 'any', server: 'local' }],
       final:  'remote'
@@ -674,102 +671,15 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
   res.json(universalCfg);
 });
 
-// Naive link: naive+https://user:pass@domain:port
-app.get('/api/users/:id/naive-link', requireAuth, (req, res) => {
-  const user = getUserById(req.params.id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  const password = req.query.password || user.password || 'YOUR_PASSWORD';
-  const link = `naive+https://${user.username}:${encodeURIComponent(password)}@${cfg.domain}:${cfg.naivePort}`;
-  res.json({ link, username: user.username });
+// Back-compat aliases
+app.get('/api/users/:id/naive-link',       requireAuth, (req, res) => {
+  res.redirect(307, `/api/users/${req.params.id}/config/naive${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`);
 });
-
-// Mieru sing-box JSON
-app.get('/api/users/:id/mieru-config', requireAuth, (req, res) => {
-  const user = getUserById(req.params.id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  const password = req.query.password || user.password || 'YOUR_PASSWORD';
-
-  const singboxCfg = {
-    log: { level: 'info', timestamp: true },
-    outbounds: [
-      {
-        type: 'mieru', tag: 'mieru-out',
-        server: cfg.serverIp || cfg.domain,
-        server_port: cfg.mieruPortStart,
-        username: user.username, password,
-        protocol: 'TCP',
-        multiplex: { enabled: false }
-      },
-      { type: 'direct', tag: 'direct' },
-      { type: 'dns',    tag: 'dns-out' }
-    ],
-    route: {
-      rules: [{ protocol: 'dns', outbound: 'dns-out' }],
-      final: 'mieru-out'
-    }
-  };
-
-  const filename = `mieru-${user.username}-${cfg.domain}.json`;
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  res.setHeader('Content-Type', 'application/json');
-  res.json(singboxCfg);
+app.get('/api/users/:id/mieru-config',     requireAuth, (req, res) => {
+  res.redirect(307, `/api/users/${req.params.id}/config/mieru${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`);
 });
-
-// Universal config: Naive + Mieru + urltest auto-fallback
 app.get('/api/users/:id/universal-config', requireAuth, (req, res) => {
-  const user = getUserById(req.params.id);
-  if (!user) return res.status(404).json({ error: 'User not found' });
-  const password = req.query.password || user.password || 'YOUR_PASSWORD';
-
-  const universalCfg = {
-    log: { level: 'info', timestamp: true },
-    dns: {
-      servers: [
-        { tag: 'remote', address: 'tls://8.8.8.8',                    detour: 'select' },
-        { tag: 'local',  address: 'https://223.5.5.5/dns-query',       detour: 'direct' }
-      ],
-      rules:  [{ outbound: 'any', server: 'local' }],
-      final:  'remote'
-    },
-    outbounds: [
-      {
-        type: 'urltest', tag: 'select',
-        outbounds: ['naive-out', 'mieru-out'],
-        url: 'https://www.gstatic.com/generate_204',
-        interval: '3m', tolerance: 50
-      },
-      {
-        type: 'http', tag: 'naive-out',
-        server: cfg.domain, server_port: cfg.naivePort,
-        username: user.username, password,
-        tls: { enabled: true, server_name: cfg.domain }
-      },
-      {
-        type: 'mieru', tag: 'mieru-out',
-        server: cfg.serverIp || cfg.domain,
-        server_port: cfg.mieruPortStart,
-        username: user.username, password,
-        protocol: 'TCP',
-        multiplex: { enabled: false }
-      },
-      { type: 'direct', tag: 'direct' },
-      { type: 'dns',    tag: 'dns-out' }
-    ],
-    route: {
-      rules: [
-        { protocol: 'dns',  outbound: 'dns-out' },
-        { geoip: 'cn',      outbound: 'direct'  },
-        { geosite: 'cn',    outbound: 'direct'  }
-      ],
-      final: 'select',
-      auto_detect_interface: true
-    }
-  };
-
-  const filename = `universal-${user.username}-${cfg.domain}.json`;
-  res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
-  res.setHeader('Content-Type', 'application/json');
-  res.json(universalCfg);
+  res.redirect(307, `/api/users/${req.params.id}/config/universal${req.url.includes('?') ? req.url.slice(req.url.indexOf('?')) : ''}`);
 });
 
 // ── Monitoring — Sprint 5 ─────────────────────────────────────────────────────
@@ -782,8 +692,9 @@ app.get('/api/status', requireAuth, async (req, res) => {
 
     res.json({
       services: {
-        naive: { active: exec_('systemctl is-active caddy-naive') === 'active',
-                 version: exec_(`${CADDY_BIN} version 2>/dev/null | head -1`) },
+        // Blocker 7: naive service (not caddy-naive)
+        naive: { active: exec_('systemctl is-active naive') === 'active',
+                 version: exec_(`${resolvedNaiveBin} --version 2>/dev/null | head -1`) },
         mieru: { active: exec_('systemctl is-active mita') === 'active',
                  version: exec_('mita version 2>/dev/null | head -1') },
         panel: { active: true }
@@ -798,7 +709,7 @@ app.get('/api/status', requireAuth, async (req, res) => {
         os:   osInfo.distro + ' ' + osInfo.release,
         arch: osInfo.arch
       },
-      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.1.1' },
+      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.2.0' },
       domain:   cfg.domain,
       serverIp: cfg.serverIp,
       language: cfg.language || 'ru'
@@ -828,7 +739,7 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
   res.json(users);
 });
 
-// Parse `mita describe users` output (format may change between mita versions)
+// Parse `mita describe users` output
 function parseMitaUsers(raw) {
   const users = [];
   if (!raw) return users;
@@ -862,7 +773,9 @@ app.get('/api/logs/:service', requireAuth, (req, res) => {
   const lines = Math.min(parseInt(req.query.lines || '100', 10), 1000);
   let cmd;
   switch (service) {
-    case 'caddy': cmd = `journalctl -u caddy-naive -n ${lines} --no-pager 2>/dev/null || tail -n ${lines} ${LOG_CADDY} 2>/dev/null`; break;
+    // Blocker 7: naive logs (not caddy-naive)
+    case 'caddy':
+    case 'naive': cmd = `journalctl -u naive -n ${lines} --no-pager 2>/dev/null || tail -n ${lines} ${LOG_NAIVE} 2>/dev/null`; break;
     case 'mieru': cmd = `journalctl -u mita -n ${lines} --no-pager 2>/dev/null || mita describe log 2>/dev/null`; break;
     case 'panel': cmd = `tail -n ${lines} ${LOG_PANEL} 2>/dev/null`; break;
     default: return res.status(400).json({ error: 'Unknown service' });
@@ -874,34 +787,63 @@ app.get('/api/logs/:service', requireAuth, (req, res) => {
 // ── Diagnostics ───────────────────────────────────────────────────────────────
 app.get('/api/diagnostics', requireAuth, async (_req, res) => {
   const exec_ = cmd => { try { return execSync(cmd, { timeout: 4000 }).toString().trim(); } catch { return ''; } };
+
+  // Blocker 8: port-listen check helper
   const chkPort = p => {
-    try { return parseInt(execSync(`ss -tlnup sport = :${p} 2>/dev/null | grep -c :${p}`, { timeout: 3000 }).toString().trim(), 10) > 0; }
-    catch { return false; }
+    try {
+      return parseInt(
+        execSync(`ss -tlnup sport = :${p} 2>/dev/null | grep -c :${p}`, { timeout: 3000 }).toString().trim(),
+        10) > 0;
+    } catch { return false; }
   };
 
-  let caddyValid = false, caddyErr = '';
-  try { execSync(`${CADDY_BIN} validate --config ${resolvedCaddy} --adapter caddyfile 2>&1`, { timeout: 6000 }); caddyValid = true; }
-  catch (e) { caddyErr = e.stdout?.toString() || e.message; }
+  // Blocker 5: naive --version instead of caddy validate
+  let naiveVersionOk = false, naiveVersionStr = '';
+  try {
+    naiveVersionStr = execSync(`${resolvedNaiveBin} --version 2>&1`, { timeout: 6000 }).toString().trim();
+    naiveVersionOk  = naiveVersionStr.length > 0;
+  } catch (e) { naiveVersionStr = e.message; }
+
+  // Blocker 8: check all Mieru ports in range (sample first and last)
+  const mieruPortsListening = [];
+  for (const p of [cfg.mieruPortStart, cfg.mieruPortEnd]) {
+    if (p && chkPort(p)) mieruPortsListening.push(p);
+  }
 
   res.json({
-    ports:           { naive: chkPort(cfg.naivePort), mieru: chkPort(cfg.mieruPortStart) },
-    caddyConfigValid: caddyValid,
-    caddyConfigError: caddyErr || null,
-    mitaStatus:       exec_('mita status 2>/dev/null'),
-    mitaConfig:       exec_('mita describe config 2>/dev/null'),
-    timeSynced:       exec_('timedatectl status 2>/dev/null').includes('synchronized: yes'),
-    mitaStateFile:    resolvedMitaFile
+    ports: {
+      naive:       chkPort(cfg.naivePort),
+      mieru:       chkPort(cfg.mieruPortStart),
+      // Blocker 8: extended Mieru port check
+      mieruPorts:  mieruPortsListening
+    },
+    // Blocker 5: naive --version replaces caddy validate
+    naiveVersionOk,
+    naiveVersion:      naiveVersionStr,
+    naiveConfigExists: fs.existsSync(resolvedNaiveCfg),
+    htpasswdExists:    fs.existsSync(resolvedHtpasswd),
+    htpasswdUsers:     fs.existsSync(resolvedHtpasswd)
+      ? fs.readFileSync(resolvedHtpasswd, 'utf8').split('\n').filter(l => l.trim()).length
+      : 0,
+    mitaStatus:   exec_('mita status 2>/dev/null'),
+    mitaConfig:   exec_('mita describe config 2>/dev/null'),
+    timeSynced:   exec_('timedatectl status 2>/dev/null').includes('synchronized: yes'),
+    mitaStateFile: resolvedMitaFile
   });
 });
 
 // ── Service control ───────────────────────────────────────────────────────────
 app.post('/api/service/:name/:action', requireAuth, (req, res) => {
   const { name, action } = req.params;
-  if (!['caddy-naive','mita'].includes(name))    return res.status(400).json({ error: 'Unknown service' });
-  if (!['start','stop','restart','reload'].includes(action)) return res.status(400).json({ error: 'Unknown action' });
+  // Accept both 'naive' (new) and 'caddy-naive' (legacy alias) for back-compat
+  const svcName = name === 'caddy-naive' ? 'naive' : name;
+  if (!['naive','mita'].includes(svcName))
+    return res.status(400).json({ error: 'Unknown service (valid: naive, mita)' });
+  if (!['start','stop','restart','reload'].includes(action))
+    return res.status(400).json({ error: 'Unknown action' });
   try {
-    execSync(`systemctl ${action} ${name} 2>&1`, { timeout: 15000 });
-    res.json({ ok: true, service: name, action });
+    execSync(`systemctl ${action} ${svcName} 2>&1`, { timeout: 15000 });
+    res.json({ ok: true, service: svcName, action });
   } catch (e) { res.status(500).json({ error: e.stdout?.toString() || e.message }); }
 });
 
@@ -920,8 +862,9 @@ wss.on('connection', ws => {
         cpu:        Math.round(cpu.currentLoad),
         ramUsedMB:  Math.round((mem.total - mem.available) / 1048576),
         ramTotalMB: Math.round(mem.total / 1048576),
-        naive:      exec_('systemctl is-active caddy-naive') === 'active',
-        mieru:      exec_('systemctl is-active mita')        === 'active'
+        // Blocker 7: check 'naive' service (not caddy-naive)
+        naive:      exec_('systemctl is-active naive') === 'active',
+        mieru:      exec_('systemctl is-active mita')  === 'active'
       }));
     } catch {}
   };
@@ -943,8 +886,9 @@ cron.schedule('*/5 * * * *', () => {
     }
   });
   if (changed) {
-    try { buildCaddyfile(); reloadCaddy(); }  catch {}
-    try { applyMitaConfig(); }                catch {}
+    // Blocker 7: rebuild htpasswd + reload naive instead of Caddyfile
+    try { buildHtpasswd(getAllUsers()); reloadNaive(); } catch {}
+    try { applyMitaConfig(); }                          catch {}
   }
 });
 
@@ -982,7 +926,7 @@ server.listen(PORT, HOST, () => {
     '  ██║  ██║ ██║ ██╔╝ ██╗ ██╔╝ ██╗ ██╔╝ ██╗',
     '  ╚═╝  ╚═╝ ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝',
     '',
-    `  Panel Naive + Mieru v${cfg.version || '1.1.1'} by RIXXX`,
+    `  Panel Naive + Mieru v${cfg.version || '1.2.0'} by RIXXX`,
     `  http://${HOST}:${PORT}/`,
     HOST === '127.0.0.1' ? `  ⚠  SSH-only: ssh -L 3000:127.0.0.1:3000 root@<server>` : '',
     ''

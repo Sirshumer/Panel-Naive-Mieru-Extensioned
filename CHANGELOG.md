@@ -7,6 +7,51 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.0] — 2026-05-07
+
+### Breaking Changes
+- **NaiveProxy binary** changed from `caddy-naive` to standalone `naive` binary
+  - Binary path: `/usr/local/bin/naive` (was `/usr/local/bin/caddy-naive`)
+  - Config: `/etc/naive/config.json` + `/etc/naive/htpasswd` (was Caddyfile)
+  - Systemd unit: `naive.service` (was `caddy-naive.service`)
+  - Run `bash update.sh --repair` to migrate an existing v1.1.x install
+
+### Added
+- **Blocker 1**: Strict architecture asset matching — `endswith("-" + arch + ".tar.xz")` with no Linux fallback
+- **Blocker 2**: `NAIVE_BIN=/usr/local/bin/naive`, `NAIVE_CONFIG_DIR=/etc/naive`; searches for `naive`/`naiveproxy` binary in archive
+- **Blocker 3**: `/etc/naive/config.json` with `listen`, `name`, `auth` (htpasswd path), `padding`, `log`
+- **Blocker 4**: `naive.service` systemd unit; old `caddy-naive.service` removed on install/repair
+- **Blocker 5**: Smoke tests — `naive --version`, `systemctl is-active naive`, port-listen check
+- **Blocker 6**: `update.sh --repair` rebuilds htpasswd + naive config + mita-state from SQLite; `--status` shows naive version, config, htpasswd user count
+- **Blocker 7**: `buildHtpasswd(users)` + `buildNaiveConfig()` in `server/index.js`; all user CRUD rebuilds htpasswd + reloads naive
+- **Blocker 8**: Post-start Mieru port-listen check in smoke tests and `/api/diagnostics`
+- **Blocker 9**: Installer output captured to `/var/log/rixxx-panel-install.log`
+- **Blocker 10**: `--non-interactive`/`--force` flags; `--domain`, `--email`, `--admin-pass` etc. CLI args
+- **Blocker 11**: Version file at `/etc/rixxx-panel/version` with key=value format (`panel_version`, `naive_version`, `mieru_version`, `installed_at`)
+- **Blocker 12**: Generic listen `"https://:PORT"` in naive config; `"name": "${DOMAIN}"` for logging
+- **Blocker 13**: Certbot step in `install.sh`; `cert`/`key` paths in config.json; renewal hook
+- **Blocker 14**: `fmtLastSeen(iso)` in `app.js` — shows "X min ago / Xh ago / Xd ago" in tables
+- **Blocker 15**: GitHub Actions CI matrix in `.github/workflows/ci.yml` — Ubuntu 24.04, 22.04, Debian 12
+- `apache2-utils` and `certbot` added to `install_deps()`
+- UFW opens port 80/tcp for Certbot HTTP-01 challenges
+- `uninstall.sh` removes naive paths, legacy caddy-naive artifacts, Certbot hook
+
+### Changed
+- `install.sh` version bumped to `1.2.0`
+- `update.sh` TARGET_VERSION bumped to `1.2.0`
+- `panel/package.json` version bumped to `1.2.0`
+- `panel/server/index.js` bumped to `v1.2.0`
+- `panel/public/app.js` bumped to `v1.2.0`
+- `/api/logs/caddy` aliased to `naive` logs for back-compat
+- `/api/service/caddy-naive/…` aliased to `naive` for back-compat
+
+### Fixed
+- `update.sh --status` shows naive binary version
+- `update.sh --repair` rebuilds from live DB without requiring a backup
+- `uninstall.sh` cleans all v1.2.0 paths and legacy caddy-naive artifacts
+
+---
+
 ## [v1.1.0] — 2026-05-06
 
 ### Added

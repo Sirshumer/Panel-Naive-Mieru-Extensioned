@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.1.1
+ * Panel Naive + Mieru — Frontend Application v1.2.0
  * Features: i18n (ru/en), dark/light theme, QR codes, all 6 sprints
  */
 'use strict';
@@ -390,7 +390,7 @@ function renderUsersTable(users) {
       <td>${fmtNum(u.usedMB)}</td>
       <td>${u.quotaMB > 0 ? fmtNum(u.quotaMB) : '∞'}</td>
       <td>${quotaStr}</td>
-      <td>${fmtDate(u.lastSeen)}</td>
+      <td>${fmtLastSeen(u.lastSeen)}</td>
       <td>
         <div style="display:flex;gap:4px;flex-wrap:wrap">
           <button class="btn btn-xs btn-secondary" onclick="openEditUser('${u.id}')">${t('users.edit')}</button>
@@ -732,7 +732,7 @@ function renderTrafficTable(stats) {
       <td>${quotaMB > 0 ? fmtNum(quotaMB) : '∞'}</td>
       <td>${quotaCell}</td>
       <td>${u.expiry ? fmtDate(u.expiry) : '—'}</td>
-      <td>${fmtDate(u.lastSeen)}</td>
+      <td>${fmtLastSeen(u.lastSeen)}</td>
     </tr>`;
   }).join('');
 }
@@ -930,6 +930,26 @@ function fmtDate(iso) {
   try {
     const opts = { day: '2-digit', month: 'short', year: 'numeric' };
     return new Date(iso).toLocaleDateString(currentLang === 'ru' ? 'ru-RU' : 'en-GB', opts);
+  } catch { return iso; }
+}
+
+// Blocker 14: show "Last seen N min/h/d ago" instead of raw ISO date
+function fmtLastSeen(iso) {
+  if (!iso) return '—';
+  try {
+    const diffMs  = Date.now() - new Date(iso).getTime();
+    if (diffMs < 0) return fmtDate(iso);
+    const diffMin = Math.floor(diffMs / 60000);
+    if (diffMin < 1)  return currentLang === 'ru' ? 'только что' : 'just now';
+    if (diffMin < 60) return currentLang === 'ru'
+      ? `${diffMin} мин. назад`
+      : `${diffMin} min ago`;
+    const diffH = Math.floor(diffMin / 60);
+    if (diffH < 24)   return currentLang === 'ru'
+      ? `${diffH} ч. назад`
+      : `${diffH}h ago`;
+    const diffD = Math.floor(diffH / 24);
+    return currentLang === 'ru' ? `${diffD} д. назад` : `${diffD}d ago`;
   } catch { return iso; }
 }
 
