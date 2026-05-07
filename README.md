@@ -6,7 +6,7 @@
 
 # 🛡 Panel Naive + Mieru by RIXXX
 
-**v1.2.0** — Веб-панель управления NaiveProxy + Mieru для Ubuntu/Debian VPS
+**v1.2.3** — Веб-панель управления NaiveProxy + Mieru для Ubuntu/Debian VPS
 
 [![Telegram](https://img.shields.io/badge/Telegram-@russian__paradice__vpn-2CA5E0?logo=telegram&logoColor=white)](https://t.me/russian_paradice_vpn)
 [![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-181717?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
@@ -23,8 +23,8 @@
 
 | Sprint | Функционал |
 |--------|-----------|
-| 1 | Авто-установщик: определение архитектуры, NaiveProxy, Mieru .deb, systemd, NTP, UFW, config.json |
-| 2 | CRUD пользователей: SQLite, перестройка htpasswd / Mieru-конфига, cron удаления просроченных |
+| 1 | Авто-установщик: определение архитектуры (только amd64), caddy-forwardproxy-naive, Mieru .deb, systemd, NTP, UFW, config.json |
+| 2 | CRUD пользователей: SQLite, атомарная перестройка Caddyfile / Mieru-конфига, cron удаления просроченных |
 | 3 | Настройки сервера: смена портов, паттерны трафика, MTU, авто-обновление UFW |
 | 4 | Клиентские конфиги: Naive-ссылка, Mieru sing-box JSON, универсальный конфиг, QR-коды |
 | 5 | Мониторинг: WebSocket метрики в реальном времени, трафик, квоты, история снимков |
@@ -39,7 +39,8 @@
 | Ubuntu | 20.04, 22.04, 24.04 |
 | Debian | 11, 12 |
 
-**Архитектуры:** `x86_64` (amd64) · `aarch64` (arm64) *(экспериментально, не тестировалось в продакшне)* · `armv7l` (armhf) *(экспериментально, не тестировалось в продакшне)*
+**Архитектуры:** `x86_64` (amd64) — **только** *(caddy-forwardproxy-naive поддерживает только amd64)*  
+> ⚠️ ARM64 и ARMv7 **не поддерживаются** в v1.2.3 — установщик завершится с понятной ошибкой.
 
 ---
 
@@ -57,9 +58,11 @@ sudo bash install.sh
 Мастер установки запросит:
 - Язык (Русский / English) — **первый вопрос**
 - Домен / имя хоста
-- Email для TLS-сертификата
+- Email для TLS (Caddy управляет сертификатами автоматически через TLS-ALPN-01)
 - Порт NaiveProxy (по умолчанию: `443`)
 - Диапазон портов Mieru (по умолчанию: `2012-2022`)
+- URL фейкового сайта (по умолчанию: `https://www.example.com`)
+- Probe secret (по умолчанию: авто-генерация)
 - Данные администратора панели
 - Настройка UFW (опционально)
 - Режим доступа к панели (SSH-only / публичный)
@@ -90,14 +93,15 @@ sudo bash update.sh --expose vpn.example.com
 | `/etc/rixxx-panel/config.json` | Конфигурация панели |
 | `/etc/rixxx-panel/version` | Установленная версия |
 | `/etc/rixxx-panel/backups/` | Резервные копии (хранится последние 10) |
-| `/etc/naive/config.json` | Конфиг NaiveProxy (listen, name, auth, cert/key) |
-| `/etc/naive/htpasswd` | Пользователи NaiveProxy (bcrypt, управляется панелью) |
-| `/var/log/naive/access.log` | Лог доступа NaiveProxy |
+| `/etc/caddy-naive/Caddyfile` | Конфиг Caddy forwardproxy-naive (basicauth, probe_resistance) |
+| `/etc/caddy-naive/probe_secret` | Секрет защиты от зондирования |
+| `/var/www/fake-site/` | Фейковый сайт (показывается неопознанным клиентам) |
+| `/var/log/caddy-naive/access.log` | Лог доступа caddy-naive |
 | `/var/log/rixxx-panel-install.log` | Лог установки |
 | `/var/lib/rixxx-panel/mita-state.json` | JSON-файл Mieru (применяется через `mita apply config`) |
 | `/var/lib/rixxx-panel/db.sqlite` | SQLite база данных пользователей |
 | `/opt/panel-naive-mieru/` | Файлы приложения панели |
-| `/usr/local/bin/naive` | Бинарный файл NaiveProxy |
+| `/usr/local/bin/caddy-naive` | Бинарный файл caddy-forwardproxy-naive |
 
 > ⚠️ **Важно:** `/etc/mita/` — внутреннее хранилище Mieru в формате protobuf, **не редактируется вручную**.  
 > Панель использует `/var/lib/rixxx-panel/mita-state.json` и применяет его командой `mita apply config <file>`.
@@ -108,8 +112,8 @@ sudo bash update.sh --expose vpn.example.com
 
 ```bash
 # Управление сервисами
-systemctl status naive mita
-systemctl restart naive
+systemctl status caddy-naive mita
+systemctl restart caddy-naive
 systemctl restart mita
 
 # Панель (PM2)
@@ -132,7 +136,6 @@ caddy-naive reload  --config /etc/caddy-naive/Caddyfile --adapter caddyfile
 bash update.sh --status    # Проверка состояния
 bash update.sh --repair    # Исправление сломанной установки
 sudo bash uninstall.sh     # Полное удаление
-sudo bash uninstall.sh --keep-configs  # Удаление без конфигов
 ```
 
 ---
@@ -215,9 +218,6 @@ bash update.sh --help             # Справка
 ```bash
 # Полное удаление (включая конфиги и базу данных)
 sudo bash uninstall.sh
-
-# Удаление без конфигов (сохранить /etc/rixxx-panel/ и DB)
-sudo bash uninstall.sh --keep-configs
 ```
 
 ---
@@ -227,6 +227,8 @@ sudo bash uninstall.sh --keep-configs
 - Панель работает на `127.0.0.1:3000` — не доступна из интернета по умолчанию
 - Пароль администратора хранится в bcrypt-хэше в `config.json` (chmod 600)
 - SQLite БД в `/var/lib/rixxx-panel/` (только root)
+- **Probe resistance**: неопознанные клиенты видят фейковый сайт вместо ошибки прокси
+- **Без certbot**: Caddy управляет TLS автоматически через TLS-ALPN-01 (порт 80 не нужен)
 - Временные конфиг-файлы удаляются через `shred -u`
 - Rate limiting на login (20 запросов / 15 мин)
 - Куки сессии `httpOnly`

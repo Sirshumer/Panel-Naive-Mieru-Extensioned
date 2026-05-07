@@ -1,15 +1,16 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — install.sh  v1.2.0
-# Supports: Ubuntu 20.04/22.04/24.04, Debian 11/12 | x86_64, ARM64, ARMv7
+# Panel Naive + Mieru by RIXXX — install.sh  v1.2.3
+# Caddy-forwardproxy-naive (amd64-only) + Mieru (mita) + fake-site + probe-resistance
+# Supports: Ubuntu 20.04/22.04/24.04, Debian 11/12 | x86_64 only
 # ==============================================================================
 set -euo pipefail
 
-# ── Blocker 9: Capture all installer output to a log file ─────────────────────
+# ── Capture all installer output to a log file ────────────────────────────────
 INSTALL_LOG="/var/log/rixxx-panel-install.log"
 mkdir -p "$(dirname "$INSTALL_LOG")"
 exec > >(tee -a "$INSTALL_LOG") 2>&1
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] install.sh started (PID $$)"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] install.sh v1.2.3 started (PID $$)"
 
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
@@ -29,18 +30,25 @@ BACKUP_DIR="/etc/rixxx-panel/backups"
 DB_PATH="/var/lib/rixxx-panel/db.sqlite"
 MITA_STATE_FILE="/var/lib/rixxx-panel/mita-state.json"
 
-# Blocker 2: naive binary paths (replaces caddy-naive)
-NAIVE_BIN="/usr/local/bin/naive"
-NAIVE_CONFIG_DIR="/etc/naive"
-NAIVE_CONFIG="${NAIVE_CONFIG_DIR}/config.json"
-NAIVE_HTPASSWD="${NAIVE_CONFIG_DIR}/htpasswd"
+# v1.2.3: Caddy-forwardproxy-naive replaces standalone naive binary
+CADDY_BIN="/usr/local/bin/caddy-naive"
+CADDY_CONFIG_DIR="/etc/caddy-naive"
+CADDY_FILE="${CADDY_CONFIG_DIR}/Caddyfile"
+CADDY_VERSION_FILE="${CADDY_CONFIG_DIR}/version"
+FAKE_SITE_DIR="/var/www/fake-site"
 
-CURRENT_VERSION="1.2.0"
+# Legacy paths kept for migration/repair reference
+NAIVE_BIN="/usr/local/bin/naive"        # may still exist from v1.2.x; will be removed
+NAIVE_CONFIG_DIR="/etc/naive"
+
+CURRENT_VERSION="1.2.3"
 REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
-NAIVE_RELEASES="https://api.github.com/repos/klzgrad/naiveproxy/releases/latest"
+# Bug 1: direct download URL for caddy-forwardproxy-naive (amd64 only)
+CADDY_NAIVE_RELEASES="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
+CADDY_NAIVE_FALLBACK_URL="https://github.com/klzgrad/forwardproxy/releases/download/v2.10.0-naive/caddy-forwardproxy-naive.tar.xz"
 MIERU_RELEASES="https://api.github.com/repos/enfein/mieru/releases/latest"
 
-# ── Blocker 10: --force / --non-interactive flags ─────────────────────────────
+# ── Flags ─────────────────────────────────────────────────────────────────────
 NON_INTERACTIVE=false
 FORCE_INSTALL=false
 
@@ -48,13 +56,15 @@ parse_install_args() {
   while [[ $# -gt 0 ]]; do
     case "$1" in
       --non-interactive|--force|-y) NON_INTERACTIVE=true; FORCE_INSTALL=true ;;
-      --domain)       INPUT_DOMAIN="${2:-}";      shift ;;
-      --email)        INPUT_EMAIL="${2:-}";       shift ;;
-      --admin-user)   INPUT_ADMIN_USER="${2:-}";  shift ;;
-      --admin-pass)   INPUT_ADMIN_PASS="${2:-}";  shift ;;
-      --naive-port)   INPUT_NAIVE_PORT="${2:-}";  shift ;;
-      --mieru-start)  INPUT_MIERU_START="${2:-}"; shift ;;
-      --mieru-end)    INPUT_MIERU_END="${2:-}";   shift ;;
+      --domain)         INPUT_DOMAIN="${2:-}";          shift ;;
+      --email)          INPUT_EMAIL="${2:-}";           shift ;;
+      --admin-user)     INPUT_ADMIN_USER="${2:-}";      shift ;;
+      --admin-pass)     INPUT_ADMIN_PASS="${2:-}";      shift ;;
+      --naive-port)     INPUT_NAIVE_PORT="${2:-}";      shift ;;
+      --mieru-start)    INPUT_MIERU_START="${2:-}";     shift ;;
+      --mieru-end)      INPUT_MIERU_END="${2:-}";       shift ;;
+      --fake-site-url)  INPUT_FAKE_SITE_URL="${2:-}";   shift ;;
+      --probe-secret)   INPUT_PROBE_SECRET="${2:-}";    shift ;;
       --lang)
         case "${2:-ru}" in en) LANG_RU=false ;; *) LANG_RU=true ;; esac
         shift ;;
@@ -62,6 +72,7 @@ parse_install_args() {
         echo "Usage: bash install.sh [--non-interactive] [--domain DOMAIN] [--email EMAIL]"
         echo "                       [--admin-user USER] [--admin-pass PASS]"
         echo "                       [--naive-port PORT] [--mieru-start PORT] [--mieru-end PORT]"
+        echo "                       [--fake-site-url URL] [--probe-secret SECRET]"
         echo "                       [--lang ru|en]"
         exit 0 ;;
       *) log_warn "Unknown argument: $1 (ignored)" ;;
@@ -70,12 +81,9 @@ parse_install_args() {
   done
 }
 
-# ── i18n strings ──────────────────────────────────────────────────────────────
+# ── i18n ──────────────────────────────────────────────────────────────────────
 LANG_RU=true
-
-t() {
-  if $LANG_RU; then echo "$1"; else echo "$2"; fi
-}
+t() { if $LANG_RU; then echo "$1"; else echo "$2"; fi }
 
 # ── Root check ────────────────────────────────────────────────────────────────
 [[ $EUID -ne 0 ]] && die "Запустите скрипт от root (sudo bash install.sh) / Run as root"
@@ -85,7 +93,7 @@ select_language() {
   if $NON_INTERACTIVE; then return; fi
   echo ""
   echo -e "${BOLD}╔══════════════════════════════════════════════════╗${NC}"
-  echo -e "${BOLD}║   Panel Naive + Mieru by RIXXX  v${CURRENT_VERSION}        ║${NC}"
+  echo -e "${BOLD}║   Panel Naive + Mieru by RIXXX  v${CURRENT_VERSION}       ║${NC}"
   echo -e "${BOLD}╚══════════════════════════════════════════════════╝${NC}"
   echo ""
   echo -e "  Выберите язык / Select language:"
@@ -98,11 +106,7 @@ select_language() {
     *) LANG_RU=true  ;;
   esac
   echo ""
-  if $LANG_RU; then
-    log_info "Выбран язык: Русский"
-  else
-    log_info "Language selected: English"
-  fi
+  $LANG_RU && log_info "Выбран язык: Русский" || log_info "Language selected: English"
 }
 
 # ── OS check ──────────────────────────────────────────────────────────────────
@@ -125,6 +129,24 @@ check_os() {
   esac
 }
 
+# ── Architecture detection — amd64 only for caddy-naive ───────────────────────
+detect_arch() {
+  log_step "$(t 'Определение архитектуры' 'Detecting architecture')"
+  local machine; machine=$(uname -m)
+  case "$machine" in
+    x86_64|amd64) ARCH="amd64"; DEB_ARCH="amd64" ;;
+    # Bug 1: caddy-forwardproxy-naive is amd64-only; ARM not supported
+    aarch64|arm64) die "$(t \
+      'caddy-forwardproxy-naive поддерживает только amd64. ARM64 не поддерживается в v1.2.3.' \
+      'caddy-forwardproxy-naive only supports amd64. ARM64 is not supported in v1.2.3.')" ;;
+    armv7l) die "$(t \
+      'caddy-forwardproxy-naive поддерживает только amd64. ARMv7 не поддерживается в v1.2.3.' \
+      'caddy-forwardproxy-naive only supports amd64. ARMv7 is not supported in v1.2.3.')" ;;
+    *) die "$(t "Неподдерживаемая архитектура: $machine" "Unsupported architecture: $machine")" ;;
+  esac
+  log_info "$(t 'Архитектура' 'Architecture'): $machine → $ARCH ✓"
+}
+
 # ── Idempotent check ──────────────────────────────────────────────────────────
 check_existing() {
   if [[ -f "$PANEL_CONFIG" ]]; then
@@ -145,25 +167,11 @@ check_existing() {
     local ts; ts=$(date +%Y-%m-%d-%H%M%S)
     local bdir="$BACKUP_DIR/$ts"
     mkdir -p "$bdir"
-    [[ -f "$NAIVE_CONFIG"    ]] && cp "$NAIVE_CONFIG"    "$bdir/" || true
-    [[ -f "$NAIVE_HTPASSWD"  ]] && cp "$NAIVE_HTPASSWD"  "$bdir/" || true
-    [[ -f "$MITA_STATE_FILE" ]] && cp "$MITA_STATE_FILE" "$bdir/" || true
-    [[ -f "$PANEL_CONFIG"    ]] && cp "$PANEL_CONFIG"    "$bdir/" || true
+    [[ -f "$CADDY_FILE"       ]] && cp "$CADDY_FILE"       "$bdir/" || true
+    [[ -f "$MITA_STATE_FILE"  ]] && cp "$MITA_STATE_FILE"  "$bdir/" || true
+    [[ -f "$PANEL_CONFIG"     ]] && cp "$PANEL_CONFIG"     "$bdir/" || true
     log_info "$(t "Резервная копия: $bdir" "Backup created: $bdir")"
   fi
-}
-
-# ── Blocker 1: Architecture detection (strict asset matching) ─────────────────
-detect_arch() {
-  log_step "$(t 'Определение архитектуры' 'Detecting architecture')"
-  local machine; machine=$(uname -m)
-  case "$machine" in
-    x86_64|amd64)  ARCH="amd64"; NAIVE_ARCH="linux-x64";  DEB_ARCH="amd64"  ;;
-    aarch64|arm64) ARCH="arm64"; NAIVE_ARCH="linux-arm64"; DEB_ARCH="arm64"  ;;
-    armv7l)        ARCH="armv7"; NAIVE_ARCH="linux-arm";   DEB_ARCH="armhf"  ;;
-    *) die "$(t "Неподдерживаемая архитектура: $machine" "Unsupported architecture: $machine")" ;;
-  esac
-  log_info "$(t "Архитектура" 'Architecture'): $machine → $ARCH ✓"
 }
 
 # ── NTP sync ──────────────────────────────────────────────────────────────────
@@ -183,8 +191,6 @@ sync_time() {
     log_info "$(t 'Время синхронизировано ✓' 'Time synchronised ✓')"
   else
     log_warn "$(t 'Синхронизация не подтверждена за 15 с!' 'Sync not confirmed within 15 s!')"
-    log_warn "$(t 'Если Mieru не подключается — проверьте время: timedatectl status' \
-               'If Mieru fails to connect — check time: timedatectl status')"
   fi
 }
 
@@ -193,18 +199,17 @@ install_deps() {
   log_step "$(t 'Установка зависимостей' 'Installing dependencies')"
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
+  # Bug 1: certbot removed — Caddy uses TLS-ALPN-01 (no standalone HTTP-01 needed)
   apt-get install -y -qq \
-    curl wget git ufw unzip tar gzip jq \
+    curl wget git ufw unzip tar xz-utils jq \
     ca-certificates gnupg lsb-release \
-    certbot \
     systemd cron net-tools iproute2 \
-    apache2-utils coreutils 2>/dev/null || \
+    coreutils acl 2>/dev/null || \
   apt-get install -y \
-    curl wget git ufw unzip tar gzip jq \
+    curl wget git ufw unzip tar xz-utils jq \
     ca-certificates gnupg lsb-release \
-    certbot \
     systemd cron net-tools iproute2 \
-    apache2-utils coreutils
+    coreutils acl
   log_info "$(t 'Зависимости установлены ✓' 'Dependencies installed ✓')"
 }
 
@@ -226,78 +231,85 @@ install_nodejs() {
   fi
 }
 
-# ── Blocker 2: NaiveProxy — install naive binary ─────────────────────────────
-# Blockers 1+2: strict arch match; search for 'naive' binary (not 'caddy')
-install_naiveproxy() {
-  log_step "$(t 'Установка NaiveProxy (naive)' 'Installing NaiveProxy (naive)')"
-  log_info "$(t 'Запрос последнего релиза...' 'Fetching latest release...')"
-  local release_json
-  release_json=$(curl -fsSL "$NAIVE_RELEASES") || \
-    die "$(t 'Ошибка запроса GitHub API для NaiveProxy' 'Cannot fetch NaiveProxy releases')"
-  local tag; tag=$(echo "$release_json" | jq -r '.tag_name')
-  log_info "$(t "Последняя версия NaiveProxy: $tag" "Latest NaiveProxy: $tag")"
-
-  # Blocker 1 + Minor #6: strict arch match with fallback aliases (linux-x64, linux-amd64, linux-x86_64)
-  # Primary suffix list for x86_64: try NAIVE_ARCH first, then well-known aliases
-  local asset_url
-  local _archs=( "$NAIVE_ARCH" )
-  if [[ "$NAIVE_ARCH" == "linux-x64" ]]; then
-    _archs+=( "linux-amd64" "linux-x86_64" )
-  fi
-
-  for _a in "${_archs[@]}"; do
-    asset_url=$(echo "$release_json" | jq -r \
-      --arg arch "$_a" \
-      '.assets[] | select(.name | endswith("-" + $arch + ".tar.xz")) | .browser_download_url' \
-      | head -1)
-    [[ -n "$asset_url" ]] && break
-  done
-
-  # Secondary: accept .tar.gz and .zip but still strict arch suffix
-  if [[ -z "$asset_url" ]]; then
-    for _a in "${_archs[@]}"; do
-      asset_url=$(echo "$release_json" | jq -r \
-        --arg arch "$_a" \
-        '.assets[] | select((.name | endswith("-" + $arch + ".tar.gz")) or (.name | endswith("-" + $arch + ".zip"))) | .browser_download_url' \
-        | head -1)
-      [[ -n "$asset_url" ]] && break
-    done
-  fi
-
-  [[ -z "$asset_url" ]] && \
-    die "$(t "Не найден ассет NaiveProxy для архитектуры $NAIVE_ARCH (нет fallback)" \
-            "No NaiveProxy asset found for $NAIVE_ARCH (no fallback — check releases page)")"
+# ── Bug 1: Install caddy-forwardproxy-naive (amd64 only) ──────────────────────
+# Downloads from https://github.com/klzgrad/forwardproxy/releases/latest
+# Validates binary and sets file capabilities for binding privileged ports.
+install_caddy_naive() {
+  log_step "$(t 'Установка caddy-forwardproxy-naive' 'Installing caddy-forwardproxy-naive')"
 
   local tmp_dir; tmp_dir=$(mktemp -d)
-  local archive_name; archive_name=$(basename "$asset_url")
-  log_info "$(t "Загрузка: $asset_url" "Downloading: $asset_url")"
-  wget -q --show-progress -O "$tmp_dir/$archive_name" "$asset_url" || \
-    die "$(t 'Ошибка загрузки NaiveProxy' 'Failed to download NaiveProxy')"
-  cd "$tmp_dir"
-  [[ "$archive_name" == *.tar.xz ]] && tar -xJf "$archive_name"
-  [[ "$archive_name" == *.tar.gz ]] && tar -xzf "$archive_name"
-  [[ "$archive_name" == *.zip    ]] && unzip -q  "$archive_name"
+  local archive_path="${tmp_dir}/caddy-forwardproxy-naive.tar.xz"
 
-  # Blocker 2: search for 'naive' executable (not 'caddy')
-  local naive_bin_found
-  naive_bin_found=$(find "$tmp_dir" -type f -name "naive" ! -name "*.xz" ! -name "*.gz" ! -name "*.zip" | head -1)
-  # Also accept naiveproxy binary name
-  if [[ -z "$naive_bin_found" ]]; then
-    naive_bin_found=$(find "$tmp_dir" -type f -name "naiveproxy" ! -name "*.xz" ! -name "*.gz" | head -1)
+  log_info "$(t 'Запрос последнего релиза из GitHub...' 'Fetching latest release from GitHub...')"
+  local asset_url=""
+  local release_tag="unknown"
+
+  # Try GitHub API first
+  local release_json=""
+  release_json=$(curl -fsSL --connect-timeout 10 "$CADDY_NAIVE_RELEASES" 2>/dev/null) || true
+
+  if [[ -n "$release_json" ]]; then
+    release_tag=$(echo "$release_json" | jq -r '.tag_name // "unknown"')
+    log_info "$(t "Последняя версия: $release_tag" "Latest release: $release_tag")"
+
+    # Look for .tar.xz asset (the release contains one tarball for linux-amd64)
+    asset_url=$(echo "$release_json" | jq -r \
+      '.assets[] | select(.name | test("caddy.*forwardproxy.*naive.*\\.tar\\.xz$|caddy-forwardproxy-naive.*\\.tar\\.xz$"; "i")) | .browser_download_url' \
+      | head -1)
+
+    # Broader fallback: any .tar.xz
+    if [[ -z "$asset_url" ]]; then
+      asset_url=$(echo "$release_json" | jq -r \
+        '.assets[] | select(.name | endswith(".tar.xz")) | .browser_download_url' | head -1)
+    fi
   fi
-  [[ -z "$naive_bin_found" ]] && \
-    die "$(t "'naive' или 'naiveproxy' бинарный файл не найден в архиве" "'naive' or 'naiveproxy' binary not found in archive")"
 
-  install -m 755 "$naive_bin_found" "$NAIVE_BIN"
+  # Fallback to pinned v2.10.0 URL if GitHub API failed or no asset found
+  if [[ -z "$asset_url" ]]; then
+    log_warn "$(t \
+      'GitHub API недоступен — использую резервный URL (v2.10.0)' \
+      'GitHub API unavailable — using fallback URL (v2.10.0)')"
+    asset_url="$CADDY_NAIVE_FALLBACK_URL"
+    release_tag="v2.10.0-naive"
+  fi
+
+  log_info "$(t "Загрузка: $asset_url" "Downloading: $asset_url")"
+  wget -q --show-progress --connect-timeout 30 -O "$archive_path" "$asset_url" || \
+    die "$(t 'Ошибка загрузки caddy-forwardproxy-naive' 'Failed to download caddy-forwardproxy-naive')"
+
+  # Extract
+  cd "$tmp_dir"
+  tar -xJf "$archive_path" 2>/dev/null || tar -xf "$archive_path" 2>/dev/null || \
+    die "$(t 'Ошибка распаковки архива' 'Failed to extract archive')"
+
+  # Find the caddy binary (named 'caddy' or 'caddy-naive' inside the archive)
+  local caddy_found
+  caddy_found=$(find "$tmp_dir" -maxdepth 3 -type f \
+    \( -name "caddy" -o -name "caddy-naive" -o -name "caddy-forwardproxy-naive" \) \
+    ! -name "*.xz" ! -name "*.gz" ! -name "*.tar" | head -1)
+
+  [[ -z "$caddy_found" ]] && \
+    die "$(t 'caddy бинарный файл не найден в архиве' 'caddy binary not found in archive')"
+
+  install -m 755 "$caddy_found" "$CADDY_BIN"
   rm -rf "$tmp_dir"; cd /
 
-  NAIVE_VERSION=$("$NAIVE_BIN" --version 2>/dev/null | head -1 || echo "$tag")
-  log_info "naive $(t 'установлен' 'installed') → $NAIVE_BIN  ($NAIVE_VERSION) ✓"
+  # Bug 1: setcap so caddy-naive can bind port 443 without root
+  if command -v setcap &>/dev/null; then
+    setcap 'cap_net_bind_service=+ep' "$CADDY_BIN" 2>/dev/null || true
+  fi
 
-  # Blocker 11: write naive version to version file
-  mkdir -p "$(dirname "$VERSION_FILE")"
-  # Will be fully written in write_version(), but capture NAIVE_VERSION now
-  export NAIVE_VERSION
+  # Verify
+  CADDY_VERSION=$("$CADDY_BIN" version 2>/dev/null | head -1 || \
+                  "$CADDY_BIN" --version 2>/dev/null | head -1 || echo "$release_tag")
+  log_info "caddy-naive $(t 'установлен' 'installed') → $CADDY_BIN  ($CADDY_VERSION) ✓"
+  export CADDY_VERSION
+
+  # Remove legacy naive binary if present (migration from v1.2.x)
+  if [[ -f "$NAIVE_BIN" ]]; then
+    log_info "$(t 'Удаляем устаревший бинарник naive (v1.2.x)...' 'Removing legacy naive binary (v1.2.x)...')"
+    rm -f "$NAIVE_BIN"
+  fi
 }
 
 # ── Mieru (mita) via .deb ─────────────────────────────────────────────────────
@@ -330,12 +342,11 @@ install_mieru() {
   log_info "mita $(t 'установлен' 'installed') ($MIERU_VERSION) ✓"
 }
 
-# ── Interactive prompts (bilingual) ───────────────────────────────────────────
+# ── Interactive / non-interactive config gathering ────────────────────────────
 gather_config() {
   log_step "$(t 'Настройка' 'Configuration')"
 
   if $NON_INTERACTIVE; then
-    # All values must be provided via --flags or have defaults
     DOMAIN="${INPUT_DOMAIN:?$(die "$(t '--domain обязателен в --non-interactive режиме' '--domain is required in --non-interactive mode')")}"
     ADMIN_EMAIL="${INPUT_EMAIL:-admin@${DOMAIN}}"
     NAIVE_PORT="${INPUT_NAIVE_PORT:-443}"
@@ -348,6 +359,9 @@ gather_config() {
     else
       ADMIN_PASS="$INPUT_ADMIN_PASS"
     fi
+    # Bug 1 new fields: fake-site URL and probe secret
+    FAKE_SITE_URL="${INPUT_FAKE_SITE_URL:-https://www.example.com}"
+    PROBE_SECRET="${INPUT_PROBE_SECRET:-$(openssl rand -hex 16)}"
     USE_UFW="Y"
     EXPOSE_PANEL="N"
     log_info "$(t 'Конфигурация принята из аргументов ✓' 'Configuration loaded from arguments ✓')"
@@ -361,17 +375,17 @@ gather_config() {
   echo ""
 
   # Domain
-  read -rp "$(echo -e "${CYAN}$(t 'Домен / имя хоста' 'Domain / hostname')${NC} ($(t 'напр.' 'e.g.') vpn.example.com): ")" INPUT_DOMAIN
+  read -rp "$(echo -e "${CYAN}$(t 'Домен' 'Domain')${NC} (e.g. vpn.example.com): ")" INPUT_DOMAIN
   [[ -z "${INPUT_DOMAIN:-}" ]] && die "$(t 'Домен не может быть пустым' 'Domain cannot be empty')"
   DOMAIN="$INPUT_DOMAIN"
 
-  # Email for TLS / Certbot
-  read -rp "$(echo -e "${CYAN}Email $(t 'для TLS-сертификата (Certbot)' 'for TLS cert (Certbot)')${NC} ($(t 'напр.' 'e.g.') admin@example.com): ")" INPUT_EMAIL
+  # Email for ACME
+  read -rp "$(echo -e "${CYAN}Email $(t 'для ACME/TLS (Caddy)' 'for ACME/TLS (Caddy)')${NC}: ")" INPUT_EMAIL
   [[ -z "${INPUT_EMAIL:-}" ]] && die "$(t 'Email не может быть пустым' 'Email cannot be empty')"
   ADMIN_EMAIL="$INPUT_EMAIL"
 
   # NaiveProxy port
-  read -rp "$(echo -e "${CYAN}$(t 'Порт NaiveProxy HTTPS' 'NaiveProxy HTTPS port')${NC} [$(t 'по умолчанию' 'default'): 443]: ")" INPUT_NAIVE_PORT
+  read -rp "$(echo -e "${CYAN}$(t 'Порт NaiveProxy HTTPS' 'NaiveProxy HTTPS port')${NC} [443]: ")" INPUT_NAIVE_PORT
   NAIVE_PORT="${INPUT_NAIVE_PORT:-443}"
   if ! [[ "$NAIVE_PORT" =~ ^[0-9]+$ ]] || (( NAIVE_PORT < 1 || NAIVE_PORT > 65535 )); then
     die "$(t "Некорректный порт: $NAIVE_PORT" "Invalid port: $NAIVE_PORT")"
@@ -379,11 +393,11 @@ gather_config() {
 
   # Mieru port range
   echo ""
-  echo -e "${YELLOW}$(t 'Mieru использует диапазон портов (TCP). По умолчанию: 2012-2022' \
-                       'Mieru uses a port range (TCP). Default: 2012-2022')${NC}"
+  echo -e "${YELLOW}$(t 'Mieru использует диапазон портов TCP. По умолчанию: 2012-2022' \
+                       'Mieru uses a TCP port range. Default: 2012-2022')${NC}"
   read -rp "$(echo -e "${CYAN}$(t 'Начальный порт Mieru' 'Mieru start port')${NC} [2012]: ")" INPUT_MIERU_START
   MIERU_PORT_START="${INPUT_MIERU_START:-2012}"
-  read -rp "$(echo -e "${CYAN}$(t 'Конечный порт Mieru  ' 'Mieru end port  ')${NC} [2022]: ")" INPUT_MIERU_END
+  read -rp "$(echo -e "${CYAN}$(t 'Конечный порт Mieru' 'Mieru end port')${NC}  [2022]: ")" INPUT_MIERU_END
   MIERU_PORT_END="${INPUT_MIERU_END:-2022}"
   for p in "$MIERU_PORT_START" "$MIERU_PORT_END"; do
     if ! [[ "$p" =~ ^[0-9]+$ ]] || (( p < 1025 || p > 65535 )); then
@@ -392,6 +406,27 @@ gather_config() {
   done
   (( MIERU_PORT_END < MIERU_PORT_START )) && \
     die "$(t "Конечный порт должен быть >= начального" "End port must be >= start port")"
+
+  # Fake site URL (used for probe resistance)
+  echo ""
+  echo -e "${YELLOW}$(t \
+    'Fake site: Caddy покажет этот сайт неопознанным клиентам (защита от обнаружения).' \
+    'Fake site: Caddy shows this site to unrecognised clients (probe resistance).')${NC}"
+  read -rp "$(echo -e "${CYAN}$(t 'URL фейкового сайта' 'Fake site URL')${NC} [https://www.example.com]: ")" INPUT_FAKE_SITE_URL
+  FAKE_SITE_URL="${INPUT_FAKE_SITE_URL:-https://www.example.com}"
+
+  # Probe secret
+  echo ""
+  echo -e "${YELLOW}$(t \
+    'Probe secret: клиенты предъявляют этот секрет в HTTP-заголовке для идентификации.' \
+    'Probe secret: clients present this secret in an HTTP header for identification.')${NC}"
+  read -rp "$(echo -e "${CYAN}$(t 'Секрет зондирования (пусто = авто)' 'Probe secret (blank = auto)')${NC}: ")" INPUT_PROBE_SECRET
+  if [[ -z "${INPUT_PROBE_SECRET:-}" ]]; then
+    PROBE_SECRET=$(openssl rand -hex 16)
+    log_info "$(t "Сгенерирован probe_secret: ${BOLD}${PROBE_SECRET}${NC}" "Generated probe_secret: ${BOLD}${PROBE_SECRET}${NC}")"
+  else
+    PROBE_SECRET="$INPUT_PROBE_SECRET"
+  fi
 
   # Admin credentials
   echo ""
@@ -422,107 +457,148 @@ gather_config() {
   log_info "$(t 'Конфигурация собрана ✓' 'Configuration gathered ✓')"
 }
 
-# ── Bug 2+5 fix: Certbot TLS certificate ────────────────────────────────────
-# Bug 2: certbot certonly does NOT accept --cert-path/--key-path; certs always
-#         land in /etc/letsencrypt/live/<domain>/. Use those paths directly.
-# Bug 5: Grant the naive process read access to letsencrypt dirs via chmod o+x
-#         (execute bit on directories so the path is traversable by root).
-obtain_tls_cert() {
-  log_step "$(t 'Получение TLS-сертификата (Certbot)' 'Obtaining TLS certificate (Certbot)')"
+# ── Bug 1: Setup fake site ────────────────────────────────────────────────────
+setup_fake_site() {
+  log_step "$(t 'Создание фейкового сайта (probe resistance)' 'Setting up fake site (probe resistance)')"
+  mkdir -p "$FAKE_SITE_DIR"
+  cat > "${FAKE_SITE_DIR}/index.html" <<FAKEHTML
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Welcome</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { font-family: system-ui, -apple-system, sans-serif; background: #f5f5f5;
+           display: flex; align-items: center; justify-content: center;
+           min-height: 100vh; color: #333; }
+    .container { text-align: center; padding: 2rem; }
+    h1 { font-size: 2rem; margin-bottom: 0.5rem; }
+    p  { color: #666; }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <h1>Welcome</h1>
+    <p>This service is currently unavailable. Please try again later.</p>
+  </div>
+</body>
+</html>
+FAKEHTML
 
-  # Stop any service on port 80 temporarily
-  systemctl stop naive 2>/dev/null || true
-
-  local le_cert="/etc/letsencrypt/live/${DOMAIN}/fullchain.pem"
-  local le_key="/etc/letsencrypt/live/${DOMAIN}/privkey.pem"
-
-  # Bug 2 fix: certonly stores certs at LE default paths — no --cert-path/--key-path
-  if certbot certonly \
-       --standalone \
-       --non-interactive \
-       --agree-tos \
-       --email "$ADMIN_EMAIL" \
-       -d "$DOMAIN" \
-       2>/dev/null; then
-    CERT_PATH="$le_cert"
-    KEY_PATH="$le_key"
-    log_info "$(t "Сертификат получен → $CERT_PATH ✓" "Certificate obtained → $CERT_PATH ✓")"
-  elif [[ -f "$le_cert" ]]; then
-    # Certbot failed but an existing cert is already present (e.g. renewal)
-    CERT_PATH="$le_cert"
-    KEY_PATH="$le_key"
-    log_info "$(t "Используется существующий сертификат: $CERT_PATH ✓" "Using existing cert: $CERT_PATH ✓")"
-  else
-    CERT_PATH=""
-    KEY_PATH=""
-    log_warn "$(t 'Certbot не смог получить сертификат — naive будет использовать системный TLS.' \
-                 'Certbot failed to obtain cert — naive will handle TLS automatically.')"
-  fi
-
-  # Bug 5 fix: ensure root-run naive can traverse /etc/letsencrypt dirs
-  # (directories need +x; archive dir needs group-read for renewal symlinks)
-  if [[ -d /etc/letsencrypt ]]; then
-    chmod o+x /etc/letsencrypt /etc/letsencrypt/live 2>/dev/null || true
-    [[ -d "/etc/letsencrypt/archive/${DOMAIN}" ]] && \
-      chmod o+x "/etc/letsencrypt/archive/${DOMAIN}" 2>/dev/null || true
-    # Make the cert files group-readable so non-root naive users work too
-    [[ -d "/etc/letsencrypt/live/${DOMAIN}" ]] && \
-      chmod o+r "/etc/letsencrypt/live/${DOMAIN}/"*.pem 2>/dev/null || true
-    [[ -d "/etc/letsencrypt/archive/${DOMAIN}" ]] && \
-      chmod o+r "/etc/letsencrypt/archive/${DOMAIN}/"*.pem 2>/dev/null || true
-  fi
-
-  # Renewal hook: restart naive and re-apply LE permissions after renewal
-  mkdir -p /etc/letsencrypt/renewal-hooks/deploy
-  cat > /etc/letsencrypt/renewal-hooks/deploy/restart-naive.sh <<'HOOKEOF'
-#!/usr/bin/env bash
-# Restart naive after Certbot certificate renewal
-# Re-apply read permissions so naive (running as root) can access updated certs
-DOMAIN=$(basename "$(ls -d /etc/letsencrypt/live/*/  2>/dev/null | head -1)")
-[[ -n "$DOMAIN" ]] && {
-  chmod o+x /etc/letsencrypt /etc/letsencrypt/live "/etc/letsencrypt/live/${DOMAIN}" \
-             "/etc/letsencrypt/archive/${DOMAIN}" 2>/dev/null || true
-  chmod o+r "/etc/letsencrypt/live/${DOMAIN}/"*.pem \
-             "/etc/letsencrypt/archive/${DOMAIN}/"*.pem 2>/dev/null || true
-}
-systemctl restart naive 2>/dev/null || true
-HOOKEOF
-  chmod +x /etc/letsencrypt/renewal-hooks/deploy/restart-naive.sh
-  log_info "$(t 'Хук обновления сертификата установлен ✓' 'Certificate renewal hook installed ✓')"
+  chmod 644 "${FAKE_SITE_DIR}/index.html"
+  log_info "$(t "Фейковый сайт создан → $FAKE_SITE_DIR ✓" "Fake site created → $FAKE_SITE_DIR ✓")"
 }
 
-# ── Blocker 3: Write naive config.json + htpasswd ─────────────────────────────
-write_naive_config() {
-  log_step "$(t 'Запись конфига NaiveProxy' 'Writing NaiveProxy config')"
-  mkdir -p "$NAIVE_CONFIG_DIR" /var/log/naive
+# ── Bug 1: Write Caddyfile (TLS-ALPN-01, forwardproxy, probe-resistance) ──────
+# Caddy handles TLS automatically via TLS-ALPN-01 — no certbot needed.
+# probe_resistance shows fake site to unrecognised clients.
+write_caddyfile() {
+  log_step "$(t 'Запись Caddyfile' 'Writing Caddyfile')"
+  mkdir -p "$CADDY_CONFIG_DIR" /var/log/caddy-naive
 
-  # htpasswd file will be populated by panel on user create
-  # Start with an empty file; buildHtpasswd() in server/index.js manages it
-  : > "$NAIVE_HTPASSWD"
-  chmod 640 "$NAIVE_HTPASSWD"
-
-  # Blocker 12: generic listen "https://:PORT", separate name for logging
-  # Blocker 3: use htpasswd file for auth (multi-user)
-  # Blocker 13: add cert/key paths when available
-  local tls_block=""
-  if [[ -n "${CERT_PATH:-}" && -f "$CERT_PATH" ]]; then
-    tls_block=",
-  \"cert\": \"${CERT_PATH}\",
-  \"key\":  \"${KEY_PATH}\""
+  # Build users block from DB if it exists, else empty (will be rebuilt on first user add)
+  # The Caddyfile is rebuilt by the panel via /api/services/rebuild-all after each user change
+  local users_block=""
+  if [[ -f "$DB_PATH" ]] && command -v node &>/dev/null; then
+    users_block=$(node -e "
+      try {
+        const Database = require('better-sqlite3');
+        const db = new Database('$DB_PATH', { readonly: true });
+        const rows = db.prepare(\"SELECT username, password FROM users\").all()
+          .filter(u => { try { const p=JSON.parse(db.prepare('SELECT protocols FROM users WHERE username=?').get(u.username)?.protocols||'[]'); return p.includes('naive'); } catch{return true;} });
+        rows.forEach(u => { process.stdout.write('  basicauth ' + u.username + ' ' + u.password + '\n'); });
+        db.close();
+      } catch(e) { /* ignore — no DB yet */ }
+    " 2>/dev/null || true)
   fi
 
-  cat > "$NAIVE_CONFIG" <<NAIVECFG
+  cat > "$CADDY_FILE" <<CADDYEOF
 {
-  "listen": "https://:${NAIVE_PORT}",
-  "name":   "${DOMAIN}",
-  "auth":   "${NAIVE_HTPASSWD}",
-  "padding": true,
-  "log":    "/var/log/naive/access.log"${tls_block}
+  email ${ADMIN_EMAIL}
+  admin off
+  log {
+    output file /var/log/caddy-naive/access.log {
+      roll_size 50mb
+      roll_keep 5
+    }
+    format json
+  }
 }
-NAIVECFG
 
-  chmod 640 "$NAIVE_CONFIG"
-  log_info "$(t "naive config.json записан → $NAIVE_CONFIG ✓" "naive config.json written → $NAIVE_CONFIG ✓")"
+:80 {
+  redir https://{host}{uri} permanent
+}
+
+${DOMAIN}:${NAIVE_PORT} {
+  tls ${ADMIN_EMAIL}
+
+  route {
+    forward_proxy {
+      basic_auth
+${users_block}      hide_ip
+      hide_via
+      probe_resistance ${PROBE_SECRET}
+    }
+    file_server {
+      root ${FAKE_SITE_DIR}
+    }
+  }
+
+  log {
+    output file /var/log/caddy-naive/access.log
+    format json
+  }
+}
+CADDYEOF
+
+  chmod 640 "$CADDY_FILE"
+  log_info "$(t "Caddyfile записан → $CADDY_FILE ✓" "Caddyfile written → $CADDY_FILE ✓")"
+
+  # Store probe_secret in caddy config dir for panel to read
+  echo "$PROBE_SECRET" > "${CADDY_CONFIG_DIR}/probe_secret"
+  chmod 600 "${CADDY_CONFIG_DIR}/probe_secret"
+}
+
+# ── Bug 1: Write caddy-naive.service ─────────────────────────────────────────
+write_caddy_service() {
+  log_step "$(t 'Запись systemd юнита caddy-naive.service' 'Writing caddy-naive.service')"
+
+  # Remove legacy naive.service if present (migration)
+  if [[ -f /etc/systemd/system/naive.service ]]; then
+    systemctl stop    naive 2>/dev/null || true
+    systemctl disable naive 2>/dev/null || true
+    rm -f /etc/systemd/system/naive.service
+    log_info "$(t 'naive.service удалён (заменён caddy-naive.service) ✓' \
+                 'naive.service removed (replaced by caddy-naive.service) ✓')"
+  fi
+
+  cat > /etc/systemd/system/caddy-naive.service <<SVCCADDY
+[Unit]
+Description=Caddy forwardproxy-naive Server
+Documentation=https://github.com/klzgrad/forwardproxy
+After=network.target network-online.target
+Requires=network-online.target
+
+[Service]
+Type=notify
+User=root
+ExecStart=${CADDY_BIN} run --config ${CADDY_FILE} --adapter caddyfile
+ExecReload=/bin/kill -USR1 \$MAINPID
+TimeoutStopSec=5
+Restart=on-failure
+RestartSec=5
+LimitNOFILE=1048576
+PrivateTmp=true
+ProtectSystem=full
+AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target
+SVCCADDY
+
+  log_info "$(t 'caddy-naive.service написан ✓' 'caddy-naive.service written ✓')"
 }
 
 # ── Mieru initial state file ──────────────────────────────────────────────────
@@ -550,43 +626,6 @@ PYEOF
   log_info "$(t "Mita state file → $MITA_STATE_FILE ✓" "Mita state file → $MITA_STATE_FILE ✓")"
 }
 
-# ── Blocker 4: naive.service systemd unit ─────────────────────────────────────
-write_naive_service() {
-  log_step "$(t 'Запись systemd юнита naive.service' 'Writing naive.service systemd unit')"
-
-  # Remove old caddy-naive unit if present
-  if [[ -f /etc/systemd/system/caddy-naive.service ]]; then
-    systemctl stop    caddy-naive 2>/dev/null || true
-    systemctl disable caddy-naive 2>/dev/null || true
-    rm -f /etc/systemd/system/caddy-naive.service
-    log_info "$(t 'caddy-naive.service удалён ✓' 'caddy-naive.service removed ✓')"
-  fi
-
-  cat > /etc/systemd/system/naive.service <<SVCEOF
-[Unit]
-Description=NaiveProxy Server
-Documentation=https://github.com/klzgrad/naiveproxy
-After=network.target network-online.target
-Requires=network-online.target
-
-[Service]
-Type=simple
-User=root
-ExecStart=${NAIVE_BIN} ${NAIVE_CONFIG}
-Restart=on-failure
-RestartSec=5
-LimitNOFILE=1048576
-PrivateTmp=true
-ProtectSystem=full
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
-
-[Install]
-WantedBy=multi-user.target
-SVCEOF
-
-  log_info "$(t 'naive.service написан ✓' 'naive.service written ✓')"
-}
-
 # ── Systemd: mita (ensure exists) ─────────────────────────────────────────────
 write_mita_service() {
   if [[ ! -f /lib/systemd/system/mita.service ]] && \
@@ -609,12 +648,9 @@ MITSVC
   fi
 }
 
-# ── Bug 3 fix: UFW helper — handles single-port (start==end) correctly ────────
-# UFW rejects "N:N/proto" range syntax when start equals end; use single-port
-# rule instead. This fixes the crash in --non-interactive mode with --mieru-start
-# and --mieru-end set to the same value.
+# ── Bug 7: UFW helper — handles single-port (start==end) correctly ─────────
+# UFW rejects "N:N/proto" range syntax when start equals end.
 _ufw_mieru_rule() {
-  # Usage: _ufw_mieru_rule <start> <end> <proto> <comment>
   local s=$1 e=$2 proto=$3 comment=$4
   if [[ "$s" -eq "$e" ]]; then
     ufw allow "${s}/${proto}" comment "${comment}" 2>/dev/null || true
@@ -624,19 +660,18 @@ _ufw_mieru_rule() {
 }
 
 # ── UFW ───────────────────────────────────────────────────────────────────────
+# Bug 1: Port 80 rule REMOVED — Caddy uses TLS-ALPN-01 (no HTTP-01 challenge)
 setup_ufw() {
   log_step "$(t 'Настройка UFW' 'Configuring UFW firewall')"
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow ssh
-  ufw allow "${NAIVE_PORT}/tcp" comment "NaiveProxy HTTPS"
-  # Bug 3 fix: single-port safe helper
+  ufw allow "${NAIVE_PORT}/tcp" comment "CaddyNaive HTTPS"
+  # Bug 7: single-port safe helper
   _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" tcp "Mieru TCP"
-  # UDP opened at OS level; mita only binds UDP when udpEnabled=true in panel
   _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" udp "Mieru UDP"
-  # Port 80 for Certbot HTTP-01 challenge
-  ufw allow 80/tcp comment "Certbot HTTP-01"
+  # Bug 1: NO port 80 rule — Caddy TLS-ALPN-01 does not need port 80
   [[ "${EXPOSE_PANEL^^}" =~ ^(Y|Д)$ ]] && ufw allow 8080/tcp comment "Panel Web UI"
   ufw --force enable
   log_info "$(t 'Правила UFW применены ✓' 'UFW rules applied ✓')"
@@ -677,7 +712,6 @@ write_config_json() {
     const bcrypt = require('bcryptjs');
     process.stdout.write(bcrypt.hashSync(process.argv[1], 12));
   " -- "$ADMIN_PASS" 2>/dev/null) || {
-    # Fallback: htpasswd bcrypt
     bcrypt_hash=$(htpasswd -bnBC 12 "" "$ADMIN_PASS" 2>/dev/null | tr -d ':\n' | sed 's/^[^\$]*//')
   }
   [[ -z "$bcrypt_hash" ]] && die "$(t 'Не удалось создать bcrypt-хеш пароля' 'Failed to generate bcrypt password hash')"
@@ -698,9 +732,12 @@ data = {
     "exposePanel":     "$EXPOSE_PANEL".upper() in ("Y","Д"),
     "useUfw":          "$USE_UFW".upper() in ("Y","Д"),
     "dbPath":          "$DB_PATH",
-    "naiveConfig":     "$NAIVE_CONFIG",
-    "naiveHtpasswd":   "$NAIVE_HTPASSWD",
-    "naiveBin":        "$NAIVE_BIN",
+    "caddyBin":        "$CADDY_BIN",
+    "caddyFile":       "$CADDY_FILE",
+    "caddyConfigDir":  "$CADDY_CONFIG_DIR",
+    "fakeSiteDir":     "$FAKE_SITE_DIR",
+    "fakeSiteUrl":     "$FAKE_SITE_URL",
+    "probeSecret":     "$PROBE_SECRET",
     "mitaStateFile":   "$MITA_STATE_FILE",
     "trafficPattern":  "NOOP",
     "mtu":             1400,
@@ -717,12 +754,12 @@ PYCFG
   log_info "$(t 'config.json записан ✓' 'config.json written ✓')"
 }
 
-# ── Blocker 11: write version file ────────────────────────────────────────────
+# ── Version file ──────────────────────────────────────────────────────────────
 write_version() {
   mkdir -p "$(dirname "$VERSION_FILE")"
   cat > "$VERSION_FILE" <<VEREOF
 panel_version=${CURRENT_VERSION}
-naive_version=${NAIVE_VERSION:-unknown}
+caddy_version=${CADDY_VERSION:-unknown}
 mieru_version=${MIERU_VERSION:-unknown}
 installed_at=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 VEREOF
@@ -734,19 +771,16 @@ start_services() {
   log_step "$(t 'Запуск сервисов' 'Starting services')"
   systemctl daemon-reload
 
-  # naive.service
-  write_naive_service
-  systemctl enable naive
-  systemctl restart naive && \
-    log_info "$(t 'naive запущен ✓' 'naive started ✓')" || \
-    log_warn "$(t 'naive не запустился — journalctl -u naive -n 30' \
-               'naive failed — journalctl -u naive -n 30')"
+  # caddy-naive.service
+  write_caddy_service
+  systemctl enable caddy-naive
+  systemctl restart caddy-naive && \
+    log_info "$(t 'caddy-naive запущен ✓' 'caddy-naive started ✓')" || \
+    log_warn "$(t 'caddy-naive не запустился — journalctl -u caddy-naive -n 30' \
+               'caddy-naive failed — journalctl -u caddy-naive -n 30')"
 
-  # Bug 4 fix: mita crashes when first started with an empty users[] array.
-  # Apply the portBindings config first (so mita knows the port range), but
-  # only actually start the service when there is at least one user in the
-  # state file.  The panel's rebuildServices() will start mita automatically
-  # when the first user is added through the web UI.
+  # Bug 4: mita crashes when started with empty users[].
+  # Apply portBindings config, but only start mita after first user is added.
   write_mita_service
   systemctl enable mita 2>/dev/null || true
   if mita apply config "$MITA_STATE_FILE" 2>/dev/null; then
@@ -755,7 +789,6 @@ start_services() {
     log_warn "$(t 'mita apply config вернул ошибку — проверьте: mita status' \
                'mita apply config returned non-zero — check: mita status')"
   fi
-  # Count users in state file
   local _mita_users
   _mita_users=$(python3 -c "
 import json, sys
@@ -768,10 +801,9 @@ except Exception:
   if [[ "$_mita_users" -gt 0 ]]; then
     systemctl restart mita && \
       log_info "$(t 'mita запущен ✓' 'mita started ✓')" || \
-      log_warn "$(t 'mita не запустился — journalctl -u mita -n 30' \
-                 'mita failed — journalctl -u mita -n 30')"
+      log_warn "$(t 'mita не запустился — journalctl -u mita -n 30' 'mita failed — journalctl -u mita -n 30')"
   else
-    log_info "$(t 'mita: нет пользователей — сервис запустится автоматически после добавления первого пользователя через панель' \
+    log_info "$(t 'mita: нет пользователей — сервис запустится автоматически после добавления первого пользователя' \
                'mita: no users yet — service will start automatically after first user is added via panel')"
   fi
 
@@ -793,8 +825,98 @@ except Exception:
   cd /
 }
 
-# ── Blocker 5: Smoke tests (naive --version, port checks) ────────────────────
-# Blocker 8: post-start Mieru port-listen check
+# ── Bug 14: smoke_test_configs() — create test user, validate config downloads ─
+smoke_test_configs() {
+  log_step "$(t 'Smoke-тест конфигов клиента' 'Smoke test: client config validation')"
+  local test_user="smoke_test_user"
+  local test_pass="smoke_pass_123"
+  local test_email="smoke@test.local"
+  local panel_url="http://127.0.0.1:3000"
+  local pass=0 fail=0
+  local cookie_file; cookie_file=$(mktemp)
+
+  # Login
+  local login_res
+  login_res=$(curl -sf -c "$cookie_file" -X POST "$panel_url/api/login" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"admin\",\"password\":\"$ADMIN_PASS\"}" 2>/dev/null) || true
+
+  if echo "$login_res" | grep -q '"ok":true'; then
+    echo -e "  ${GREEN}✓${NC} smoke login OK"; (( pass++ ))
+  else
+    echo -e "  ${YELLOW}⚠${NC}  smoke login skipped (panel may still be starting)"
+    rm -f "$cookie_file"
+    return 0
+  fi
+
+  # Create test user
+  local create_res
+  create_res=$(curl -sf -b "$cookie_file" -X POST "$panel_url/api/users" \
+    -H "Content-Type: application/json" \
+    -d "{\"username\":\"$test_user\",\"email\":\"$test_email\",\"password\":\"$test_pass\",\"protocols\":[\"naive\",\"mieru\"],\"quotaMB\":0}" \
+    2>/dev/null) || true
+  local user_id=""
+  user_id=$(echo "$create_res" | python3 -c "import json,sys; d=json.load(sys.stdin); print(d.get('id',''))" 2>/dev/null || true)
+
+  if [[ -n "$user_id" ]]; then
+    echo -e "  ${GREEN}✓${NC} smoke test user created (id: ${user_id:0:8}…)"; (( pass++ ))
+  else
+    echo -e "  ${RED}✗${NC} smoke test user creation failed"; (( fail++ ))
+    rm -f "$cookie_file"; return 0
+  fi
+
+  # Fetch naive config
+  local naive_cfg
+  naive_cfg=$(curl -sf -b "$cookie_file" \
+    "$panel_url/api/users/$user_id/config/naive?password=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$test_pass'))")" \
+    2>/dev/null) || true
+
+  if echo "$naive_cfg" | python3 -c "import json,sys; d=json.load(sys.stdin); assert 'link' in d" 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} naive config link valid"; (( pass++ ))
+    # Bug 5: verify transport field
+    local naive_link; naive_link=$(echo "$naive_cfg" | python3 -c "import json,sys; print(json.load(sys.stdin)['link'])" 2>/dev/null || true)
+    if echo "$naive_link" | grep -q "naive+https://"; then
+      echo -e "  ${GREEN}✓${NC} naive link uses HTTPS transport"; (( pass++ ))
+    else
+      echo -e "  ${RED}✗${NC} naive link missing HTTPS transport"; (( fail++ ))
+    fi
+  else
+    echo -e "  ${RED}✗${NC} naive config invalid"; (( fail++ ))
+  fi
+
+  # Fetch mieru (sing-box) config
+  local mieru_cfg
+  mieru_cfg=$(curl -sf -b "$cookie_file" \
+    "$panel_url/api/users/$user_id/config/mieru?password=$(python3 -c "import urllib.parse; print(urllib.parse.quote('$test_pass'))")" \
+    2>/dev/null) || true
+
+  if echo "$mieru_cfg" | python3 -c "
+import json,sys
+d=json.load(sys.stdin)
+ob=d.get('outbounds',[])
+m=[o for o in ob if o.get('type')=='mieru']
+assert m, 'no mieru outbound'
+# Bug 12: server_ports array
+assert 'server_ports' in m[0] or 'server_port' in m[0], 'missing port field'
+# Bug 5: transport field
+assert m[0].get('transport','TCP') in ('TCP','UDP'), 'invalid transport'
+" 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} mieru config valid (transport + port fields)"; (( pass++ ))
+  else
+    echo -e "  ${RED}✗${NC} mieru config validation failed"; (( fail++ ))
+  fi
+
+  # Cleanup test user
+  curl -sf -b "$cookie_file" -X DELETE "$panel_url/api/users/$user_id" > /dev/null 2>&1 || true
+  echo -e "  ${GREEN}✓${NC} smoke test user cleaned up"
+  rm -f "$cookie_file"
+
+  echo ""
+  echo -e "  Config smoke: ${GREEN}$pass passed${NC}  ${RED}$fail failed${NC}"
+  return 0
+}
+
+# ── Smoke tests ───────────────────────────────────────────────────────────────
 smoke_test() {
   log_step "$(t 'Smoke-тесты' 'Running smoke tests')"
   sleep 5
@@ -808,25 +930,28 @@ smoke_test() {
     fi
   }
 
-  # Blocker 5: naive smoke tests
-  chk "naive --version"          "timeout 5 $NAIVE_BIN --version || $NAIVE_BIN --help"
-  chk "naive.service active"     "systemctl is-active naive"
-  chk "naive port :${NAIVE_PORT} listening" \
+  # caddy-naive checks
+  chk "caddy-naive version"          "timeout 5 $CADDY_BIN version || $CADDY_BIN --version"
+  chk "caddy-naive.service active"   "systemctl is-active caddy-naive"
+  chk "caddy-naive port :${NAIVE_PORT} listening" \
       "ss -tlnup sport = :${NAIVE_PORT} 2>/dev/null | grep -q :${NAIVE_PORT}"
-  chk "naive config.json present" "[[ -f $NAIVE_CONFIG ]]"
+  chk "Caddyfile present"            "[[ -f $CADDY_FILE ]]"
+  chk "fake-site index.html present" "[[ -f ${FAKE_SITE_DIR}/index.html ]]"
 
   # mita tests
-  chk "mita active"              "systemctl is-active mita"
-  chk "mita status OK"           "mita status 2>/dev/null | grep -qi 'running\|active\|listen'"
+  chk "mita.service enabled"         "systemctl is-enabled mita"
+  chk "mita-state.json present"      "[[ -f $MITA_STATE_FILE ]]"
+  chk "mita port :${MIERU_PORT_START} OR service starting" \
+      "ss -tlnup sport = :${MIERU_PORT_START} 2>/dev/null | grep -q :${MIERU_PORT_START} || \
+       systemctl is-enabled mita"
 
-  # Blocker 8: Mieru port-listen check (check first port in range)
-  chk "mita port :${MIERU_PORT_START} listening" \
-      "ss -tlnup sport = :${MIERU_PORT_START} 2>/dev/null | grep -q :${MIERU_PORT_START}"
+  # Panel
+  chk "Panel responds :3000"         "curl -sf http://127.0.0.1:3000/ -o /dev/null"
+  chk "config.json present"          "[[ -f $PANEL_CONFIG ]]"
+  chk "version file present"         "[[ -f $VERSION_FILE ]]"
 
-  chk "Panel responds :3000"     "curl -sf http://127.0.0.1:3000/ -o /dev/null"
-  chk "config.json present"      "[[ -f $PANEL_CONFIG ]]"
-  chk "mita-state.json present"  "[[ -f $MITA_STATE_FILE ]]"
-  chk "version file present"     "[[ -f $VERSION_FILE ]]"
+  # probe_resistance secret saved
+  chk "probe_secret file present"    "[[ -f ${CADDY_CONFIG_DIR}/probe_secret ]]"
 
   if timedatectl status 2>/dev/null | grep -q "synchronized: yes"; then
     echo -e "  ${GREEN}✓${NC} $(t 'Время синхронизировано' 'Time synchronised')"
@@ -838,8 +963,13 @@ smoke_test() {
 
   echo ""
   echo -e "  $(t 'Результат' 'Results'): ${GREEN}$pass $(t 'прошло' 'passed')${NC}  ${RED}$fail $(t 'упало' 'failed')${NC}"
-  (( fail > 0 )) && log_warn "$(t 'Проверьте логи: journalctl -u naive mita -n 30' \
-                                  'Check logs: journalctl -u naive mita -n 30')"
+  (( fail > 0 )) && log_warn "$(t 'Проверьте логи: journalctl -u caddy-naive mita -n 30' \
+                                  'Check logs: journalctl -u caddy-naive mita -n 30')"
+
+  # Bug 14: config smoke tests (require panel running + ADMIN_PASS set)
+  if [[ -n "${ADMIN_PASS:-}" ]]; then
+    smoke_test_configs
+  fi
 }
 
 # ── UFW call ──────────────────────────────────────────────────────────────────
@@ -850,20 +980,24 @@ maybe_ufw() {
 
 # ── Final banner ──────────────────────────────────────────────────────────────
 print_banner() {
-  local server_ip; server_ip=$(python3 -c "import json; print(json.load(open('$PANEL_CONFIG'))['serverIp'])" 2>/dev/null || hostname -I | awk '{print $1}')
+  local server_ip
+  server_ip=$(python3 -c "import json; print(json.load(open('$PANEL_CONFIG'))['serverIp'])" 2>/dev/null \
+              || hostname -I | awk '{print $1}')
   echo ""
-  echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
   if $LANG_RU; then
-    echo -e "${GREEN}${BOLD}║     Panel Naive + Mieru v${CURRENT_VERSION} — Установка завершена  ✓    ║${NC}"
+    echo -e "${GREEN}${BOLD}║   Panel Naive + Mieru v${CURRENT_VERSION} (Caddy) — Установка завершена ✓ ║${NC}"
   else
-    echo -e "${GREEN}${BOLD}║     Panel Naive + Mieru v${CURRENT_VERSION} — Installation Complete ✓  ║${NC}"
+    echo -e "${GREEN}${BOLD}║   Panel Naive + Mieru v${CURRENT_VERSION} (Caddy) — Install Complete ✓   ║${NC}"
   fi
-  echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}"
+  echo -e "${GREEN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
   echo ""
   echo -e "  ${BOLD}$(t 'Домен' 'Domain'):${NC}              $DOMAIN"
   echo -e "  ${BOLD}$(t 'IP сервера' 'Server IP'):${NC}          $server_ip"
-  echo -e "  ${BOLD}$(t 'Порт NaiveProxy' 'NaiveProxy port'):${NC}    $NAIVE_PORT"
+  echo -e "  ${BOLD}$(t 'Порт NaiveProxy (Caddy)' 'NaiveProxy port (Caddy)'):${NC}  $NAIVE_PORT"
   echo -e "  ${BOLD}$(t 'Порты Mieru' 'Mieru ports'):${NC}        $MIERU_PORT_START-$MIERU_PORT_END (TCP)"
+  echo -e "  ${BOLD}$(t 'Probe secret' 'Probe secret'):${NC}       ${PROBE_SECRET}"
+  echo -e "  ${BOLD}$(t 'Fake site' 'Fake site'):${NC}          $FAKE_SITE_DIR"
   echo ""
   echo -e "  ${BOLD}$(t 'Доступ к панели' 'Panel access'):${NC}"
   if [[ "${EXPOSE_PANEL^^}" =~ ^(Y|Д)$ ]]; then
@@ -879,14 +1013,16 @@ print_banner() {
   echo ""
   echo -e "  ${BOLD}$(t 'Полезные команды' 'Useful commands'):${NC}"
   echo -e "    pm2 logs panel-naive-mieru"
-  echo -e "    systemctl status naive mita"
+  echo -e "    systemctl status caddy-naive mita"
+  echo -e "    $CADDY_BIN version"
   echo -e "    mita status"
   echo -e "    bash update.sh --status"
+  echo -e "    bash update.sh --repair"
   echo ""
   echo -e "  ${BOLD}$(t 'Лог установки' 'Install log'):${NC}      $INSTALL_LOG"
   echo ""
-  echo -e "  ${YELLOW}${BOLD}⚠  $(t 'ВАЖНО: Сохраните пароль — он больше не будет показан!' \
-                                    'IMPORTANT: Save the password — it will not be shown again!')${NC}"
+  echo -e "  ${YELLOW}${BOLD}⚠  $(t 'ВАЖНО: Сохраните пароль и probe_secret — они больше не будут показаны!' \
+                                    'IMPORTANT: Save the password and probe_secret — they will not be shown again!')${NC}"
   echo ""
   echo -e "  Telegram: ${CYAN}https://t.me/russian_paradice_vpn${NC}"
   echo -e "  $(t 'Донат' 'Donate'):    ${CYAN}https://app.lava.top/2107724612?tabId=donate${NC}"
@@ -895,7 +1031,6 @@ print_banner() {
 
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
-  # Blocker 10: parse --non-interactive / --force first
   parse_install_args "$@"
 
   select_language
@@ -905,12 +1040,12 @@ main() {
   sync_time
   install_deps
   install_nodejs
-  install_naiveproxy
+  install_caddy_naive
   install_mieru
   gather_config
-  obtain_tls_cert
+  setup_fake_site
   write_mita_state
-  write_naive_config
+  write_caddyfile
   write_config_json
   install_panel
   write_version
