@@ -58,11 +58,20 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `rebuild_htpasswd_from_db()`, `rebuild_naive_config()` functions in `update.sh`.
 - `ensure_naive_service()` function (replaced by `ensure_caddy_service()`).
 - `certbot`, `apache2-utils` from installer dependencies.
-- UFW rule for port 80/tcp (HTTP-01 challenge no longer needed).
 - `naive.service` systemd unit (replaced by `caddy-naive.service`).
 - `/usr/local/bin/naive` binary (replaced by `/usr/local/bin/caddy-naive`).
 - `/etc/naive/config.json` and `/etc/naive/htpasswd` (replaced by `/etc/caddy-naive/Caddyfile`).
 - Certbot renewal hook `/etc/letsencrypt/renewal-hooks/deploy/restart-naive.sh` (no longer needed; Caddy auto-renews).
+- Duplicate site-level `log { }` block from Caddyfile template (Bug 21 — kept global block only).
+
+### Fixed (post-release patches)
+- **Bug 18 (P0, install.sh + panel/server/index.js)**: Caddyfile generated with an empty `basic_auth` block when no users exist in the DB yet — Caddy rejects this and the install aborts. Fixed in both places:
+  - `write_caddyfile()` (`install.sh`): generates a random `_placeholder_install` sentinel `basicauth` line before the heredoc; uses real DB users if any exist. Calls `caddy validate` after writing and logs warnings if validation fails.
+  - `buildCaddyfile()` (`panel/server/index.js`): when `naiveUsers` array is empty emits a `_placeholder_<random-hex>` basicauth line using `crypto.randomBytes`; real users replace it on next rebuild.
+- **Bug 19 (P0, install.sh)**: No rollback guidance on failure — installer silently exited, leaving system in partial state. Added `on_error()` function and `trap 'on_error $? $LINENO' ERR` immediately after the install-log redirect. The handler prints: exit code, line number, log path, and three recovery options (`--force` re-run, clean `uninstall.sh`, `tail -30` log).
+- **Bug 20 (P1, install.sh)**: UFW did not open port 80, breaking ACME HTTP-01 TLS challenge (Caddy uses HTTP-01 as fallback when TLS-ALPN-01 is unavailable, and also needs port 80 for the HTTP→HTTPS redirect). Added `ufw allow 80/tcp comment "ACME HTTP-01 + redir HTTPS"` in `setup_ufw()`.
+- **Bug 21 (P1, install.sh + panel/server/index.js)**: Caddyfile contained both a global `log { }` block and a duplicate site-level `log { output file … }` block writing to the same file — Caddy warns and only one block takes effect. Removed the site-level block; global block covers all requests.
+- **Bug 22 (P1, install.sh)**: `caddy-naive.service` unit file was written *inside* `start_services()`, after `systemctl daemon-reload` had already been called — so the new unit was never picked up by systemd on the first run. Moved `write_caddy_service()` call to `main()` (between `write_caddyfile()` and `write_config_json()`); `start_services()` now runs `daemon-reload` with the unit already on disk.
 
 ---
 

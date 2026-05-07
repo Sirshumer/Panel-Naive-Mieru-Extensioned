@@ -12,6 +12,22 @@ mkdir -p "$(dirname "$INSTALL_LOG")"
 exec > >(tee -a "$INSTALL_LOG") 2>&1
 echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] install.sh v1.2.3 started (PID $$)"
 
+# ── Bug 19: ERR trap — log failure location and guide user to recovery ────────
+on_error() {
+  local exit_code=$1 line=$2
+  echo ""
+  echo -e "${RED}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${RED}${BOLD}║  install.sh FAILED  (exit $exit_code  at line $line)           ${NC}"
+  echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+  echo -e "  ${YELLOW}Install log:${NC} $INSTALL_LOG"
+  echo -e "  ${YELLOW}Recovery options:${NC}"
+  echo -e "    • Retry (idempotent):   ${CYAN}sudo bash install.sh --force${NC}"
+  echo -e "    • Clean uninstall:      ${CYAN}sudo bash uninstall.sh${NC}"
+  echo -e "    • View last 30 lines:   ${CYAN}tail -30 $INSTALL_LOG${NC}"
+  echo ""
+}
+trap 'on_error $? $LINENO' ERR
+
 # ── Colours ───────────────────────────────────────────────────────────────────
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
@@ -491,29 +507,54 @@ FAKEHTML
   log_info "$(t "Фейковый сайт создан → $FAKE_SITE_DIR ✓" "Fake site created → $FAKE_SITE_DIR ✓")"
 }
 
-# ── Bug 1: Write Caddyfile (TLS-ALPN-01, forwardproxy, probe-resistance) ──────
+# ── Write Caddyfile (TLS-ALPN-01, forwardproxy, probe-resistance) ─────────────
+# Bug 18: always emit at least one basicauth line (placeholder) so Caddy does
+#          not reject an empty basic_auth block during validation.
+# Bug 21: keep only the global log block — no duplicate site-level log block.
 # Caddy handles TLS automatically via TLS-ALPN-01 — no certbot needed.
 # probe_resistance shows fake site to unrecognised clients.
 write_caddyfile() {
   log_step "$(t 'Запись Caddyfile' 'Writing Caddyfile')"
   mkdir -p "$CADDY_CONFIG_DIR" /var/log/caddy-naive
 
-  # Build users block from DB if it exists, else empty (will be rebuilt on first user add)
-  # The Caddyfile is rebuilt by the panel via /api/services/rebuild-all after each user change
-  local users_block=""
+  # Build users block from DB if it exists.
+  # Bug 18: generate a placeholder user so basic_auth is never empty.
+  # The Caddyfile is rebuilt by the panel via /api/services/rebuild-all after each user change.
+  local users_block
+  # Placeholder: a disabled sentinel user (username prefixed with _placeholder_)
+  local placeholder_user="_placeholder_install"
+  local placeholder_pass
+  placeholder_pass=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 32)
+
+  users_block="      basicauth ${placeholder_user} ${placeholder_pass}"
+
   if [[ -f "$DB_PATH" ]] && command -v node &>/dev/null; then
-    users_block=$(node -e "
+    local db_users
+    db_users=$(node -e "
       try {
         const Database = require('better-sqlite3');
         const db = new Database('$DB_PATH', { readonly: true });
-        const rows = db.prepare(\"SELECT username, password FROM users\").all()
-          .filter(u => { try { const p=JSON.parse(db.prepare('SELECT protocols FROM users WHERE username=?').get(u.username)?.protocols||'[]'); return p.includes('naive'); } catch{return true;} });
-        rows.forEach(u => { process.stdout.write('  basicauth ' + u.username + ' ' + u.password + '\n'); });
+        const rows = db.prepare('SELECT username, password FROM users').all()
+          .filter(u => {
+            try {
+              const p = JSON.parse(db.prepare('SELECT protocols FROM users WHERE username=?')
+                .get(u.username)?.protocols || '[]');
+              return p.includes('naive');
+            } catch { return true; }
+          });
+        rows.forEach(u => process.stdout.write('      basicauth ' + u.username + ' ' + u.password + '\n'));
         db.close();
       } catch(e) { /* ignore — no DB yet */ }
     " 2>/dev/null || true)
+    if [[ -n "$db_users" ]]; then
+      users_block="$db_users"
+    fi
   fi
 
+  # Build probe_resistance line (always set during install)
+  local probe_line="      probe_resistance ${PROBE_SECRET}"
+
+  # Bug 21: site-level log block removed — global log block covers all requests.
   cat > "$CADDY_FILE" <<CADDYEOF
 {
   email ${ADMIN_EMAIL}
@@ -537,31 +578,37 @@ ${DOMAIN}:${NAIVE_PORT} {
   route {
     forward_proxy {
       basic_auth
-${users_block}      hide_ip
+${users_block}
+      hide_ip
       hide_via
-      probe_resistance ${PROBE_SECRET}
+${probe_line}
     }
     file_server {
       root ${FAKE_SITE_DIR}
     }
   }
-
-  log {
-    output file /var/log/caddy-naive/access.log
-    format json
-  }
 }
 CADDYEOF
 
   chmod 640 "$CADDY_FILE"
-  log_info "$(t "Caddyfile записан → $CADDY_FILE ✓" "Caddyfile written → $CADDY_FILE ✓")"
+
+  # Bug 18: validate Caddyfile before proceeding
+  if "$CADDY_BIN" validate --config "$CADDY_FILE" --adapter caddyfile &>/dev/null; then
+    log_info "$(t "Caddyfile проверен и записан → $CADDY_FILE ✓" "Caddyfile validated and written → $CADDY_FILE ✓")"
+  else
+    log_warn "$(t "Предупреждение: caddy validate вернул ошибку — проверьте $CADDY_FILE" \
+                  "Warning: caddy validate returned an error — check $CADDY_FILE")"
+    "$CADDY_BIN" validate --config "$CADDY_FILE" --adapter caddyfile 2>&1 | head -20 || true
+  fi
 
   # Store probe_secret in caddy config dir for panel to read
   echo "$PROBE_SECRET" > "${CADDY_CONFIG_DIR}/probe_secret"
   chmod 600 "${CADDY_CONFIG_DIR}/probe_secret"
 }
 
-# ── Bug 1: Write caddy-naive.service ─────────────────────────────────────────
+# ── Write caddy-naive.service ───────────────────────────────────────────────
+# Bug 22: called explicitly in main() after write_caddyfile() and before
+#          start_services() so the unit file always exists before daemon-reload.
 write_caddy_service() {
   log_step "$(t 'Запись systemd юнита caddy-naive.service' 'Writing caddy-naive.service')"
 
@@ -660,18 +707,19 @@ _ufw_mieru_rule() {
 }
 
 # ── UFW ───────────────────────────────────────────────────────────────────────
-# Bug 1: Port 80 rule REMOVED — Caddy uses TLS-ALPN-01 (no HTTP-01 challenge)
+# Bug 20: port 80 required for ACME HTTP-01 challenge (Caddy redirects to HTTPS
+#         and also uses HTTP-01 as a fallback when TLS-ALPN-01 is unavailable).
 setup_ufw() {
   log_step "$(t 'Настройка UFW' 'Configuring UFW firewall')"
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
   ufw allow ssh
+  ufw allow 80/tcp comment "ACME HTTP-01 + redir HTTPS"
   ufw allow "${NAIVE_PORT}/tcp" comment "CaddyNaive HTTPS"
   # Bug 7: single-port safe helper
   _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" tcp "Mieru TCP"
   _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" udp "Mieru UDP"
-  # Bug 1: NO port 80 rule — Caddy TLS-ALPN-01 does not need port 80
   [[ "${EXPOSE_PANEL^^}" =~ ^(Y|Д)$ ]] && ufw allow 8080/tcp comment "Panel Web UI"
   ufw --force enable
   log_info "$(t 'Правила UFW применены ✓' 'UFW rules applied ✓')"
@@ -767,12 +815,13 @@ VEREOF
 }
 
 # ── Start services ────────────────────────────────────────────────────────────
+# Bug 22: write_caddy_service() is now called from main() before start_services()
+#          so daemon-reload always sees the fresh unit file.
 start_services() {
   log_step "$(t 'Запуск сервисов' 'Starting services')"
   systemctl daemon-reload
 
-  # caddy-naive.service
-  write_caddy_service
+  # caddy-naive.service (unit already written by main() → write_caddy_service)
   systemctl enable caddy-naive
   systemctl restart caddy-naive && \
     log_info "$(t 'caddy-naive запущен ✓' 'caddy-naive started ✓')" || \
@@ -1046,6 +1095,7 @@ main() {
   setup_fake_site
   write_mita_state
   write_caddyfile
+  write_caddy_service
   write_config_json
   install_panel
   write_version
