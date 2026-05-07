@@ -66,7 +66,7 @@ try {
     probeSecret:   '',
     mitaStateFile: MITA_STATE_FILE,
     trafficPattern: 'NOOP', mtu: 1400, udpEnabled: false,
-    language: 'ru', version: '1.2.3'
+    language: 'ru', version: '1.2.4'
   };
 }
 
@@ -167,76 +167,115 @@ function saveConfig() {
 
 // ── buildCaddyfile() ─────────────────────────────────────────────────────────
 // Rebuilds the Caddyfile from current cfg and user list.
-// Bug 18: always emits at least one basicauth line (placeholder) so Caddy
-//         never sees an empty basic_auth block and rejects the config.
-// Bug 21: site-level log block removed — the global log block covers all
-//         requests; duplicate log blocks write to the same file and warn.
-// probe_resistance shows fake site to unrecognised clients.
+//
+// Bug 23 (P0): the old code emitted a bare "basic_auth" keyword with no
+//   arguments (invalid in caddy-forwardproxy-naive → parse error) and used
+//   the wrong spelling "basicauth" for per-user lines.  Both are now fixed
+//   by delegating to caddyTemplate.js which is the single source of truth.
+//
+// Bug 26 (P1): delegate to caddyTemplate.js so install.sh, update.sh, and
+//   this file all produce byte-for-byte identical Caddyfiles.
+//
+// Bug 28 (P1): removed redundant "tls <email>" inside the site block —
+//   Caddy's automatic HTTPS handles TLS; the global email directive is enough.
+//
+// Bug 29 (P1): directive order inside forward_proxy is now enforced by the
+//   template: basic_auth lines → hide_ip → hide_via → probe_resistance.
+//
+// Bug 30 (P1): "order forward_proxy before file_server" now appears in the
+//   global block via the template.
+//
+// Bug 34: placeholder emitted when naiveUsers is empty so the forward_proxy
+//   block always has at least one credential (prevents unauthenticated access
+//   and Caddy validation failure).
+//
+// Bug 38 (P2): log rotation uses roll_keep_for 720h (30 days) not roll_keep 5.
+//
+// Bug 21: no site-level log block — global block covers all traffic.
 function buildCaddyfile(config, users) {
+  // Filter to naive-protocol users only
   const naiveUsers = users.filter(u => {
     try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
     catch { return true; }
-  });
+  // Normalise to {username, password} shape expected by caddyTemplate.js
+  }).map(u => ({ username: u.username, password: u.password || u.passHash || '' }));
 
-  const probeSecret = config.probeSecret ||
+  // Read probe secret from config or from the file written by install.sh
+  const probeSecret = (config.probeSecret || '').trim() ||
     (fs.existsSync(path.join(resolvedCaddyCfgDir, 'probe_secret'))
       ? fs.readFileSync(path.join(resolvedCaddyCfgDir, 'probe_secret'), 'utf8').trim()
       : '');
 
-  const fakeSiteDir = resolvedFakeSiteDir;
-  const email       = config.adminEmail  || '';
-  const domain      = config.domain      || 'localhost';
-  const port        = config.naivePort   || 443;
-
-  // Bug 18: build basicauth lines; always include at least a placeholder so
-  // the block is never empty (empty basic_auth causes Caddy validation failure).
-  let authLines;
-  if (naiveUsers.length > 0) {
-    authLines = naiveUsers
-      .map(u => `      basicauth ${u.username} ${u.password || u.passHash}`)
-      .join('\n');
-  } else {
-    // Placeholder sentinel — random suffix makes it effectively unreachable.
-    // The panel rebuilds the Caddyfile whenever a real user is added.
-    const crypto = require('crypto');
-    const rnd = crypto.randomBytes(16).toString('hex');
-    authLines = `      basicauth _placeholder_${rnd} _disabled_${rnd}`;
+  // Bug 26: delegate to the shared template module (single source of truth).
+  // Falls back to an inline render if the template file is not yet deployed.
+  const tplPath = path.join(__dirname, 'caddyTemplate.js');
+  if (fs.existsSync(tplPath)) {
+    const tpl = require(tplPath);
+    return tpl.render({
+      adminEmail:  config.adminEmail  || '',
+      domain:      config.domain      || 'localhost',
+      naivePort:   config.naivePort   || 443,
+      fakeSiteDir: resolvedFakeSiteDir,
+      probeSecret,
+      logFile:     LOG_CADDY,
+    }, naiveUsers);
   }
 
-  // Bug 21: omit site-level log block — global block already captures all traffic.
-  const probeResLine = probeSecret
-    ? `      probe_resistance ${probeSecret}`
-    : '';
+  // ── Inline fallback (identical rules to caddyTemplate.js) ─────────────────
+  // Used only when caddyTemplate.js is not yet on disk (e.g. very first boot
+  // before install_panel() has run).  Kept in sync with the template manually.
+  const crypto = require('crypto');
+  let authLines;
+  if (naiveUsers.length > 0) {
+    // Bug 23: each credential line is "basic_auth <user> <pass>" — no bare keyword
+    authLines = naiveUsers
+      .map(u => `    basic_auth ${u.username} ${u.password}`)
+      .join('\n');
+  } else {
+    // Bug 34: unreachable placeholder keeps the block non-empty
+    const rnd = crypto.randomBytes(20).toString('hex');
+    authLines = `    basic_auth _placeholder_${rnd.slice(0, 16)} _disabled_${rnd.slice(16)}`;
+  }
 
+  // Bug 29: probe_resistance comes after hide_ip + hide_via
+  const probeLine = probeSecret ? `\n    probe_resistance ${probeSecret}` : '';
+
+  // Bug 28: no "tls <email>" inside site block
+  // Bug 30: order directive in global block
+  // Bug 38: roll_keep_for 720h
   return `{
-  email ${email}
+  # Bug 30: evaluate forwardproxy before file_server
+  order forward_proxy before file_server
+  email ${config.adminEmail || ''}
   admin off
   log {
+    # Bug 38: 30-day retention by age
     output file ${LOG_CADDY} {
-      roll_size 50mb
-      roll_keep 5
+      roll_size     50mb
+      roll_keep_for 720h
     }
     format json
   }
 }
 
+# HTTP → HTTPS redirect (also needed for ACME HTTP-01 fallback)
 :80 {
   redir https://{host}{uri} permanent
 }
 
-${domain}:${port} {
-  tls ${email}
+${config.domain || 'localhost'}:${config.naivePort || 443} {
+  # Bug 28: TLS managed automatically by Caddy — no explicit tls directive
 
   route {
     forward_proxy {
-      basic_auth
+      # Bug 23: no bare "basic_auth" token; each line IS the credential directive
+      # Bug 29: order — credentials → hide_ip → hide_via → probe_resistance
 ${authLines}
       hide_ip
-      hide_via
-${probeResLine}
+      hide_via${probeLine}
     }
     file_server {
-      root ${fakeSiteDir}
+      root ${resolvedFakeSiteDir}
     }
   }
 }
@@ -918,7 +957,7 @@ app.get('/api/status', requireAuth, async (req, res) => {
         os:   osInfo.distro + ' ' + osInfo.release,
         arch: osInfo.arch
       },
-      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.2.3' },
+      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.2.4' },
       domain:   cfg.domain,
       serverIp: cfg.serverIp,
       language: cfg.language || 'ru'
@@ -1034,7 +1073,8 @@ app.get('/api/diagnostics', requireAuth, async (_req, res) => {
     caddyfileUsers:    (() => {
       if (!fs.existsSync(resolvedCaddyFile)) return 0;
       const content = fs.readFileSync(resolvedCaddyFile, 'utf8');
-      return (content.match(/^\s*basicauth\s+\S+\s+\S+/gm) || []).length;
+      // Bug 23: directive is now "basic_auth" (underscore), not "basicauth"
+      return (content.match(/^\s*basic_auth\s+\S+\s+\S+/gm) || []).length;
     })(),
     mitaStatus:   exec_('mita status 2>/dev/null'),
     mitaConfig:   exec_('mita describe config 2>/dev/null'),
@@ -1142,7 +1182,7 @@ server.listen(PORT, HOST, () => {
     '  ██║  ██║ ██║ ██╔╝ ██╗ ██╔╝ ██╗ ██╔╝ ██╗',
     '  ╚═╝  ╚═╝ ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝',
     '',
-    `  Panel Naive + Mieru v${cfg.version || '1.2.3'} by RIXXX  (Caddy-forwardproxy-naive)`,
+    `  Panel Naive + Mieru v${cfg.version || '1.2.4'} by RIXXX  (Caddy-forwardproxy-naive)`,
     `  http://${HOST}:${PORT}/`,
     HOST === '127.0.0.1' ? `  ⚠  SSH-only: ssh -L 3000:127.0.0.1:3000 root@<server>` : '',
     ''

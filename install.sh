@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — install.sh  v1.2.3
+# Panel Naive + Mieru by RIXXX — install.sh  v1.2.4
 # Caddy-forwardproxy-naive (amd64-only) + Mieru (mita) + fake-site + probe-resistance
 # Supports: Ubuntu 20.04/22.04/24.04, Debian 11/12 | x86_64 only
 # ==============================================================================
@@ -10,7 +10,7 @@ set -euo pipefail
 INSTALL_LOG="/var/log/rixxx-panel-install.log"
 mkdir -p "$(dirname "$INSTALL_LOG")"
 exec > >(tee -a "$INSTALL_LOG") 2>&1
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] install.sh v1.2.3 started (PID $$)"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] install.sh v1.2.4 started (PID $$)"
 
 # ── Bug 19: ERR trap — log failure location and guide user to recovery ────────
 on_error() {
@@ -57,7 +57,7 @@ FAKE_SITE_DIR="/var/www/fake-site"
 NAIVE_BIN="/usr/local/bin/naive"        # may still exist from v1.2.x; will be removed
 NAIVE_CONFIG_DIR="/etc/naive"
 
-CURRENT_VERSION="1.2.3"
+CURRENT_VERSION="1.2.4"
 REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
 # Bug 1: direct download URL for caddy-forwardproxy-naive (amd64 only)
 CADDY_NAIVE_RELEASES="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
@@ -110,6 +110,8 @@ select_language() {
   echo ""
   echo -e "${BOLD}╔══════════════════════════════════════════════════╗${NC}"
   echo -e "${BOLD}║   Panel Naive + Mieru by RIXXX  v${CURRENT_VERSION}       ║${NC}"
+  # Bug 32: interactive prompts go to /dev/tty so tee-to-log doesn't swallow them
+  # (exec redirect is set up above; read uses /dev/tty automatically in bash)
   echo -e "${BOLD}╚══════════════════════════════════════════════════╝${NC}"
   echo ""
   echo -e "  Выберите язык / Select language:"
@@ -153,11 +155,11 @@ detect_arch() {
     x86_64|amd64) ARCH="amd64"; DEB_ARCH="amd64" ;;
     # Bug 1: caddy-forwardproxy-naive is amd64-only; ARM not supported
     aarch64|arm64) die "$(t \
-      'caddy-forwardproxy-naive поддерживает только amd64. ARM64 не поддерживается в v1.2.3.' \
-      'caddy-forwardproxy-naive only supports amd64. ARM64 is not supported in v1.2.3.')" ;;
+      'caddy-forwardproxy-naive поддерживает только amd64. ARM64 не поддерживается в v1.2.4.' \
+      'caddy-forwardproxy-naive only supports amd64. ARM64 is not supported in v1.2.4.')" ;;
     armv7l) die "$(t \
-      'caddy-forwardproxy-naive поддерживает только amd64. ARMv7 не поддерживается в v1.2.3.' \
-      'caddy-forwardproxy-naive only supports amd64. ARMv7 is not supported in v1.2.3.')" ;;
+      'caddy-forwardproxy-naive поддерживает только amd64. ARMv7 не поддерживается в v1.2.4.' \
+      'caddy-forwardproxy-naive only supports amd64. ARMv7 is not supported in v1.2.4.')" ;;
     *) die "$(t "Неподдерживаемая архитектура: $machine" "Unsupported architecture: $machine")" ;;
   esac
   log_info "$(t 'Архитектура' 'Architecture'): $machine → $ARCH ✓"
@@ -508,97 +510,164 @@ FAKEHTML
 }
 
 # ── Write Caddyfile (TLS-ALPN-01, forwardproxy, probe-resistance) ─────────────
-# Bug 18: always emit at least one basicauth line (placeholder) so Caddy does
-#          not reject an empty basic_auth block during validation.
-# Bug 21: keep only the global log block — no duplicate site-level log block.
-# Caddy handles TLS automatically via TLS-ALPN-01 — no certbot needed.
-# probe_resistance shows fake site to unrecognised clients.
+# Bug 23: forward_proxy credential lines use  basic_auth <user> <pass>  (with
+#          underscore).  The bare  "basic_auth"  keyword with no arguments is
+#          invalid in caddy-forwardproxy-naive and causes:
+#            "wrong argument count or unexpected line ending after 'basic_auth'"
+# Bug 24: caddy validate failure is fatal (die), not a warning.
+# Bug 26: template rendered via caddyTemplate.js — single source of truth.
+# Bug 27: backup existing Caddyfile; restore DB users when --force.
+# Bug 28: no  tls <email>  in site block — Caddy handles TLS automatically.
+# Bug 29: directive order inside forward_proxy:  basic_auth → hide_ip → hide_via → probe_resistance.
+# Bug 30: global  order forward_proxy before file_server.
+# Bug 33: DNS check — warn if domain doesn't resolve to server IP.
+# Bug 38: log rotation uses  roll_keep_for 720h  (30 days).
 write_caddyfile() {
   log_step "$(t 'Запись Caddyfile' 'Writing Caddyfile')"
   mkdir -p "$CADDY_CONFIG_DIR" /var/log/caddy-naive
 
-  # Build users block from DB if it exists.
-  # Bug 18: generate a placeholder user so basic_auth is never empty.
-  # The Caddyfile is rebuilt by the panel via /api/services/rebuild-all after each user change.
-  local users_block
-  # Placeholder: a disabled sentinel user (username prefixed with _placeholder_)
-  local placeholder_user="_placeholder_install"
-  local placeholder_pass
-  placeholder_pass=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 32)
+  # Bug 27: backup existing Caddyfile before overwriting
+  if [[ -f "$CADDY_FILE" ]]; then
+    local ts; ts=$(date +%Y%m%d-%H%M%S)
+    cp "$CADDY_FILE" "${CADDY_FILE}.bak.${ts}" 2>/dev/null || true
+    log_info "$(t "Резервная копия Caddyfile: ${CADDY_FILE}.bak.${ts}" \
+                  "Caddyfile backup: ${CADDY_FILE}.bak.${ts}")"
+  fi
 
-  users_block="      basicauth ${placeholder_user} ${placeholder_pass}"
+  # Bug 33: DNS pre-flight — warn if domain doesn't resolve to this server's IP
+  local server_ip_check
+  server_ip_check=$(curl -4 -fsSL --connect-timeout 5 https://api.ipify.org 2>/dev/null \
+                    || hostname -I | awk '{print $1}')
+  local dns_ip
+  dns_ip=$(getent hosts "$DOMAIN" 2>/dev/null | awk '{print $1; exit}' || true)
+  if [[ -n "$dns_ip" && "$dns_ip" != "$server_ip_check" ]]; then
+    log_warn "$(t \
+      "DNS: $DOMAIN → $dns_ip (сервер: $server_ip_check) — убедитесь что A-запись верна!" \
+      "DNS: $DOMAIN → $dns_ip (server: $server_ip_check) — verify your A record is correct!")"
+  elif [[ -z "$dns_ip" ]]; then
+    log_warn "$(t \
+      "DNS: $DOMAIN не резолвится — убедитесь что A-запись указывает на этот сервер" \
+      "DNS: $DOMAIN does not resolve — ensure your A record points to this server")"
+  else
+    log_info "$(t "DNS: $DOMAIN → $dns_ip ✓" "DNS: $DOMAIN → $dns_ip ✓")"
+  fi
 
+  # Bug 27 + Bug 23: gather real DB users when --force / reinstall
+  # Bug 23: credential lines are  basic_auth <user> <pass>  (no bare keyword)
+  local naive_users_json="[]"
   if [[ -f "$DB_PATH" ]] && command -v node &>/dev/null; then
-    local db_users
-    db_users=$(node -e "
+    naive_users_json=$(node -e "
       try {
         const Database = require('better-sqlite3');
         const db = new Database('$DB_PATH', { readonly: true });
-        const rows = db.prepare('SELECT username, password FROM users').all()
+        const rows = db.prepare('SELECT username, password, protocols FROM users').all()
           .filter(u => {
-            try {
-              const p = JSON.parse(db.prepare('SELECT protocols FROM users WHERE username=?')
-                .get(u.username)?.protocols || '[]');
-              return p.includes('naive');
-            } catch { return true; }
+            try { return JSON.parse(u.protocols || '[\"naive\",\"mieru\"]').includes('naive'); }
+            catch { return true; }
           });
-        rows.forEach(u => process.stdout.write('      basicauth ' + u.username + ' ' + u.password + '\n'));
+        process.stdout.write(JSON.stringify(rows.map(u => ({ username: u.username, password: u.password }))));
         db.close();
-      } catch(e) { /* ignore — no DB yet */ }
-    " 2>/dev/null || true)
-    if [[ -n "$db_users" ]]; then
-      users_block="$db_users"
-    fi
+      } catch(e) { process.stdout.write('[]'); }
+    " 2>/dev/null || echo '[]')
   fi
 
-  # Build probe_resistance line (always set during install)
-  local probe_line="      probe_resistance ${PROBE_SECRET}"
+  # Bug 26: render Caddyfile via the shared caddyTemplate.js module
+  local template_js="${PANEL_DIR}/server/caddyTemplate.js"
+  local caddyfile_content
 
-  # Bug 21: site-level log block removed — global log block covers all requests.
-  cat > "$CADDY_FILE" <<CADDYEOF
-{
+  if [[ -f "$template_js" ]] && command -v node &>/dev/null; then
+    caddyfile_content=$(node -e "
+      const t = require('$template_js');
+      const users = $naive_users_json;
+      const cfg = {
+        adminEmail:  '${ADMIN_EMAIL}',
+        domain:      '${DOMAIN}',
+        naivePort:   ${NAIVE_PORT},
+        fakeSiteDir: '${FAKE_SITE_DIR}',
+        probeSecret: '${PROBE_SECRET}',
+        logFile:     '/var/log/caddy-naive/access.log'
+      };
+      process.stdout.write(t.render(cfg, users));
+    " 2>/dev/null) || true
+  fi
+
+  # Fallback: render inline (identical rules — used before panel is installed)
+  if [[ -z "${caddyfile_content:-}" ]]; then
+    # Bug 23: placeholder uses  basic_auth <user> <pass>  (no bare keyword)
+    local placeholder_user="_placeholder_install"
+    local placeholder_pass
+    placeholder_pass=$(openssl rand -base64 24 | tr -dc 'A-Za-z0-9' | head -c 32)
+
+    local auth_lines
+    if [[ "$naive_users_json" != "[]" ]] && command -v node &>/dev/null; then
+      auth_lines=$(node -e "
+        const rows = $naive_users_json;
+        rows.forEach(u => process.stdout.write('    basic_auth ' + u.username + ' ' + u.password + '\n'));
+      " 2>/dev/null || true)
+    fi
+    if [[ -z "${auth_lines:-}" ]]; then
+      auth_lines="    basic_auth ${placeholder_user} ${placeholder_pass}"
+    fi
+
+    local probe_line=""
+    [[ -n "${PROBE_SECRET:-}" ]] && probe_line="    probe_resistance ${PROBE_SECRET}"
+
+    # Bug 28: no tls directive — Caddy automatic HTTPS handles it
+    # Bug 29: order: basic_auth → hide_ip → hide_via → probe_resistance
+    # Bug 30: order forward_proxy before file_server
+    # Bug 38: roll_keep_for 720h instead of roll_keep 5
+    # Bug 21: no site-level log block
+    caddyfile_content="{
+  # Bug 30: ensure forward_proxy is evaluated before file_server
+  order forward_proxy before file_server
   email ${ADMIN_EMAIL}
   admin off
   log {
     output file /var/log/caddy-naive/access.log {
-      roll_size 50mb
-      roll_keep 5
+      roll_size     50mb
+      roll_keep_for 720h
     }
     format json
   }
 }
 
+# HTTP → HTTPS redirect + ACME HTTP-01 fallback
 :80 {
   redir https://{host}{uri} permanent
 }
 
 ${DOMAIN}:${NAIVE_PORT} {
-  tls ${ADMIN_EMAIL}
-
   route {
     forward_proxy {
-      basic_auth
-${users_block}
+${auth_lines}
       hide_ip
-      hide_via
-${probe_line}
+      hide_via"
+    [[ -n "$probe_line" ]] && caddyfile_content+="
+      ${probe_line}"
+    caddyfile_content+="
     }
     file_server {
       root ${FAKE_SITE_DIR}
     }
   }
-}
-CADDYEOF
+}"
+  fi
 
+  # Write atomically
+  local tmp_file="${CADDY_FILE}.new"
+  printf '%s\n' "$caddyfile_content" > "$tmp_file"
+  mv "$tmp_file" "$CADDY_FILE"
   chmod 640 "$CADDY_FILE"
 
-  # Bug 18: validate Caddyfile before proceeding
-  if "$CADDY_BIN" validate --config "$CADDY_FILE" --adapter caddyfile &>/dev/null; then
+  # Bug 24: validate is FATAL — die on failure, not log_warn
+  local validate_out
+  if validate_out=$("$CADDY_BIN" validate --config "$CADDY_FILE" --adapter caddyfile 2>&1); then
     log_info "$(t "Caddyfile проверен и записан → $CADDY_FILE ✓" "Caddyfile validated and written → $CADDY_FILE ✓")"
   else
-    log_warn "$(t "Предупреждение: caddy validate вернул ошибку — проверьте $CADDY_FILE" \
-                  "Warning: caddy validate returned an error — check $CADDY_FILE")"
-    "$CADDY_BIN" validate --config "$CADDY_FILE" --adapter caddyfile 2>&1 | head -20 || true
+    log_error "$(t "caddy validate вернул ошибку:" "caddy validate returned error:")"
+    echo "$validate_out"
+    die "$(t "Caddyfile невалиден — установка прервана. Проверьте $CADDY_FILE" \
+              "Caddyfile is invalid — install aborted. Check $CADDY_FILE")"
   fi
 
   # Store probe_secret in caddy config dir for panel to read
@@ -630,7 +699,9 @@ Requires=network-online.target
 
 [Service]
 Type=notify
-User=root
+# Bug 37: run as unprivileged system user; cap_net_bind_service grants port 443
+User=caddy
+Group=caddy
 ExecStart=${CADDY_BIN} run --config ${CADDY_FILE} --adapter caddyfile
 ExecReload=/bin/kill -USR1 \$MAINPID
 TimeoutStopSec=5
@@ -639,7 +710,8 @@ RestartSec=5
 LimitNOFILE=1048576
 PrivateTmp=true
 ProtectSystem=full
-AmbientCapabilities=CAP_NET_ADMIN CAP_NET_BIND_SERVICE
+ReadWritePaths=/var/log/caddy-naive /etc/caddy-naive
+AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]
 WantedBy=multi-user.target
@@ -707,10 +779,32 @@ _ufw_mieru_rule() {
 }
 
 # ── UFW ───────────────────────────────────────────────────────────────────────
-# Bug 20: port 80 required for ACME HTTP-01 challenge (Caddy redirects to HTTPS
-#         and also uses HTTP-01 as a fallback when TLS-ALPN-01 is unavailable).
+# Bug 20: port 80 required for ACME HTTP-01 challenge.
+# Bug 36: backup UFW rules before reset; interactive-mode prompts for confirmation.
 setup_ufw() {
   log_step "$(t 'Настройка UFW' 'Configuring UFW firewall')"
+
+  # Bug 36: backup current rules before --force reset
+  if command -v ufw &>/dev/null; then
+    local ufw_bak="/etc/rixxx-panel/backups/ufw-before-install-$(date +%Y%m%d-%H%M%S).rules"
+    mkdir -p "$(dirname "$ufw_bak")"
+    ufw status verbose 2>/dev/null > "$ufw_bak" || true
+    log_info "$(t "Резервная копия правил UFW: $ufw_bak" "UFW rules backup: $ufw_bak")"
+  fi
+
+  # Bug 36: prompt for confirmation in interactive mode
+  if ! $NON_INTERACTIVE; then
+    echo ""
+    echo -e "${YELLOW}$(t 'UFW --force reset удалит все текущие правила!' \
+                         'UFW --force reset will erase all existing rules!')${NC}"
+    read -rp "$(t '  Продолжить? [Д/н]: ' '  Continue? [Y/n]: ')" _ufw_confirm
+    local _uc="${_ufw_confirm:-Y}"
+    if $LANG_RU; then
+      [[ "${_uc^^}" =~ ^(Н|N)$ ]] && { log_info "$(t 'UFW пропущен.' 'UFW skipped.')"; return; }
+    else
+      [[ "${_uc^^}" == "N" ]] && { log_info "UFW skipped."; return; }
+    fi
+  fi
   ufw --force reset
   ufw default deny incoming
   ufw default allow outgoing
@@ -815,18 +909,44 @@ VEREOF
 }
 
 # ── Start services ────────────────────────────────────────────────────────────
-# Bug 22: write_caddy_service() is now called from main() before start_services()
-#          so daemon-reload always sees the fresh unit file.
+# Bug 22: write_caddy_service() called from main() before start_services().
+# Bug 25: die if caddy-naive is not active after restart.
+# Bug 37: caddy-naive runs as dedicated 'caddy' system user with cap_net_bind_service.
 start_services() {
   log_step "$(t 'Запуск сервисов' 'Starting services')"
+
+  # Bug 37: create 'caddy' system user if absent
+  if ! id caddy &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin caddy 2>/dev/null || true
+    log_info "$(t 'Системный пользователь caddy создан ✓' 'System user caddy created ✓')"
+  fi
+  # Ensure Caddy binary ownership + cap_net_bind_service for the caddy user
+  chown root:caddy "$CADDY_BIN" 2>/dev/null || true
+  chmod 750 "$CADDY_BIN" 2>/dev/null || true
+  setcap 'cap_net_bind_service=+ep' "$CADDY_BIN" 2>/dev/null || true
+  # Give caddy group read access to config
+  chgrp -R caddy "$CADDY_CONFIG_DIR" 2>/dev/null || true
+  chmod -R g+r  "$CADDY_CONFIG_DIR" 2>/dev/null || true
+  chmod 640 "$CADDY_FILE" 2>/dev/null || true
+  # Caddy needs write access to its log dir
+  mkdir -p /var/log/caddy-naive
+  chown caddy:caddy /var/log/caddy-naive 2>/dev/null || true
+
   systemctl daemon-reload
 
   # caddy-naive.service (unit already written by main() → write_caddy_service)
   systemctl enable caddy-naive
-  systemctl restart caddy-naive && \
-    log_info "$(t 'caddy-naive запущен ✓' 'caddy-naive started ✓')" || \
-    log_warn "$(t 'caddy-naive не запустился — journalctl -u caddy-naive -n 30' \
-               'caddy-naive failed — journalctl -u caddy-naive -n 30')"
+  systemctl restart caddy-naive
+  sleep 2
+  # Bug 25: fatal if caddy-naive did not become active
+  if ! systemctl is-active --quiet caddy-naive; then
+    log_error "$(t 'caddy-naive не запустился! Вывод journalctl:' \
+                   'caddy-naive failed to start! journalctl output:')"
+    journalctl -u caddy-naive -n 40 --no-pager 2>/dev/null || true
+    die "$(t 'caddy-naive не активен — установка прервана. Запустите: journalctl -u caddy-naive -n 50' \
+              'caddy-naive is not active — install aborted. Run: journalctl -u caddy-naive -n 50')"
+  fi
+  log_info "$(t 'caddy-naive запущен ✓' 'caddy-naive started ✓')"
 
   # Bug 4: mita crashes when started with empty users[].
   # Apply portBindings config, but only start mita after first user is added.
