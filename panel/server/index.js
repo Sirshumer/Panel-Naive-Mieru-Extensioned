@@ -199,6 +199,16 @@ function buildNaiveConfig() {
   fs.renameSync(tmp, resolvedNaiveCfg);   // atomic replace
 }
 
+// ── Bug 3 fix: UFW single-port helper ───────────────────────────────────────
+// UFW rejects "N:N/proto" when start===end; use a single-port rule instead.
+function ufwMieruRule(action, start, end, proto, comment) {
+  if (start === end) {
+    execSync(`ufw ${action} allow ${start}/${proto}${comment ? ` comment "${comment}"` : ''} 2>/dev/null || true`, { timeout: 5000 });
+  } else {
+    execSync(`ufw ${action} allow ${start}:${end}/${proto}${comment ? ` comment "${comment}"` : ''} 2>/dev/null || true`, { timeout: 5000 });
+  }
+}
+
 // ── Blocker 7: Service helpers — naive ───────────────────────────────────────
 // Reload naive (SIGHUP for hot-reload without dropping connections)
 function reloadNaive() {
@@ -415,20 +425,99 @@ app.post('/api/config/password', requireAuth, (req, res) => {
   res.json({ ok: true });
 });
 
+// ── Validation helpers ───────────────────────────────────────────────────────
+const VALID_PROTOCOLS = ['naive', 'mieru'];
+const USERNAME_RE     = /^[a-zA-Z0-9_.-]{1,64}$/;
+const EMAIL_RE        = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
+
+/**
+ * Bug 8: normalise quota — accept quotaMB or quotaGb (gb * 1024 → MB).
+ * Bug 9: validate all user input fields.
+ * Returns { error } string on failure, or { quotaMB, protocols } on success.
+ */
+function validateUserInput({ email, username, password, protocols, quotaMB, quotaGb }, requirePassword) {
+  if (!username || !USERNAME_RE.test(username))
+    return { error: 'username required and must match [a-zA-Z0-9_.-] (max 64 chars)' };
+  if (!email || !EMAIL_RE.test(email))
+    return { error: 'valid email is required' };
+  if (requirePassword) {
+    if (!password) return { error: 'password is required for new users' };
+    if (password.length < 8) return { error: 'password must be at least 8 characters' };
+  } else if (password !== undefined && password !== null && password !== '' && password.length < 8) {
+    return { error: 'new password must be at least 8 characters' };
+  }
+  // Bug 8: accept quotaGb; convert to quotaMB
+  let resolvedQuotaMB = 0;
+  if (quotaMB !== undefined && quotaMB !== null) {
+    resolvedQuotaMB = parseInt(quotaMB, 10);
+    if (isNaN(resolvedQuotaMB) || resolvedQuotaMB < 0)
+      return { error: 'quotaMB must be a non-negative integer' };
+  } else if (quotaGb !== undefined && quotaGb !== null) {
+    const gb = parseFloat(quotaGb);
+    if (isNaN(gb) || gb < 0) return { error: 'quotaGb must be a non-negative number' };
+    resolvedQuotaMB = Math.round(gb * 1024);
+  }
+  // Bug 9: protocols allowlist
+  let resolvedProtocols = ['naive', 'mieru'];
+  if (protocols !== undefined) {
+    if (!Array.isArray(protocols))
+      return { error: 'protocols must be an array' };
+    const invalid = protocols.filter(p => !VALID_PROTOCOLS.includes(p));
+    if (invalid.length)
+      return { error: `unknown protocol(s): ${invalid.join(', ')}. Allowed: ${VALID_PROTOCOLS.join(', ')}` };
+    if (!protocols.length)
+      return { error: 'at least one protocol is required (naive, mieru)' };
+    resolvedProtocols = protocols;
+  }
+  return { quotaMB: resolvedQuotaMB, protocols: resolvedProtocols };
+}
+
+/**
+ * Bug 7: parse all TEXT JSON columns back to JS types when returning user rows.
+ * Bug 6: helper that rebuilds services and returns reloaded status.
+ */
+function parseUserRow(u) {
+  return {
+    ...u,
+    protocols: typeof u.protocols === 'string'
+      ? (() => { try { return JSON.parse(u.protocols); } catch { return []; } })()
+      : (u.protocols || []),
+  };
+}
+
+function rebuildServices() {
+  let naiveOk = false, mitaOk = false;
+  try { buildHtpasswd(getAllUsers()); naiveOk = reloadNaive(); }
+  catch (e) { console.error('[NAIVE]', e.message); }
+  try { mitaOk = applyMitaConfig(); }
+  catch (e) { console.error('[MITA]', e.message); }
+  return { naiveOk, mitaOk, servicesReloaded: naiveOk && mitaOk };
+}
+
 // ── Users API ─────────────────────────────────────────────────────────────────
+// Bug 7: parse protocols (TEXT → Array) in GET /api/users
 app.get('/api/users', requireAuth, (req, res) => {
-  const users = getAllUsers().map(({ passHash, password, ...u }) => u);
+  const users = getAllUsers().map(u => {
+    const { passHash, password, ...rest } = u;
+    return parseUserRow(rest);
+  });
   res.json(users);
 });
 
 app.post('/api/users', requireAuth, (req, res) => {
-  const { email, username, password, expiry, protocols, quotaMB } = req.body;
-  if (!email || !username || !password)
-    return res.status(400).json({ error: 'email, username and password are required' });
-  if (password.length < 8)
-    return res.status(400).json({ error: 'Password must be at least 8 characters' });
+  // Bug 9: full validation; Bug 8: quotaGb support
+  const { email, username, password, expiry, protocols, quotaMB, quotaGb } = req.body;
+  const validation = validateUserInput(
+    { email, username, password, protocols, quotaMB, quotaGb }, true);
+  if (validation.error)
+    return res.status(400).json({ error: validation.error });
+
   if (getUserByUsername(username))
     return res.status(409).json({ error: 'Username already exists' });
+
+  // Validate expiry if provided
+  if (expiry && isNaN(Date.parse(expiry)))
+    return res.status(400).json({ error: 'expiry must be a valid ISO date string' });
 
   const now  = new Date().toISOString();
   const user = {
@@ -437,33 +526,51 @@ app.post('/api/users', requireAuth, (req, res) => {
     passHash:  bcrypt.hashSync(password, 12),  // for naive htpasswd
     password,                                   // plain text for mita apply config
     expiry:    expiry || null,
-    protocols: JSON.stringify(protocols || ['naive', 'mieru']),
-    quotaMB:   quotaMB || 0,
+    protocols: JSON.stringify(validation.protocols),
+    quotaMB:   validation.quotaMB,
     usedMB:    0,
     createdAt: now, updatedAt: now, lastSeen: null
   };
   upsertUser(user);
 
-  // Blocker 7: rebuild htpasswd + reload naive; rebuild mita state
-  try { buildHtpasswd(getAllUsers()); reloadNaive(); } catch (e) { console.error('[NAIVE]', e.message); }
-  try { applyMitaConfig(); }                          catch (e) { console.error('[MITA]',  e.message); }
+  // Bug 6: rebuild htpasswd + reload naive; rebuild mita state; report status
+  const svcStatus = rebuildServices();
 
   const { passHash, password: _p, ...safe } = user;
-  res.status(201).json(safe);
+  // Bug 7: return protocols as array
+  res.status(201).json({ ...parseUserRow(safe), ...svcStatus });
 });
 
 app.put('/api/users/:id', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
 
-  const { email, username, password, expiry, protocols, quotaMB } = req.body;
+  const { email, username, password, expiry, protocols, quotaMB, quotaGb } = req.body;
+  // Bug 9: validate; Bug 8: quotaGb support
+  const validation = validateUserInput(
+    { email: email ?? user.email,
+      username: username ?? user.username,
+      password,
+      protocols,
+      quotaMB: quotaMB !== undefined ? quotaMB : undefined,
+      quotaGb: quotaGb !== undefined ? quotaGb : undefined }, false);
+  if (validation.error)
+    return res.status(400).json({ error: validation.error });
+
+  if (expiry !== undefined && expiry !== null && isNaN(Date.parse(expiry)))
+    return res.status(400).json({ error: 'expiry must be a valid ISO date string' });
+
   const updated = {
     ...user,
     email:     email     ?? user.email,
     username:  username  ?? user.username,
-    expiry:    expiry    !== undefined ? expiry : user.expiry,
-    protocols: protocols ? JSON.stringify(protocols) : user.protocols,
-    quotaMB:   quotaMB   !== undefined ? quotaMB : user.quotaMB,
+    expiry:    expiry    !== undefined ? (expiry || null) : user.expiry,
+    protocols: protocols
+      ? JSON.stringify(validation.protocols)
+      : user.protocols,
+    quotaMB:   (quotaMB !== undefined || quotaGb !== undefined)
+      ? validation.quotaMB
+      : user.quotaMB,
     updatedAt: new Date().toISOString()
   };
   if (password) {
@@ -472,22 +579,21 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   }
   upsertUser(updated);
 
-  // Blocker 7: rebuild htpasswd + reload naive; rebuild mita state
-  try { buildHtpasswd(getAllUsers()); reloadNaive(); } catch {}
-  try { applyMitaConfig(); }                          catch {}
+  // Bug 6: rebuild services and report status
+  const svcStatus = rebuildServices();
 
   const { passHash, password: _p, ...safe } = updated;
-  res.json(safe);
+  // Bug 7: return protocols as array
+  res.json({ ...parseUserRow(safe), ...svcStatus });
 });
 
 app.delete('/api/users/:id', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   deleteUser(req.params.id);
-  // Blocker 7: rebuild htpasswd + reload naive; rebuild mita state
-  try { buildHtpasswd(getAllUsers()); reloadNaive(); } catch {}
-  try { applyMitaConfig(); }                          catch {}
-  res.json({ ok: true });
+  // Bug 6: rebuild services and report status
+  const svcStatus = rebuildServices();
+  res.json({ ok: true, ...svcStatus });
 });
 
 // ── Server settings — Sprint 3 ────────────────────────────────────────────────
@@ -516,12 +622,11 @@ app.post('/api/settings/mieru-ports', requireAuth, (req, res) => {
   cfg.mieruPortStart = s; cfg.mieruPortEnd = e; saveConfig();
 
   try {
-    execSync(`ufw delete allow ${oldS}:${oldE}/tcp 2>/dev/null || true`, { timeout: 5000 });
-    execSync(`ufw delete allow ${oldS}:${oldE}/udp 2>/dev/null || true`, { timeout: 5000 });
-    execSync(`ufw allow ${s}:${e}/tcp comment "Mieru TCP" 2>/dev/null || true`, { timeout: 5000 });
-    if (cfg.udpEnabled) {
-      execSync(`ufw allow ${s}:${e}/udp comment "Mieru UDP" 2>/dev/null || true`, { timeout: 5000 });
-    }
+    // Bug 3 fix: use single-port helper to avoid UFW crash when start===end
+    ufwMieruRule('delete', oldS, oldE, 'tcp', '');
+    ufwMieruRule('delete', oldS, oldE, 'udp', '');
+    ufwMieruRule('',       s,    e,    'tcp', 'Mieru TCP');
+    if (cfg.udpEnabled) ufwMieruRule('', s, e, 'udp', 'Mieru UDP');
   } catch {}
 
   try {
@@ -554,10 +659,11 @@ app.post('/api/settings/udp-toggle', requireAuth, (req, res) => {
   cfg.udpEnabled = enable; saveConfig();
   try {
     const s = cfg.mieruPortStart, e = cfg.mieruPortEnd;
+    // Bug 3 fix: use single-port helper to avoid UFW crash when start===end
     if (enable) {
-      execSync(`ufw allow ${s}:${e}/udp comment "Mieru UDP" 2>/dev/null || true`, { timeout: 5000 });
+      ufwMieruRule('', s, e, 'udp', 'Mieru UDP');
     } else {
-      execSync(`ufw delete allow ${s}:${e}/udp 2>/dev/null || true`, { timeout: 5000 });
+      ufwMieruRule('delete', s, e, 'udp', '');
     }
   } catch {}
   try {

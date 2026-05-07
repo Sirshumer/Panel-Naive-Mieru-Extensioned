@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>Naive + Mieru by RIXXX v1.1.1</title>
+  <title>Naive + Mieru by RIXXX v1.2.2</title>
   <meta name="description" content="Panel Naive + Mieru — web management for NaiveProxy + Mieru by RIXXX" />
   <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 40 40'%3E%3Ccircle cx='20' cy='20' r='18' fill='%23c08552'/%3E%3Cpath d='M13 20h14M20 13l7 7-7 7' stroke='%23fff' stroke-width='2.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
   <link rel="preconnect" href="https://fonts.googleapis.com" />
@@ -23,10 +23,9 @@
 
   <!-- Language + Theme controls on login -->
   <div class="login-controls">
-    <button class="ctrl-btn lang-btn" id="login-lang-btn" onclick="cycleLang()" title="Switch language">RU</button>
-    <button class="ctrl-btn" id="login-theme-btn" onclick="toggleTheme()" title="Toggle theme">
-      <!-- sun icon shown in dark, moon in light -->
-      <svg id="login-theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+    <button class="ctrl-btn lang-btn" id="login-lang-btn" title="Switch language">RU</button>
+    <button class="ctrl-btn" id="login-theme-btn" title="Toggle theme">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
         <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
         <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
         <line x1="1" y1="12" x2="3" y2="12"/><line x1="21" y1="12" x2="23" y2="12"/>
@@ -63,7 +62,7 @@
                  data-i18n-ph="login.passPlaceholder"
                  placeholder="••••••••" required autocomplete="current-password"
                  aria-label="Password" />
-          <button type="button" class="btn-eye" onclick="togglePw('login-pass')">
+          <button type="button" class="btn-eye" data-action="toggle-pw" data-target="login-pass" aria-label="Toggle password visibility">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
           </button>
         </div>
@@ -95,7 +94,7 @@
       </svg>
       <div>
         <div>RIXXX Panel</div>
-        <div class="sidebar-product-label">Naive + Mieru v1.1.1</div>
+        <div class="sidebar-product-label">Naive + Mieru v1.2.2</div>
       </div>
     </div>
     <nav class="sidebar-nav">
@@ -130,7 +129,7 @@
         <div class="sidebar-username" id="sidebar-uname">admin</div>
         <div class="sidebar-role" data-i18n="nav.administrator">Administrator</div>
       </div>
-      <button class="btn-logout" onclick="logout()" title="Logout">
+      <button class="btn-logout" id="btn-logout" title="Logout" aria-label="Logout">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/></svg>
       </button>
     </div>
@@ -139,17 +138,15 @@
   <!-- Main content -->
   <main class="main-content">
     <header class="topbar">
-      <button class="menu-toggle" id="menu-toggle" onclick="toggleSidebar()">
+      <button class="menu-toggle" id="menu-toggle" aria-label="Toggle sidebar">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><line x1="3" y1="12" x2="21" y2="12"/><line x1="3" y1="6" x2="21" y2="6"/><line x1="3" y1="18" x2="21" y2="18"/></svg>
       </button>
       <h2 class="topbar-title" id="topbar-title" data-i18n="nav.dashboard">Dashboard</h2>
       <div class="topbar-right">
         <div class="status-dot" id="ws-dot" title="Real-time connection"></div>
-        <span class="topbar-version" id="topbar-version">v1.1.1</span>
-        <!-- Language toggle -->
-        <button class="ctrl-btn lang-btn" id="topbar-lang-btn" onclick="cycleLang()" title="Switch language">RU</button>
-        <!-- Theme toggle -->
-        <button class="ctrl-btn" id="topbar-theme-btn" onclick="toggleTheme()" title="Toggle theme">
+        <span class="topbar-version" id="topbar-version">v1.2.2</span>
+        <button class="ctrl-btn lang-btn" id="topbar-lang-btn" title="Switch language">RU</button>
+        <button class="ctrl-btn" id="topbar-theme-btn" title="Toggle theme">
           <svg id="topbar-theme-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
             <circle cx="12" cy="12" r="5"/><line x1="12" y1="1" x2="12" y2="3"/><line x1="12" y1="21" x2="12" y2="23"/>
             <line x1="4.22" y1="4.22" x2="5.64" y2="5.64"/><line x1="18.36" y1="18.36" x2="19.78" y2="19.78"/>
@@ -172,9 +169,9 @@
             <div class="stat-value" id="d-naive-status">—</div>
           </div>
           <div class="stat-actions">
-            <button class="btn btn-xs btn-success" onclick="svcAction('caddy-naive','start')" data-i18n="dashboard.start">Start</button>
-            <button class="btn btn-xs btn-warning" onclick="svcAction('caddy-naive','restart')" data-i18n="dashboard.restart">Restart</button>
-            <button class="btn btn-xs btn-danger"  onclick="svcAction('caddy-naive','stop')" data-i18n="dashboard.stop">Stop</button>
+            <button class="btn btn-xs btn-success"  data-action="svc" data-svc="naive" data-svc-action="start"   data-i18n="dashboard.start">Start</button>
+            <button class="btn btn-xs btn-warning"  data-action="svc" data-svc="naive" data-svc-action="restart" data-i18n="dashboard.restart">Restart</button>
+            <button class="btn btn-xs btn-danger"   data-action="svc" data-svc="naive" data-svc-action="stop"    data-i18n="dashboard.stop">Stop</button>
           </div>
         </div>
         <div class="stat-card">
@@ -186,9 +183,9 @@
             <div class="stat-value" id="d-mieru-status">—</div>
           </div>
           <div class="stat-actions">
-            <button class="btn btn-xs btn-success" onclick="svcAction('mita','start')" data-i18n="dashboard.start">Start</button>
-            <button class="btn btn-xs btn-warning" onclick="svcAction('mita','restart')" data-i18n="dashboard.restart">Restart</button>
-            <button class="btn btn-xs btn-danger"  onclick="svcAction('mita','stop')" data-i18n="dashboard.stop">Stop</button>
+            <button class="btn btn-xs btn-success"  data-action="svc" data-svc="mita" data-svc-action="start"   data-i18n="dashboard.start">Start</button>
+            <button class="btn btn-xs btn-warning"  data-action="svc" data-svc="mita" data-svc-action="restart" data-i18n="dashboard.restart">Restart</button>
+            <button class="btn btn-xs btn-danger"   data-action="svc" data-svc="mita" data-svc-action="stop"    data-i18n="dashboard.stop">Stop</button>
           </div>
         </div>
         <div class="stat-card">
@@ -258,7 +255,7 @@
     <section id="page-users" class="content-page">
       <div class="page-header">
         <h3 data-i18n="users.title">Users</h3>
-        <button class="btn btn-primary" onclick="openAddUser()">
+        <button class="btn btn-primary" id="btn-add-user" data-action="open-add-user">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="16" height="16"><line x1="12" y1="5" x2="12" y2="19"/><line x1="5" y1="12" x2="19" y2="12"/></svg>
           <span data-i18n="users.addUser">Add User</span>
         </button>
@@ -293,7 +290,7 @@
         <div class="modal">
           <div class="modal-header">
             <h4 id="user-modal-title" data-i18n="users.addTitle">Add User</h4>
-            <button class="modal-close" onclick="closeUserModal()">✕</button>
+            <button class="modal-close" data-action="close-user-modal" aria-label="Close">✕</button>
           </div>
           <div class="modal-body">
             <input type="hidden" id="user-id" />
@@ -312,7 +309,7 @@
                 <label data-i18n="users.passwordLabel">Password *</label>
                 <div class="input-pw-wrap">
                   <input type="password" id="u-password" data-i18n-ph="users.passwordPlaceholder" placeholder="Minimum 8 chars" />
-                  <button type="button" class="btn-eye" onclick="togglePw('u-password')">
+                  <button type="button" class="btn-eye" data-action="toggle-pw" data-target="u-password" aria-label="Toggle password visibility">
                     <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/></svg>
                   </button>
                 </div>
@@ -339,8 +336,8 @@
             <div id="user-modal-error" class="alert alert-error hidden"></div>
           </div>
           <div class="modal-footer">
-            <button class="btn btn-ghost" onclick="closeUserModal()" data-i18n="users.cancel">Cancel</button>
-            <button class="btn btn-primary" onclick="saveUser()" data-i18n="users.save">Save User</button>
+            <button class="btn btn-ghost" data-action="close-user-modal" data-i18n="users.cancel">Cancel</button>
+            <button class="btn btn-primary" id="btn-save-user" data-action="save-user" data-i18n="users.save">Save User</button>
           </div>
         </div>
       </div>
@@ -350,7 +347,7 @@
         <div class="modal modal-sm">
           <div class="modal-header">
             <h4 data-i18n="config.downloadTitle">Download Client Config</h4>
-            <button class="modal-close" onclick="closeConfigModal()">✕</button>
+            <button class="modal-close" data-action="close-config-modal" aria-label="Close">✕</button>
           </div>
           <div class="modal-body">
             <p style="margin-bottom:12px;color:var(--text-secondary);font-size:13px" data-i18n="config.passwordNote">
@@ -361,23 +358,22 @@
               <input type="password" id="cfg-password" data-i18n-ph="config.passwordPlaceholder" placeholder="User password" />
             </div>
             <div id="naive-link-box" class="code-box hidden"></div>
-            <!-- QR code container (shown after naive link generation) -->
             <div id="qr-container" class="qr-container hidden">
               <canvas id="qr-canvas"></canvas>
               <div class="qr-note" data-i18n="config.qrNote">Scan QR code with client app (iOS: ShadowRocket, Karing)</div>
             </div>
           </div>
           <div class="modal-footer">
-            <button class="btn btn-ghost" onclick="closeConfigModal()" data-i18n="config.cancel">Cancel</button>
-            <button class="btn btn-secondary" onclick="downloadNaiveLink()">
+            <button class="btn btn-ghost"      data-action="close-config-modal" data-i18n="config.cancel">Cancel</button>
+            <button class="btn btn-secondary"  data-action="dl-naive-link">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
               <span data-i18n="config.naiveLink">Naive Link</span>
             </button>
-            <button class="btn btn-secondary" onclick="downloadMieruConfig()">
+            <button class="btn btn-secondary"  data-action="dl-mieru-config">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               <span data-i18n="config.mieruJson">Mieru JSON</span>
             </button>
-            <button class="btn btn-primary" onclick="downloadUniversalConfig()">
+            <button class="btn btn-primary"    data-action="dl-universal-config">
               <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
               <span data-i18n="config.universalConfig">Universal Config</span>
             </button>
@@ -394,7 +390,7 @@
         <div class="card">
           <div class="card-header" data-i18n="settings.naivePortTitle">NaiveProxy Port</div>
           <div class="card-body">
-            <p class="card-desc" data-i18n="settings.naivePortDesc">Change the HTTPS port for NaiveProxy. Reloads Caddy only — no service restart.</p>
+            <p class="card-desc" data-i18n="settings.naivePortDesc">Change the HTTPS port for NaiveProxy. Requires service restart.</p>
             <div class="form-group">
               <label data-i18n="settings.naivePortLabel">Port (1–65535)</label>
               <input type="number" id="s-naive-port" min="1" max="65535" value="443" />
@@ -402,7 +398,7 @@
             <div class="alert alert-warning">
               <strong>⚠</strong> <span data-i18n="settings.naivePortNote">Changing port will require clients to update their configs.</span>
             </div>
-            <button class="btn btn-primary mt-2" onclick="changeNaivePort()" data-i18n="settings.applyNaivePort">Apply Naive Port</button>
+            <button class="btn btn-primary mt-2" data-action="change-naive-port" data-i18n="settings.applyNaivePort">Apply Naive Port</button>
             <div id="naive-port-msg" class="msg-inline hidden"></div>
           </div>
         </div>
@@ -424,7 +420,7 @@
             <div class="alert alert-warning">
               <strong>⚠</strong> <span data-i18n="settings.mieruPortNote">UFW rules will be updated automatically. Clients must download new configs.</span>
             </div>
-            <button class="btn btn-primary mt-2" onclick="changeMieruPorts()" data-i18n="settings.applyMieruPorts">Apply Mieru Ports</button>
+            <button class="btn btn-primary mt-2" data-action="change-mieru-ports" data-i18n="settings.applyMieruPorts">Apply Mieru Ports</button>
             <div id="mieru-port-msg" class="msg-inline hidden"></div>
           </div>
         </div>
@@ -454,7 +450,7 @@
               <label data-i18n="settings.mtuLabel">MTU (1280–1400)</label>
               <input type="number" id="s-mtu" min="1280" max="1400" value="1400" />
             </div>
-            <button class="btn btn-primary mt-2" onclick="changeTrafficPattern()" data-i18n="settings.applyPattern">Apply Pattern</button>
+            <button class="btn btn-primary mt-2" data-action="change-traffic-pattern" data-i18n="settings.applyPattern">Apply Pattern</button>
             <div id="traffic-msg" class="msg-inline hidden"></div>
           </div>
         </div>
@@ -470,7 +466,7 @@
             <div class="alert alert-warning">
               <strong>⚠</strong> <span data-i18n="settings.udpNote">UDP mode restarts Mieru. Test TCP first — it works on most networks.</span>
             </div>
-            <button class="btn btn-primary mt-2" onclick="changeUdpMode()" data-i18n="settings.applyUdp">Apply UDP Setting</button>
+            <button class="btn btn-primary mt-2" data-action="change-udp-mode" data-i18n="settings.applyUdp">Apply UDP Setting</button>
             <div id="udp-msg" class="msg-inline hidden"></div>
           </div>
         </div>
@@ -486,7 +482,7 @@
                 <option value="en">🇬🇧 English</option>
               </select>
             </div>
-            <button class="btn btn-primary mt-2" onclick="changeLanguage()" data-i18n="settings.applyLanguage">Apply</button>
+            <button class="btn btn-primary mt-2" data-action="change-language" data-i18n="settings.applyLanguage">Apply</button>
           </div>
         </div>
 
@@ -517,7 +513,7 @@
                      autocomplete="new-password"
                      aria-label="Confirm new password" />
             </div>
-            <button class="btn btn-primary" onclick="changePassword()" data-i18n="settings.changePassword">Change Password</button>
+            <button class="btn btn-primary" data-action="change-password" data-i18n="settings.changePassword">Change Password</button>
             <div id="pw-msg" class="msg-inline hidden"></div>
           </div>
         </div>
@@ -528,7 +524,7 @@
         <div class="card-body about-grid">
           <div>
             <div class="info-list">
-              <div class="info-row"><span data-i18n="settings.panelVersion">Panel Version</span><span id="about-version">v1.1.1</span></div>
+              <div class="info-row"><span data-i18n="settings.panelVersion">Panel Version</span><span id="about-version">v1.2.2</span></div>
               <div class="info-row"><span data-i18n="settings.author">Author</span><span>RIXXX</span></div>
               <div class="info-row"><span>GitHub</span><a href="https://github.com/cwash797-cmd" target="_blank">cwash797-cmd</a></div>
               <div class="info-row"><span>Telegram</span><a href="https://t.me/russian_paradice_vpn" target="_blank">@russian_paradice_vpn</a></div>
@@ -554,7 +550,7 @@
     <section id="page-monitoring" class="content-page">
       <div class="page-header">
         <h3 data-i18n="monitoring.title">Monitoring</h3>
-        <button class="btn btn-ghost btn-sm" onclick="refreshStats()">
+        <button class="btn btn-ghost btn-sm" data-action="refresh-stats">
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
           <span data-i18n="monitoring.refresh">Refresh</span>
         </button>
@@ -597,20 +593,20 @@
       <div class="page-header">
         <h3 data-i18n="logs.title">Logs</h3>
         <div class="btn-group">
-          <button class="btn btn-ghost btn-sm active" onclick="loadLogs('caddy')" id="log-btn-caddy" data-i18n="logs.caddy">Caddy</button>
-          <button class="btn btn-ghost btn-sm" onclick="loadLogs('mieru')" id="log-btn-mieru" data-i18n="logs.mieru">Mieru</button>
-          <button class="btn btn-ghost btn-sm" onclick="loadLogs('panel')" id="log-btn-panel" data-i18n="logs.panel">Panel</button>
+          <button class="btn btn-ghost btn-sm active" data-action="load-logs" data-log-svc="caddy" id="log-btn-caddy" data-i18n="logs.naive">Naive</button>
+          <button class="btn btn-ghost btn-sm"        data-action="load-logs" data-log-svc="mieru" id="log-btn-mieru" data-i18n="logs.mieru">Mieru</button>
+          <button class="btn btn-ghost btn-sm"        data-action="load-logs" data-log-svc="panel" id="log-btn-panel" data-i18n="logs.panel">Panel</button>
         </div>
       </div>
       <div class="card">
         <div class="log-toolbar">
-          <select id="log-lines" onchange="loadLogs(currentLogService)">
-            <option value="50" data-i18n="logs.lines50">50 lines</option>
+          <select id="log-lines">
+            <option value="50"  data-i18n="logs.lines50">50 lines</option>
             <option value="100" selected data-i18n="logs.lines100">100 lines</option>
             <option value="200" data-i18n="logs.lines200">200 lines</option>
             <option value="500" data-i18n="logs.lines500">500 lines</option>
           </select>
-          <button class="btn btn-ghost btn-sm" onclick="loadLogs(currentLogService)">
+          <button class="btn btn-ghost btn-sm" data-action="refresh-logs">
             <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><polyline points="23 4 23 10 17 10"/><path d="M20.49 15a9 9 0 1 1-2.12-9.36L23 10"/></svg>
             <span data-i18n="logs.refresh">Refresh</span>
           </button>
@@ -623,7 +619,7 @@
     <section id="page-diagnostics" class="content-page">
       <div class="page-header">
         <h3 data-i18n="diagnostics.title">Diagnostics</h3>
-        <button class="btn btn-primary btn-sm" onclick="runDiagnostics()" data-i18n="diagnostics.runChecks">Run Checks</button>
+        <button class="btn btn-primary btn-sm" data-action="run-diagnostics" data-i18n="diagnostics.runChecks">Run Checks</button>
       </div>
       <div class="grid grid-2">
         <div class="card">

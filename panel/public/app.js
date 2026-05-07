@@ -1,6 +1,7 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.2.0
- * Features: i18n (ru/en), dark/light theme, QR codes, all 6 sprints
+ * Panel Naive + Mieru — Frontend Application v1.2.2
+ * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
+ * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  */
 'use strict';
 
@@ -38,21 +39,17 @@ function t(key, vars) {
 }
 
 function applyI18n() {
-  // Text content
   document.querySelectorAll('[data-i18n]').forEach(el => {
     const key = el.getAttribute('data-i18n');
     const translated = t(key);
     if (translated !== key) el.textContent = translated;
   });
-  // Placeholder attributes
   document.querySelectorAll('[data-i18n-ph]').forEach(el => {
     const key = el.getAttribute('data-i18n-ph');
     const translated = t(key);
     if (translated !== key) el.placeholder = translated;
   });
-  // HTML lang attribute
   document.documentElement.lang = currentLang;
-  // Update lang button labels
   const label = currentLang.toUpperCase();
   ['login-lang-btn', 'topbar-lang-btn'].forEach(id => {
     const btn = document.getElementById(id);
@@ -80,7 +77,6 @@ let currentTheme = 'dark';
 function applyTheme(theme) {
   currentTheme = theme;
   document.documentElement.setAttribute('data-theme', theme);
-  // Update all theme toggle icons (dark mode shows sun to switch to light, light shows moon)
   const isDark = theme === 'dark';
   const iconHtml = isDark ? SUN_SVG : MOON_SVG;
   ['login-theme-btn', 'topbar-theme-btn'].forEach(id => {
@@ -105,7 +101,6 @@ async function setLang(lang) {
   currentLang = lang;
   await loadLocale(lang);
   applyI18n();
-  // Refresh page titles & dynamic content
   if (state.authenticated) {
     const titles = buildTitles();
     const titleEl = document.getElementById('topbar-title');
@@ -150,7 +145,7 @@ const state = {
 let currentLogService = 'caddy';
 
 // ══════════════════════════════════════════════════════════════
-// INIT
+// INIT — wire ALL event listeners here (Bug 1: no inline handlers)
 // ══════════════════════════════════════════════════════════════
 
 document.addEventListener('DOMContentLoaded', async () => {
@@ -161,7 +156,26 @@ document.addEventListener('DOMContentLoaded', async () => {
   applyTheme(savedTheme);
   await setLang(savedLang);
 
-  // Check existing session
+  // ── Delegated click handler (Bug 1) ──────────────────────────
+  document.addEventListener('click', handleDelegatedClick);
+
+  // ── Log-lines select change (Bug 1: was onchange inline) ─────
+  document.getElementById('log-lines')?.addEventListener('change', () => {
+    loadLogs(currentLogService);
+  });
+
+  // ── Login form ────────────────────────────────────────────────
+  document.getElementById('login-form').addEventListener('submit', handleLogin);
+
+  // ── Sidebar navigation ────────────────────────────────────────
+  document.querySelectorAll('.nav-item').forEach(el => {
+    el.addEventListener('click', e => {
+      e.preventDefault();
+      navigateTo(el.dataset.page);
+    });
+  });
+
+  // ── Check existing session ────────────────────────────────────
   fetch('/api/me')
     .then(r => r.ok ? r.json() : null)
     .then(data => {
@@ -172,17 +186,79 @@ document.addEventListener('DOMContentLoaded', async () => {
       }
     })
     .catch(() => {});
+});
 
-  // Login form
-  document.getElementById('login-form').addEventListener('submit', handleLogin);
+/**
+ * Central delegated click dispatcher — handles ALL data-action buttons
+ * This replaces every inline onclick="..." in the HTML (Bug 1 fix)
+ */
+function handleDelegatedClick(e) {
+  const btn = e.target.closest('[data-action]');
+  if (!btn) return;
+  const action = btn.dataset.action;
 
-  // Navigation
-  document.querySelectorAll('.nav-item').forEach(el => {
-    el.addEventListener('click', e => {
-      e.preventDefault();
-      navigateTo(el.dataset.page);
-    });
+  switch (action) {
+    // ── Global controls
+    case 'toggle-pw':        togglePw(btn.dataset.target); break;
+    case 'cycle-lang':       cycleLang(); break;
+    case 'toggle-theme':     toggleTheme(); break;
+
+    // ── Auth
+    case 'logout':           logout(); break;
+
+    // ── Sidebar toggle (mobile)
+    case 'toggle-sidebar':   toggleSidebar(); break;
+
+    // ── Users page
+    case 'open-add-user':    openAddUser(); break;
+    case 'close-user-modal': closeUserModal(); break;
+    case 'save-user':        saveUser(); break;
+    case 'edit-user':        openEditUser(btn.dataset.id); break;
+    case 'delete-user':      deleteUser(btn.dataset.id, btn.dataset.username); break;
+    case 'open-config':      openConfigDownload(btn.dataset.id); break;
+    case 'close-config-modal': closeConfigModal(); break;
+    case 'dl-naive-link':    downloadNaiveLink(); break;
+    case 'dl-mieru-config':  downloadMieruConfig(); break;
+    case 'dl-universal-config': downloadUniversalConfig(); break;
+
+    // ── Dashboard service buttons
+    case 'svc':              svcAction(btn.dataset.svc, btn.dataset.svcAction); break;
+
+    // ── Settings page
+    case 'change-naive-port':    changeNaivePort(); break;
+    case 'change-mieru-ports':   changeMieruPorts(); break;
+    case 'change-traffic-pattern': changeTrafficPattern(); break;
+    case 'change-udp-mode':      changeUdpMode(); break;
+    case 'change-language':      changeLanguage(); break;
+    case 'change-password':      changePassword(); break;
+
+    // ── Monitoring
+    case 'refresh-stats':    refreshStats(); break;
+
+    // ── Logs
+    case 'load-logs':        loadLogs(btn.dataset.logSvc); break;
+    case 'refresh-logs':     loadLogs(currentLogService); break;
+
+    // ── Diagnostics
+    case 'run-diagnostics':  runDiagnostics(); break;
+
+    // ── Login / topbar lang + theme (also wired via data-action on the buttons)
+    case 'lang':             cycleLang(); break;
+    case 'theme':            toggleTheme(); break;
+  }
+}
+
+// Wire lang + theme buttons via data-action (added as fallback; buttons already
+// have data-action so the delegated handler above covers them too)
+document.addEventListener('DOMContentLoaded', () => {
+  ['login-lang-btn', 'topbar-lang-btn'].forEach(id => {
+    document.getElementById(id)?.setAttribute('data-action', 'cycle-lang');
   });
+  ['login-theme-btn', 'topbar-theme-btn'].forEach(id => {
+    document.getElementById(id)?.setAttribute('data-action', 'toggle-theme');
+  });
+  document.getElementById('btn-logout')    ?.setAttribute('data-action', 'logout');
+  document.getElementById('menu-toggle')   ?.setAttribute('data-action', 'toggle-sidebar');
 });
 
 // ══════════════════════════════════════════════════════════════
@@ -197,7 +273,7 @@ async function handleLogin(e) {
   const password = document.getElementById('login-pass').value;
 
   btn.disabled = true;
-  btn.innerHTML = `<span>${t('login.signingIn')}</span>`;
+  btn.innerHTML = `<span>${t('login.signingIn') || '…'}</span>`;
   err.classList.add('hidden');
 
   try {
@@ -271,7 +347,6 @@ function navigateTo(page) {
 function toggleSidebar() {
   const sidebar = document.getElementById('sidebar');
   sidebar.classList.toggle('open');
-  // Manage overlay
   let overlay = document.getElementById('sidebar-overlay');
   if (!overlay) {
     overlay = document.createElement('div');
@@ -293,7 +368,7 @@ function toggleSidebar() {
 async function loadConfig() {
   try {
     state.config = await api('GET', '/api/config');
-    document.getElementById('topbar-version').textContent = `v${state.config.version || '1.1.1'}`;
+    document.getElementById('topbar-version').textContent = `v${state.config.version || '1.2.2'}`;
   } catch {}
 }
 
@@ -311,7 +386,7 @@ async function loadDashboard() {
     el('d-mieru-status').innerHTML = badge(status.services.mieru.active,
       t('dashboard.active'), t('dashboard.inactive'));
     el('d-user-count').textContent = status.panel.userCount;
-    el('d-domain').textContent      = status.domain || '—';
+    el('d-domain').textContent     = status.domain || '—';
 
     const cpu = status.system.cpuPercent || 0;
     el('d-cpu').textContent = `${cpu}%`;
@@ -339,7 +414,7 @@ async function loadDashboard() {
       [t('dashboard.mieruVersion'), status.services.mieru.version || '—'],
     ]);
 
-    document.getElementById('about-version').textContent = `v${status.panel.version || '1.1.1'}`;
+    document.getElementById('about-version').textContent = `v${status.panel.version || '1.2.2'}`;
   } catch (err) {
     console.error('Dashboard error:', err);
   }
@@ -367,7 +442,8 @@ function renderUsersTable(users) {
     return;
   }
   tbody.innerHTML = users.map(u => {
-    const protocols = Array.isArray(u.protocols) ? u.protocols : JSON.parse(u.protocols || '[]');
+    // Bug 7 fix: protocols is already an array from server (parsed in GET /api/users)
+    const protocols = Array.isArray(u.protocols) ? u.protocols : safeParseJSON(u.protocols, []);
     const hasNaive  = protocols.includes('naive');
     const hasMieru  = protocols.includes('mieru');
     const expBadge  = u.expiry
@@ -381,6 +457,7 @@ function renderUsersTable(users) {
       ? `<div class="quota-bar"><div class="quota-fill${quotaPct>80?' warn':''}" style="width:${quotaPct}%"></div></div> ${quotaPct}%`
       : `<span class="badge badge-gray">${t('users.unlimited')}</span>`;
 
+    // Bug 1 fix: use data-action + data-id instead of onclick="..."
     return `<tr>
       <td><strong>${esc(u.username)}</strong></td>
       <td>${esc(u.email)}</td>
@@ -393,9 +470,9 @@ function renderUsersTable(users) {
       <td>${fmtLastSeen(u.lastSeen)}</td>
       <td>
         <div style="display:flex;gap:4px;flex-wrap:wrap">
-          <button class="btn btn-xs btn-secondary" onclick="openEditUser('${u.id}')">${t('users.edit')}</button>
-          <button class="btn btn-xs btn-ghost"     onclick="openConfigDownload('${u.id}')">${t('users.config')}</button>
-          <button class="btn btn-xs btn-danger"    onclick="deleteUser('${u.id}','${esc(u.username)}')">${t('users.delete')}</button>
+          <button class="btn btn-xs btn-secondary" data-action="edit-user"   data-id="${u.id}">${t('users.edit')}</button>
+          <button class="btn btn-xs btn-ghost"     data-action="open-config" data-id="${u.id}">${t('users.config')}</button>
+          <button class="btn btn-xs btn-danger"    data-action="delete-user" data-id="${u.id}" data-username="${esc(u.username)}">${t('users.delete')}</button>
         </div>
       </td>
     </tr>`;
@@ -422,7 +499,8 @@ function openEditUser(id) {
   const user = state.users.find(u => u.id === id);
   if (!user) return;
   state.selectedUserId = id;
-  const protocols = Array.isArray(user.protocols) ? user.protocols : JSON.parse(user.protocols || '[]');
+  // Bug 7 fix: protocols already an array from server
+  const protocols = Array.isArray(user.protocols) ? user.protocols : safeParseJSON(user.protocols, []);
 
   el('user-modal-title').textContent = t('users.editTitle');
   el('user-id').value    = id;
@@ -451,21 +529,27 @@ async function saveUser() {
   if (el('p-naive').checked) protocols.push('naive');
   if (el('p-mieru').checked) protocols.push('mieru');
 
-  if (!username || !email) return showUserError(t('users.usernameRequired'));
-  if (!id && !password)    return showUserError(t('users.passwordRequired'));
+  if (!username || !email)  return showUserError(t('users.usernameRequired'));
+  if (!id && !password)     return showUserError(t('users.passwordRequired'));
   if (password && password.length < 8) return showUserError(t('users.passwordTooShort'));
-  if (!protocols.length)   return showUserError(t('users.protocolRequired'));
+  if (!protocols.length)    return showUserError(t('users.protocolRequired'));
 
   const body = { email, username, expiry, protocols, quotaMB };
   if (password) body.password = password;
 
   try {
     if (id) {
-      await api('PUT', `/api/users/${id}`, body);
+      const res = await api('PUT', `/api/users/${id}`, body);
       toast(t('users.updated'), 'success');
+      if (res.servicesReloaded === false) {
+        toast(t('users.serviceReloadWarning') || 'Service reload failed — check logs', 'error');
+      }
     } else {
-      await api('POST', '/api/users', body);
+      const res = await api('POST', '/api/users', body);
       toast(t('users.created'), 'success');
+      if (res.servicesReloaded === false) {
+        toast(t('users.serviceReloadWarning') || 'Service reload failed — check logs', 'error');
+      }
     }
     closeUserModal();
     loadUsers();
@@ -511,14 +595,12 @@ async function downloadNaiveLink() {
   if (!password) { toast(t('config.enterPassword'), 'error'); return; }
   try {
     const data = await api('GET',
-      `/api/users/${state.selectedUserId}/naive-link?password=${encodeURIComponent(password)}`);
+      `/api/users/${state.selectedUserId}/config/naive?password=${encodeURIComponent(password)}`);
 
     el('naive-link-box').textContent = data.link;
     el('naive-link-box').classList.remove('hidden');
     copyToClipboard(data.link);
     toast(t('config.naiveCopied'), 'success');
-
-    // Generate QR code for the Naive link
     generateQR(data.link);
   } catch (err) { toast(err.message, 'error'); }
 }
@@ -528,12 +610,10 @@ async function generateQR(text) {
   const canvas    = el('qr-canvas');
   if (!container || !canvas) return;
 
-  // Try QRCode library (loaded from CDN in index.html)
   if (typeof QRCode !== 'undefined') {
     try {
       await QRCode.toCanvas(canvas, text, {
-        width: 200,
-        margin: 2,
+        width: 200, margin: 2,
         color: {
           dark:  currentTheme === 'dark' ? '#e4e4e7' : '#18181b',
           light: currentTheme === 'dark' ? '#1a1a1d' : '#f5f5f7',
@@ -551,7 +631,9 @@ async function downloadMieruConfig() {
   if (!password) { toast(t('config.enterPassword'), 'error'); return; }
   try {
     const res = await fetch(
-      `/api/users/${state.selectedUserId}/mieru-config?password=${encodeURIComponent(password)}`);
+      `/api/users/${state.selectedUserId}/config/mieru?password=${encodeURIComponent(password)}`,
+      { credentials: 'include' });
+    if (res.status === 401) { redirectToLogin(); return; }
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
     const cd   = res.headers.get('Content-Disposition') || '';
@@ -566,7 +648,9 @@ async function downloadUniversalConfig() {
   if (!password) { toast(t('config.enterPassword'), 'error'); return; }
   try {
     const res = await fetch(
-      `/api/users/${state.selectedUserId}/universal-config?password=${encodeURIComponent(password)}`);
+      `/api/users/${state.selectedUserId}/config/universal?password=${encodeURIComponent(password)}`,
+      { credentials: 'include' });
+    if (res.status === 401) { redirectToLogin(); return; }
     if (!res.ok) throw new Error(await res.text());
     const blob = await res.blob();
     const cd   = res.headers.get('Content-Disposition') || '';
@@ -584,7 +668,7 @@ async function loadSettings() {
   try {
     const cfg = await api('GET', '/api/config');
     state.config = cfg;
-    el('s-naive-port').value  = cfg.naivePort    || 443;
+    el('s-naive-port').value  = cfg.naivePort     || 443;
     el('s-mieru-start').value = cfg.mieruPortStart || 2012;
     el('s-mieru-end').value   = cfg.mieruPortEnd   || 2022;
     el('s-mtu').value         = cfg.mtu || 1400;
@@ -595,17 +679,20 @@ async function loadSettings() {
     if (udpBox) udpBox.checked = cfg.udpEnabled === true;
     const langSel = el('s-language-select');
     if (langSel) langSel.value = cfg.language || currentLang || 'ru';
-    document.getElementById('about-version').textContent = `v${cfg.version || '1.1.1'}`;
+    document.getElementById('about-version').textContent = `v${cfg.version || '1.2.2'}`;
   } catch {}
 }
 
 async function changeNaivePort() {
   const port = parseInt(el('s-naive-port').value, 10);
+  if (!port || port < 1 || port > 65535) {
+    showMsg('naive-port-msg', t('settings.invalidPort') || 'Invalid port (1–65535)', false); return;
+  }
   try {
     const res = await api('POST', '/api/settings/naive-port', { port });
     showMsg('naive-port-msg', res.message || 'Port updated', true);
     state.config.naivePort = port;
-    toast(t('toast.naivePortUpdated'), 'info');
+    toast(t('toast.naivePortUpdated') || `NaiveProxy port → ${port}`, 'info');
   } catch (err) {
     showMsg('naive-port-msg', err.message, false);
   }
@@ -614,11 +701,11 @@ async function changeNaivePort() {
 async function changeMieruPorts() {
   const portStart = parseInt(el('s-mieru-start').value, 10);
   const portEnd   = parseInt(el('s-mieru-end').value, 10);
-  if (!confirm(t('settings.mieruPortConfirm'))) return;
+  if (!confirm(t('settings.mieruPortConfirm') || 'Apply Mieru port change?')) return;
   try {
     const res = await api('POST', '/api/settings/mieru-ports', { portStart, portEnd });
     showMsg('mieru-port-msg', res.message || 'Ports updated', true);
-    toast(t('toast.mieruPortsUpdated'), 'info');
+    toast(t('toast.mieruPortsUpdated') || `Mieru ports → ${portStart}–${portEnd}`, 'info');
   } catch (err) {
     showMsg('mieru-port-msg', err.message, false);
   }
@@ -630,7 +717,7 @@ async function changeUdpMode() {
     const res = await api('POST', '/api/settings/udp-toggle', { enabled });
     showMsg('udp-msg', res.message || t('settings.udpUpdated'), true);
     state.config.udpEnabled = enabled;
-    toast(t('settings.udpUpdated'), 'info');
+    toast(t('settings.udpUpdated') || `UDP ${enabled ? 'enabled' : 'disabled'}`, 'info');
   } catch (err) {
     showMsg('udp-msg', err.message, false);
   }
@@ -642,7 +729,7 @@ async function changeTrafficPattern() {
   try {
     const res = await api('POST', '/api/settings/traffic-pattern', { pattern, mtu });
     showMsg('traffic-msg', `${t('settings.trafficPatternLabel')}: ${res.pattern}, MTU: ${res.mtu}`, true);
-    toast(t('toast.trafficPatternUpdated'), 'success');
+    toast(t('toast.trafficPatternUpdated') || 'Traffic pattern updated', 'success');
   } catch (err) {
     showMsg('traffic-msg', err.message, false);
   }
@@ -652,9 +739,12 @@ async function changePassword() {
   const current  = el('s-cur-pass').value;
   const newPass  = el('s-new-pass').value;
   const confirm2 = el('s-new-pass2').value;
-  if (!current || !newPass || !confirm2) return showMsg('pw-msg', t('settings.allFieldsRequired'), false);
-  if (newPass !== confirm2)  return showMsg('pw-msg', t('settings.passwordMismatch'),  false);
-  if (newPass.length < 8)   return showMsg('pw-msg', t('settings.passwordTooShort'),  false);
+  if (!current || !newPass || !confirm2)
+    return showMsg('pw-msg', t('settings.allFieldsRequired'), false);
+  if (newPass !== confirm2)
+    return showMsg('pw-msg', t('settings.passwordMismatch'), false);
+  if (newPass.length < 8)
+    return showMsg('pw-msg', t('settings.passwordTooShort'), false);
   try {
     await api('POST', '/api/config/password', { current, newPass });
     showMsg('pw-msg', t('settings.passwordChanged'), true);
@@ -674,7 +764,7 @@ async function changeLanguage() {
   try {
     await api('POST', '/api/settings/language', { language: lang });
     await setLang(lang);
-    toast(t('settings.applyLanguage') + ': ' + lang.toUpperCase(), 'success');
+    toast((t('settings.applyLanguage') || 'Language') + ': ' + lang.toUpperCase(), 'success');
   } catch (err) {
     toast(err.message, 'error');
   }
@@ -742,14 +832,14 @@ function renderTrafficTable(stats) {
 // ══════════════════════════════════════════════════════════════
 
 async function loadLogs(service) {
-  currentLogService = service;
+  currentLogService = service || currentLogService;
   ['caddy', 'mieru', 'panel'].forEach(s => {
-    el(`log-btn-${s}`)?.classList.toggle('active', s === service);
+    el(`log-btn-${s}`)?.classList.toggle('active', s === currentLogService);
   });
   const lines = el('log-lines')?.value || 100;
-  el('log-content').textContent = t('logs.loading');
+  el('log-content').textContent = t('logs.loading') || 'Loading…';
   try {
-    const data = await api('GET', `/api/logs/${service}?lines=${lines}`);
+    const data = await api('GET', `/api/logs/${currentLogService}?lines=${lines}`);
     el('log-content').textContent = data.logs || '(empty)';
     el('log-content').scrollTop = el('log-content').scrollHeight;
   } catch (err) {
@@ -762,10 +852,10 @@ async function loadLogs(service) {
 // ══════════════════════════════════════════════════════════════
 
 async function runDiagnostics() {
-  el('diag-ports').innerHTML  = `<p class="text-muted">${t('diagnostics.checking')}</p>`;
-  el('diag-config').innerHTML = `<p class="text-muted">${t('diagnostics.checking')}</p>`;
-  el('diag-mita-status').textContent = t('logs.loading');
-  el('diag-mita-config').textContent = t('logs.loading');
+  el('diag-ports').innerHTML  = `<p class="text-muted">${t('diagnostics.checking') || '…'}</p>`;
+  el('diag-config').innerHTML = `<p class="text-muted">${t('diagnostics.checking') || '…'}</p>`;
+  el('diag-mita-status').textContent = t('logs.loading') || '…';
+  el('diag-mita-config').textContent = t('logs.loading') || '…';
 
   try {
     const data = await api('GET', '/api/diagnostics');
@@ -786,12 +876,17 @@ async function runDiagnostics() {
         </div>
       </div>`;
 
-    el('diag-config').innerHTML = data.caddyConfigValid
-      ? `<span class="badge badge-green">${t('diagnostics.caddyValid')}</span>`
-      : `<span class="badge badge-red">${t('diagnostics.caddyInvalid')}</span><pre class="mini-log mt-2">${esc(data.caddyConfigError || '')}</pre>`;
+    // Bug 2 notice: show naive version / config status instead of "caddy valid"
+    const naiveOk = data.naiveVersionOk && data.naiveConfigExists;
+    el('diag-config').innerHTML = naiveOk
+      ? `<span class="badge badge-green">${t('diagnostics.naiveValid') || 'naive OK'}</span>
+         <small style="display:block;margin-top:4px;color:var(--text-muted)">${esc(data.naiveVersion || '')}</small>
+         <small style="color:var(--text-muted)">htpasswd users: ${data.htpasswdUsers || 0}</small>`
+      : `<span class="badge badge-red">${t('diagnostics.naiveInvalid') || 'naive WARN'}</span>
+         <pre class="mini-log mt-2">${esc(data.naiveVersion || 'binary not found or version empty')}</pre>`;
 
-    el('diag-mita-status').textContent = data.mitaStatus  || t('diagnostics.noOutput');
-    el('diag-mita-config').textContent = data.mitaConfig  || t('diagnostics.noOutput');
+    el('diag-mita-status').textContent = data.mitaStatus  || t('diagnostics.noOutput') || '—';
+    el('diag-mita-config').textContent = data.mitaConfig  || t('diagnostics.noOutput') || '—';
   } catch (err) {
     toast(err.message, 'error');
   }
@@ -804,10 +899,10 @@ async function runDiagnostics() {
 async function svcAction(service, action) {
   try {
     await api('POST', `/api/service/${service}/${action}`);
-    toast(t('service.actionOk', { service, action }), 'success');
+    toast(t('service.actionOk', { service, action }) || `${service} ${action} OK`, 'success');
     setTimeout(loadDashboard, 1500);
   } catch (err) {
-    toast(t('service.actionFail', { service, action, msg: err.message }), 'error');
+    toast(t('service.actionFail', { service, action, msg: err.message }) || err.message, 'error');
   }
 }
 
@@ -860,7 +955,7 @@ function connectWebSocket() {
 }
 
 // ══════════════════════════════════════════════════════════════
-// HTTP HELPER
+// HTTP HELPER (Bug 10: 401 auto-redirect; toast on all errors)
 // ══════════════════════════════════════════════════════════════
 
 async function api(method, path, body) {
@@ -872,14 +967,33 @@ async function api(method, path, body) {
   if (body) opts.body = JSON.stringify(body);
 
   const res  = await fetch(path, opts);
+
+  // Bug 10: auto-redirect on 401
+  if (res.status === 401) {
+    redirectToLogin();
+    throw new Error(t('login.invalidCreds') || 'Session expired');
+  }
+
   const ct   = res.headers.get('Content-Type') || '';
   const data = ct.includes('json') ? await res.json() : await res.text();
 
   if (!res.ok) {
     const msg = (typeof data === 'object' && data.error) ? data.error : String(data);
-    throw new Error(msg || `HTTP ${res.status}`);
+    const errMsg = msg || `HTTP ${res.status}`;
+    toast(errMsg, 'error');   // Bug 10: always show toast on error
+    throw new Error(errMsg);
   }
   return data;
+}
+
+// Redirect back to login screen (Bug 10)
+function redirectToLogin() {
+  if (!state.authenticated) return;
+  state.authenticated = false;
+  if (state.ws) { state.ws.close(); state.ws = null; }
+  document.getElementById('app').classList.add('hidden');
+  document.getElementById('page-login').classList.add('active');
+  toast(t('login.sessionExpired') || 'Session expired — please log in again', 'error');
 }
 
 // ══════════════════════════════════════════════════════════════
@@ -893,6 +1007,11 @@ function esc(str) {
   return String(str)
     .replace(/&/g, '&amp;').replace(/</g, '&lt;')
     .replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+}
+
+/** Safe JSON.parse with fallback */
+function safeParseJSON(str, fallback) {
+  try { return JSON.parse(str); } catch { return fallback; }
 }
 
 function badge(active, trueLabel, falseLabel) {
@@ -933,7 +1052,7 @@ function fmtDate(iso) {
   } catch { return iso; }
 }
 
-// Blocker 14: show "Last seen N min/h/d ago" instead of raw ISO date
+/** Blocker 14: "Last seen N min/h/d ago" */
 function fmtLastSeen(iso) {
   if (!iso) return '—';
   try {
@@ -941,13 +1060,9 @@ function fmtLastSeen(iso) {
     if (diffMs < 0) return fmtDate(iso);
     const diffMin = Math.floor(diffMs / 60000);
     if (diffMin < 1)  return currentLang === 'ru' ? 'только что' : 'just now';
-    if (diffMin < 60) return currentLang === 'ru'
-      ? `${diffMin} мин. назад`
-      : `${diffMin} min ago`;
+    if (diffMin < 60) return currentLang === 'ru' ? `${diffMin} мин. назад` : `${diffMin} min ago`;
     const diffH = Math.floor(diffMin / 60);
-    if (diffH < 24)   return currentLang === 'ru'
-      ? `${diffH} ч. назад`
-      : `${diffH}h ago`;
+    if (diffH < 24)   return currentLang === 'ru' ? `${diffH} ч. назад`   : `${diffH}h ago`;
     const diffD = Math.floor(diffH / 24);
     return currentLang === 'ru' ? `${diffD} д. назад` : `${diffD}d ago`;
   } catch { return iso; }
@@ -1002,6 +1117,7 @@ function downloadBlob(blob, filename) {
 
 function toast(message, type = 'info') {
   const container = document.getElementById('toast-container');
+  if (!container) return;
   const t_el = document.createElement('div');
   t_el.className = `toast ${type}`;
   const icons = { success: '✓', error: '✗', info: 'ℹ' };
