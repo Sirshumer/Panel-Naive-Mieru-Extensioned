@@ -1,6 +1,6 @@
 'use strict';
 /**
- * caddyTemplate.js — canonical Caddyfile renderer  v1.2.5
+ * caddyTemplate.js — canonical Caddyfile renderer  v1.2.6
  *
  * Single source of truth used by:
  *   • panel/server/index.js   → buildCaddyfile()
@@ -46,6 +46,7 @@ const crypto = require('crypto');
  *   .fakeSiteDir  {string}  path to fake-site root
  *   .probeSecret  {string}  probe_resistance token (optional)
  *   .logFile      {string}  caddy access log path (optional)
+ *   .upstream     {string}  upstream proxy URL, e.g. https://user:pass@exit.example.com:443 (optional)
  * @param {Array<{username:string, password:string}>} naiveUsers
  *   Users with naive protocol enabled.  password must be the PLAINTEXT
  *   password (caddy-forwardproxy-naive hashes it internally).
@@ -83,6 +84,12 @@ function render(cfg, naiveUsers) {
     ? `\n    probe_resistance ${probeSecret}`
     : '';
 
+  // ── v1.2.6: cascade — upstream proxy support ──────────────────────────────
+  const upstreamUrl = (cfg.upstream || '').trim();
+  const upstreamLine = upstreamUrl
+    ? `\n    upstream ${upstreamUrl}`
+    : '';
+
   // ── Bug 28: no redundant  tls <email>  inside the site block  ────────────
   // Caddy's automatic HTTPS handles TLS for domains that resolve to this
   // server's IP.  The global  email  directive supplies the ACME account.
@@ -117,7 +124,7 @@ ${domain}:${port} {
       # Bug 29: order — credentials → hide_ip → hide_via → probe_resistance
 ${authLines}
       hide_ip
-      hide_via${probeLine}
+      hide_via${probeLine}${upstreamLine}
     }
     file_server {
       root ${fakeSite}

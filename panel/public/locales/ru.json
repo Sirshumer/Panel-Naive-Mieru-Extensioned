@@ -176,7 +176,21 @@
     "clientApps": "Клиентские приложения",
     "languageTitle": "Язык интерфейса",
     "languageDesc": "Выберите язык веб-панели. Настройка сохраняется в браузере.",
-    "applyLanguage": "Применить"
+    "applyLanguage": "Применить",
+    "cascadeTitle": "Каскад / Relay",
+    "cascadeDesc": "Настройка relay: трафик идёт через этот сервер (entry) на выходной сервер (exit), а затем в интернет.",
+    "cascadeEnable": "Включить каскад (relay)",
+    "cascadeNaiveUpstreamLabel": "Naive upstream URL",
+    "cascadeNaiveUpstreamHint": "Формат: https://user:pass@host:port",
+    "cascadeMieruHostLabel": "Mieru exit host (SOCKS5)",
+    "cascadeMieruPortLabel": "Mieru exit port",
+    "cascadeMieruUserLabel": "SOCKS5 username",
+    "cascadeMieruPassLabel": "SOCKS5 password",
+    "cascadeNote": "При включении каскада оба сервиса будут перезагружены.",
+    "applyCascade": "Применить каскад",
+    "cascadeUpdated": "Каскад обновлён — сервисы перезагружены",
+    "cascadeNaiveUpstreamRequired": "Укажите Naive upstream URL",
+    "cascadeMieruHostRequired": "Укажите Mieru exit host"
   },
 
   "monitoring": {
@@ -247,6 +261,7 @@
     "naivePortUpdated": "Порт NaiveProxy обновлён — клиентам нужны новые конфиги",
     "mieruPortsUpdated": "Порты Mieru обновлены — сервис перезапущен, клиентам нужны новые конфиги",
     "trafficPatternUpdated": "Паттерн трафика обновлён",
+    "cascadeUpdated": "Каскад обновлён",
     "error": "Ошибка",
     "info": "Информация"
   },

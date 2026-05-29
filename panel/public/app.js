@@ -1,9 +1,10 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.2.5
+ * Panel Naive + Mieru — Frontend Application v1.2.6
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  * v1.2.5: probe-secret setting, disabled-button+spinner on all submit handlers,
  *         dashboard shows caddy-naive version label, config version bump
+ * v1.2.6: cascade/relay settings (Naive upstream + Mieru egress SOCKS5)
  */
 'use strict';
 
@@ -234,6 +235,7 @@ function handleDelegatedClick(e) {
     case 'change-language':      changeLanguage(); break;
     case 'change-password':      changePassword(); break;
     case 'change-probe-secret':  changeProbeSecret(); break;
+    case 'change-cascade':       changeCascade(); break;
 
     // ── Monitoring
     case 'refresh-stats':    refreshStats(); break;
@@ -691,6 +693,19 @@ async function loadSettings() {
     // v1.2.5: probe secret (masked)
     const probeEl = el('s-probe-secret');
     if (probeEl) probeEl.placeholder = cfg.probeSecret ? '••••••••' : (t('settings.probeSecretPlaceholder') || 'Enter probe secret');
+    // v1.2.6: cascade settings
+    const cascadeEnabledEl = el('s-cascade-enabled');
+    if (cascadeEnabledEl) cascadeEnabledEl.checked = cfg.cascadeEnabled === true;
+    const cascadeNaiveEl = el('s-cascade-naive-upstream');
+    if (cascadeNaiveEl) cascadeNaiveEl.value = cfg.cascadeNaiveUpstream || '';
+    const cascadeMieruHostEl = el('s-cascade-mieru-host');
+    if (cascadeMieruHostEl) cascadeMieruHostEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.host) || '';
+    const cascadeMieruPortEl = el('s-cascade-mieru-port');
+    if (cascadeMieruPortEl) cascadeMieruPortEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.port) || 1080;
+    const cascadeMieruUserEl = el('s-cascade-mieru-user');
+    if (cascadeMieruUserEl) cascadeMieruUserEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.socks5Authentication?.username) || '';
+    const cascadeMieruPassEl = el('s-cascade-mieru-pass');
+    if (cascadeMieruPassEl) cascadeMieruPassEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.socks5Authentication?.password) || '';
     document.getElementById('about-version').textContent = `v${cfg.version || '1.2.4'}`;
   } catch {}
 }
@@ -698,15 +713,15 @@ async function loadSettings() {
 async function changeNaivePort() {
   const port = parseInt(el('s-naive-port').value, 10);
   if (!port || port < 1 || port > 65535) {
-    showMsg('naive-port-msg', t('settings.invalidPort') || 'Invalid port (1–65535)', false); return;
+    showMsg('naive-port-msg', t('settings.invalidPort') || 'Неверный порт (1–65535)', false); return;
   }
   const btn = document.querySelector('[data-action="change-naive-port"]');
   setBtnBusy(btn, true);
   try {
     const res = await api('POST', '/api/settings/naive-port', { port });
-    showMsg('naive-port-msg', res.message || 'Port updated', true);
+    showMsg('naive-port-msg', res.message || 'Порт обновлён', true);
     state.config.naivePort = port;
-    toast(t('toast.naivePortUpdated') || `NaiveProxy port → ${port}`, 'info');
+    toast(t('toast.naivePortUpdated') || `Порт NaiveProxy → ${port}`, 'info');
   } catch (err) {
     showMsg('naive-port-msg', err.message, false);
   } finally {
@@ -717,13 +732,13 @@ async function changeNaivePort() {
 async function changeMieruPorts() {
   const portStart = parseInt(el('s-mieru-start').value, 10);
   const portEnd   = parseInt(el('s-mieru-end').value, 10);
-  if (!confirm(t('settings.mieruPortConfirm') || 'Apply Mieru port change?')) return;
+  if (!confirm(t('settings.mieruPortConfirm') || 'Применить изменение портов Mieru?')) return;
   const btn = document.querySelector('[data-action="change-mieru-ports"]');
   setBtnBusy(btn, true);
   try {
     const res = await api('POST', '/api/settings/mieru-ports', { portStart, portEnd });
-    showMsg('mieru-port-msg', res.message || 'Ports updated', true);
-    toast(t('toast.mieruPortsUpdated') || `Mieru ports → ${portStart}–${portEnd}`, 'info');
+    showMsg('mieru-port-msg', res.message || 'Порты обновлены', true);
+    toast(t('toast.mieruPortsUpdated') || `Порты Mieru → ${portStart}–${portEnd}`, 'info');
   } catch (err) {
     showMsg('mieru-port-msg', err.message, false);
   } finally {
@@ -739,7 +754,7 @@ async function changeUdpMode() {
     const res = await api('POST', '/api/settings/udp-toggle', { enabled });
     showMsg('udp-msg', res.message || t('settings.udpUpdated'), true);
     state.config.udpEnabled = enabled;
-    toast(t('settings.udpUpdated') || `UDP ${enabled ? 'enabled' : 'disabled'}`, 'info');
+    toast(t('settings.udpUpdated') || `UDP ${enabled ? 'включён' : 'выключен'}`, 'info');
   } catch (err) {
     showMsg('udp-msg', err.message, false);
   } finally {
@@ -755,7 +770,7 @@ async function changeTrafficPattern() {
   try {
     const res = await api('POST', '/api/settings/traffic-pattern', { pattern, mtu });
     showMsg('traffic-msg', `${t('settings.trafficPatternLabel')}: ${res.pattern}, MTU: ${res.mtu}`, true);
-    toast(t('toast.trafficPatternUpdated') || 'Traffic pattern updated', 'success');
+    toast(t('toast.trafficPatternUpdated') || 'Паттерн трафика обновлён', 'success');
   } catch (err) {
     showMsg('traffic-msg', err.message, false);
   } finally {
@@ -793,20 +808,70 @@ async function changePassword() {
 async function changeProbeSecret() {
   const secret = el('s-probe-secret')?.value?.trim();
   if (!secret || secret.length < 8) {
-    showMsg('probe-secret-msg', t('settings.probeSecretTooShort') || 'Probe secret must be at least 8 characters', false);
+    showMsg('probe-secret-msg', t('settings.probeSecretTooShort') || 'Probe secret должен быть не менее 8 символов', false);
     return;
   }
   const btn = document.querySelector('[data-action="change-probe-secret"]');
   setBtnBusy(btn, true);
   try {
     const res = await api('POST', '/api/settings/probe-secret', { probeSecret: secret });
-    showMsg('probe-secret-msg', res.message || t('settings.probeSecretUpdated') || 'Probe secret updated', true);
+    showMsg('probe-secret-msg', res.message || t('settings.probeSecretUpdated') || 'Probe secret обновлён', true);
     el('s-probe-secret').value = '';
     el('s-probe-secret').placeholder = '••••••••';
     state.config.probeSecret = secret;
-    toast(t('settings.probeSecretUpdated') || 'Probe secret updated — Caddy reloaded', 'success');
+    toast(t('settings.probeSecretUpdated') || 'Probe secret обновлён — Caddy перезагружен', 'success');
   } catch (err) {
     showMsg('probe-secret-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+async function changeCascade() {
+  const enabled = el('s-cascade-enabled')?.checked || false;
+  const upstream = el('s-cascade-naive-upstream')?.value?.trim() || '';
+  const mieruHost = el('s-cascade-mieru-host')?.value?.trim() || '';
+  const mieruPort = parseInt(el('s-cascade-mieru-port')?.value, 10) || 1080;
+  const mieruUser = el('s-cascade-mieru-user')?.value?.trim() || '';
+  const mieruPass = el('s-cascade-mieru-pass')?.value || '';
+
+  if (enabled) {
+    if (!upstream) {
+      showMsg('cascade-msg', t('settings.cascadeNaiveUpstreamRequired') || 'Укажите Naive upstream URL', false);
+      return;
+    }
+    if (!mieruHost) {
+      showMsg('cascade-msg', t('settings.cascadeMieruHostRequired') || 'Укажите Mieru exit host', false);
+      return;
+    }
+  }
+
+  const cascadeMieruEgress = enabled && mieruHost ? {
+    proxies: [{
+      name: 'exit-relay',
+      protocol: 'SOCKS5_PROXY_PROTOCOL',
+      host: mieruHost,
+      port: mieruPort,
+      socks5Authentication: mieruUser ? { username: mieruUser, password: mieruPass } : undefined
+    }],
+    rules: [{ ipRanges: ['*'], domainNames: ['*'], action: 'DIRECT' }]
+  } : {};
+
+  const btn = document.querySelector('[data-action="change-cascade"]');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('POST', '/api/settings/cascade', {
+      cascadeEnabled: enabled,
+      cascadeNaiveUpstream: enabled ? upstream : '',
+      cascadeMieruEgress
+    });
+    showMsg('cascade-msg', res.message || t('settings.cascadeUpdated') || 'Каскад обновлён', true);
+    state.config.cascadeEnabled = enabled;
+    state.config.cascadeNaiveUpstream = upstream;
+    state.config.cascadeMieruEgress = cascadeMieruEgress;
+    toast(t('settings.cascadeUpdated') || 'Каскад обновлён — сервисы перезагружены', 'success');
+  } catch (err) {
+    showMsg('cascade-msg', err.message, false);
   } finally {
     setBtnBusy(btn, false);
   }

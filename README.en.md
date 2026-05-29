@@ -6,7 +6,7 @@
 
 # 🛡 Panel Naive + Mieru by RIXXX
 
-**v1.2.5** — Web management panel for NaiveProxy + Mieru on Ubuntu/Debian VPS
+**v1.2.6** — Web management panel for NaiveProxy + Mieru on Ubuntu/Debian VPS
 
 [![Telegram](https://img.shields.io/badge/Telegram-@russian__paradice__vpn-2CA5E0?logo=telegram&logoColor=white)](https://t.me/russian_paradice_vpn)
 [![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-181717?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
@@ -29,6 +29,7 @@
 | 4 | Client configs: Naive link, Mieru sing-box JSON, universal auto-fallback config, QR codes |
 | 5 | Monitoring dashboard: WebSocket live metrics, traffic snapshots, quota alerts |
 | 6 | `update.sh`: `--dry-run`, `--force`, `--expose`, `--ssh-only`, `--status`, `--repair`, `--help` |
+| 7 | **Cascade / Relay** (v1.2.6): `client → Entry (RU) → Exit (EU) → internet` via upstream (Naive) + egress SOCKS5 (Mieru) |
 
 ---
 
@@ -200,6 +201,39 @@ Contains both NaiveProxy and Mieru outbounds with `urltest` selector — automat
 │  └─────────────────────┘   └────────────────────────┘   │
 └──────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 🌐 Cascade / Relay (v1.2.6)
+
+Configure a two-hop chain directly from the panel (**Settings → Cascade**):
+
+```
+┌──────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────┐
+│  Client  │──▶│ Entry (RU)   │──▶│ Exit (EU)    │──▶│ Internet │
+│          │   │ caddy-naive  │   │ SOCKS5/443   │   │          │
+│  Naive   │   │ upstream     │   │              │   │          │
+│  + Mieru │   │ mita + egress│   │              │   │          │
+└──────────┘   └──────────────┘   └──────────────┘   └──────────┘
+```
+
+### What happens under the hood
+
+- **NaiveProxy** — the `Caddyfile` gets an `upstream https://user:pass@exit-host:443` directive inside the `forward_proxy` block. Client traffic is forwarded to the Exit node before reaching the internet.
+- **Mieru** — the `mita-state.json` receives an `egress` object with a SOCKS5 proxy (`SOCKS5_PROXY_PROTOCOL`) pointing at the Exit node. The `action: DIRECT` rule means all traffic goes through that exit.
+
+### UI controls
+
+1. Open **Settings → Cascade**.
+2. Tick **«Enable cascade»**.
+3. Fill in:
+   - **Naive upstream URL** — `https://user:password@exit.example.com:443`
+   - **Mieru Exit host** — IP or domain of the Exit node
+   - **Mieru Exit port** — SOCKS5 port (usually `1080`)
+   - **User / Password** — if the Exit requires SOCKS5 authentication
+4. Press **Apply cascade**. The panel atomically rewrites `Caddyfile` and `mita-state.json`, reloads services, and shows a toast notification.
+
+> 💡 You can toggle cascade on/off without erasing settings — just untick the checkbox and press **Apply**.
 
 ---
 

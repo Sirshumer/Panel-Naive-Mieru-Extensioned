@@ -27,7 +27,7 @@ log_dry()   { echo -e "${YELLOW}[DRY-RUN]${NC} $*"; }
 die()       { log_error "$*"; exit 1; }
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-TARGET_VERSION="1.2.5"
+TARGET_VERSION="1.2.6"
 PANEL_DIR="/opt/panel-naive-mieru"
 PANEL_CONFIG="/etc/rixxx-panel/config.json"
 VERSION_FILE="/etc/rixxx-panel/version"
@@ -251,7 +251,8 @@ rebuild_caddyfile_direct() {
         naivePort:   cfg.naivePort   || 443,
         fakeSiteDir: cfg.fakeSiteDir || '$FAKE_SITE_DIR',
         probeSecret,
-        logFile:     '/var/log/caddy-naive/access.log'
+        logFile:     '/var/log/caddy-naive/access.log',
+        upstream:    (cfg.cascadeEnabled && cfg.cascadeNaiveUpstream) ? cfg.cascadeNaiveUpstream : ''
       }, naiveUsers);
     } else {
       // Fallback (template not available): emit correct syntax directly
@@ -557,14 +558,6 @@ update_panel() {
 }
 
 # ── Smoke tests ───────────────────────────────────────────────────────────────
-smoke_test() {
-  log_step "Running smoke tests"
-  sleep 3
-
-  local pass=0 fail=0
-
-  check_svc() {
-    if systemctl is-active --qu��────
 smoke_test() {
   log_step "Running smoke tests"
   sleep 3

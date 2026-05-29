@@ -73,7 +73,8 @@ try {
     probeSecret:   '',
     mitaStateFile: MITA_STATE_FILE,
     trafficPattern: 'NOOP', mtu: 1400, udpEnabled: false,
-    language: 'ru', version: '1.2.5'
+    cascadeEnabled: false, cascadeNaiveUpstream: '', cascadeMieruEgress: {},
+    language: 'ru', version: '1.2.6'
   };
 }
 
@@ -239,6 +240,7 @@ function buildCaddyfile(config, users) {
       fakeSiteDir: resolvedFakeSiteDir,
       probeSecret,
       logFile:     LOG_CADDY,
+      upstream:    (config.cascadeEnabled && config.cascadeNaiveUpstream) ? config.cascadeNaiveUpstream : '',
     }, naiveUsers);
   }
 
@@ -260,6 +262,10 @@ function buildCaddyfile(config, users) {
 
   // Bug 29: probe_resistance comes after hide_ip + hide_via
   const probeLine = probeSecret ? `\n    probe_resistance ${probeSecret}` : '';
+
+  // v1.2.6: cascade — upstream proxy support (inline fallback)
+  const upstreamUrl = (config.cascadeEnabled && config.cascadeNaiveUpstream) ? config.cascadeNaiveUpstream : '';
+  const upstreamLine = upstreamUrl ? `\n    upstream ${upstreamUrl}` : '';
 
   // Bug 28: no "tls <email>" inside site block
   // Bug 30: order directive in global block
@@ -293,7 +299,7 @@ ${config.domain || 'localhost'}:${config.naivePort || 443} {
       # Bug 29: order — credentials → hide_ip → hide_via → probe_resistance
 ${authLines}
       hide_ip
-      hide_via${probeLine}
+      hide_via${probeLine}${upstreamLine}
     }
     file_server {
       root ${resolvedFakeSiteDir}
@@ -377,6 +383,14 @@ function buildMitaStateFile() {
       'CUSTOM':                    { seed: true,  tcpFragment: true,  nonce: true  }
     };
     if (patMap[pat]) mieruCfg.trafficPattern = patMap[pat];
+  }
+
+  // v1.2.6: cascade — mieru egress (outbound proxy chain)
+  if (cfg.cascadeEnabled && cfg.cascadeMieruEgress && cfg.cascadeMieruEgress.proxies && cfg.cascadeMieruEgress.proxies.length > 0) {
+    mieruCfg.egress = {
+      proxies: cfg.cascadeMieruEgress.proxies,
+      rules: cfg.cascadeMieruEgress.rules || [{ ipRanges: ['*'], domainNames: ['*'], action: 'DIRECT' }]
+    };
   }
 
   fs.mkdirSync(path.dirname(resolvedMitaFile), { recursive: true });
@@ -828,6 +842,34 @@ app.post('/api/services/rebuild-all', requireAuth, (req, res) => {
     const mitaOk  = applyMitaConfig();
     res.json({ ok: true, caddyOk, mitaOk,
       message: 'Caddyfile and mita-state.json rebuilt from database.' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── v1.2.6: Cascade settings ──────────────────────────────────────────────────
+app.get('/api/settings/cascade', requireAuth, (req, res) => {
+  const safe = {
+    cascadeEnabled: !!cfg.cascadeEnabled,
+    cascadeNaiveUpstream: cfg.cascadeNaiveUpstream || '',
+    cascadeMieruEgress: cfg.cascadeMieruEgress || {}
+  };
+  res.json(safe);
+});
+
+app.post('/api/settings/cascade', requireAuth, (req, res) => {
+  const { cascadeEnabled, cascadeNaiveUpstream, cascadeMieruEgress } = req.body;
+  cfg.cascadeEnabled = !!cascadeEnabled;
+  if (cascadeNaiveUpstream !== undefined) cfg.cascadeNaiveUpstream = String(cascadeNaiveUpstream || '').trim();
+  if (cascadeMieruEgress !== undefined) cfg.cascadeMieruEgress = cascadeMieruEgress || {};
+  saveConfig();
+
+  // Rebuild Caddyfile (naive upstream) and mita config (mieru egress)
+  try {
+    const content = buildCaddyfile(cfg, getAllUsers());
+    writeCaddyfileAtomic(content);
+    const caddyOk = reloadCaddy();
+    const mitaOk  = applyMitaConfig();
+    res.json({ ok: true, caddyOk, mitaOk,
+      message: 'Cascade settings applied. Caddy and mita reloaded.' });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 

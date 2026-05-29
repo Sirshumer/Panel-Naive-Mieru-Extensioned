@@ -57,7 +57,7 @@ FAKE_SITE_DIR="/var/www/fake-site"
 NAIVE_BIN="/usr/local/bin/naive"        # may still exist from v1.2.x; will be removed
 NAIVE_CONFIG_DIR="/etc/naive"
 
-CURRENT_VERSION="1.2.5"
+CURRENT_VERSION="1.2.6"
 REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
 # Bug 1: direct download URL for caddy-forwardproxy-naive (amd64 only)
 CADDY_NAIVE_RELEASES="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
@@ -1001,7 +1001,6 @@ start_services() {
       'caddy-naive не активен — установка продолжается. После входа в панель запустите: bash update.sh --repair' \
       'caddy-naive is not active — install continues. After opening the panel run: bash update.sh --repair')"
   fi
-  log_info "$(t 'caddy-naive запущен ✓' 'caddy-naive started ✓')"
 
   # Bug 4: mita crashes when started with empty users[].
   # Apply portBindings config, but only start mita after first user is added.

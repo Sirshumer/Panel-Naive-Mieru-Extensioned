@@ -176,7 +176,21 @@
     "clientApps": "Client Applications",
     "languageTitle": "Interface Language",
     "languageDesc": "Select web-panel language. Choice is saved in browser.",
-    "applyLanguage": "Apply"
+    "applyLanguage": "Apply",
+    "cascadeTitle": "Cascade / Relay",
+    "cascadeDesc": "Relay setup: traffic goes through this server (entry) to the exit server, then to the internet.",
+    "cascadeEnable": "Enable cascade (relay)",
+    "cascadeNaiveUpstreamLabel": "Naive upstream URL",
+    "cascadeNaiveUpstreamHint": "Format: https://user:pass@host:port",
+    "cascadeMieruHostLabel": "Mieru exit host (SOCKS5)",
+    "cascadeMieruPortLabel": "Mieru exit port",
+    "cascadeMieruUserLabel": "SOCKS5 username",
+    "cascadeMieruPassLabel": "SOCKS5 password",
+    "cascadeNote": "Both services will be reloaded when cascade is enabled.",
+    "applyCascade": "Apply Cascade",
+    "cascadeUpdated": "Cascade updated — services reloaded",
+    "cascadeNaiveUpstreamRequired": "Please provide Naive upstream URL",
+    "cascadeMieruHostRequired": "Please provide Mieru exit host"
   },
 
   "monitoring": {

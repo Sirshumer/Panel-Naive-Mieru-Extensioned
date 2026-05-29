@@ -7,6 +7,38 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.2.6] — 2026-05-29
+
+### Added
+
+- **Cascade / Relay architecture (NaiveProxy + Mieru)** — Settings UI now supports chaining traffic through an intermediate "Exit" node:
+  - **NaiveProxy**: `upstream` directive in `caddy-forwardproxy-naive` (`upstream https://user:pass@host:port`) for `client → Entry (RU) → Exit (EU) → internet`.
+  - **Mieru**: `egress` property with SOCKS5 outbound proxies in `mita` config (`SOCKS5_PROXY_PROTOCOL` + `socks5Authentication`).
+  - New REST API endpoints: `GET /api/settings/cascade`, `POST /api/settings/cascade` (requires auth).
+  - New UI card in Settings page (`index.html` + `app.js`): checkbox "Enable cascade", Naive upstream URL input, Mieru exit host/port/user/pass inputs.
+  - `caddyTemplate.js` `render(cfg, naiveUsers)` now accepts `upstream` parameter and emits `upstream <url>` inside the `forward_proxy` block.
+  - `buildMitaStateFile()` in `index.js` injects `egress` JSON when `cascadeEnabled === true`.
+  - Atomic config writes via `.new` + `fs.renameSync()` preserved for both Caddyfile and mita-state.
+
+### Fixed
+
+- **Bug 70 (P0, `install.sh`)**: Removed phantom `log_info "caddy-naive запущен ✓"` in `start_services()` that fired unconditionally even when `caddy-naive` failed to start, masking real startup failures.
+- **Bug 71 (P0, `update.sh`)**: `smoke_test()` contained corrupted/garbage bytes and a duplicate function definition, causing syntax errors or unpredictable behaviour during update. Cleaned and deduplicated the function.
+- **Bug 72 (P1, `update.sh`)**: `rebuild_caddyfile_direct()` did not pass `upstream` into `tpl.render()`, so cascade changes made via UI were lost on `--repair`. Fixed by threading `cfg.cascadeNaiveUpstream` through the Node one-liner.
+
+### Changed
+
+- `install.sh` version → `1.2.6`; `CURRENT_VERSION="1.2.6"`.
+- `update.sh` version → `1.2.6`; `TARGET_VERSION="1.2.6"`.
+- `panel/server/caddyTemplate.js` version comment → `v1.2.6`.
+- `panel/server/index.js` version comment → `v1.2.6`; `DEFAULT_CONFIG.version` → `1.2.6`; added `cascadeEnabled`, `cascadeNaiveUpstream`, `cascadeMieruEgress` fields.
+- `panel/public/index.html` version labels → `v1.2.6` (title, sidebar, topbar, about).
+- `panel/public/app.js` version comment → `v1.2.6`; added `changeCascade()` handler, cascade field loading in `loadSettings()`, delegated click mapping for `change-cascade`.
+- `panel/public/locales/ru.json` + `en.json` — added cascade translation keys under `settings.*` and `toast.*`.
+- `README.md` / `README.en.md` — version badge bumped to `v1.2.6`; added Cascade/Relay architecture section with ASCII diagram and UI instructions.
+
+---
+
 ## [v1.2.5] — 2026-05-07
 
 ### Fixed (P0 — release blockers)

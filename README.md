@@ -6,7 +6,7 @@
 
 # 🛡 Panel Naive + Mieru by RIXXX
 
-**v1.2.5** — Веб-панель управления NaiveProxy + Mieru для Ubuntu/Debian VPS
+**v1.2.6** — Веб-панель управления NaiveProxy + Mieru для Ubuntu/Debian VPS
 
 [![Telegram](https://img.shields.io/badge/Telegram-@russian__paradice__vpn-2CA5E0?logo=telegram&logoColor=white)](https://t.me/russian_paradice_vpn)
 [![GitHub](https://img.shields.io/badge/GitHub-cwash797--cmd-181717?logo=github)](https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX)
@@ -29,6 +29,7 @@
 | 4 | Клиентские конфиги: Naive-ссылка, Mieru sing-box JSON, универсальный конфиг, QR-коды |
 | 5 | Мониторинг: WebSocket метрики в реальном времени, трафик, квоты, история снимков |
 | 6 | `update.sh`: `--dry-run`, `--force`, `--expose`, `--ssh-only`, `--status`, `--repair`, `--help` |
+| 7 | **Каскад / Relay** (v1.2.6): `client → Entry (RU) → Exit (EU) → internet` — upstream (Naive) + egress SOCKS5 (Mieru) |
 
 ---
 
@@ -201,6 +202,39 @@ sudo bash uninstall.sh     # Полное удаление
 │  └─────────────────────┘   └────────────────────────┘   │
 └──────────────────────────────────────────────────────────┘
 ```
+
+---
+
+## 🌐 Каскад / Relay (v1.2.6)
+
+Настройте двухузловую цепочку прямо из панели (**Settings → Каскад**):
+
+```
+┌──────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────┐
+│  Клиент  │──▶│ Entry (RU)   │──▶│ Exit (EU)    │──▶│ Интернет │
+│          │   │ caddy-naive  │   │ SOCKS5/443   │   │          │
+│  Naive   │   │ upstream     │   │              │   │          │
+│  + Mieru │   │ mita + egress│   │              │   │          │
+└──────────┘   └──────────────┘   └──────────────┘   └──────────┘
+```
+
+### Что происходит под капотом
+
+- **NaiveProxy** — в `Caddyfile` добавляется директива `upstream https://user:pass@exit-host:443` внутри блока `forward_proxy`. Трафик клиента заворачивается на Exit-ноду перед выходом в интернет.
+- **Mieru** — в `mita-state.json` добавляется объект `egress` с SOCKS5-прокси (`SOCKS5_PROXY_PROTOCOL`) на Exit-ноду. Правило `action: DIRECT` означает, что весь трафик идёт через этот выход.
+
+### UI-управление
+
+1. Откройте **Settings → Каскад**.
+2. Включите галочку **«Включить каскад»**.
+3. Заполните:
+   - **Naive upstream URL** — `https://user:password@exit.example.com:443`
+   - **Mieru Exit host** — IP или домен Exit-ноды
+   - **Mieru Exit port** — порт SOCKS5 (обычно `1080`)
+   - **User / Password** — если Exit требует аутентификацию SOCKS5
+4. Нажмите **Применить каскад**. Панель атомарно перепишет `Caddyfile` и `mita-state.json`, перезагрузит сервисы и выдаст toast-уведомление.
+
+> 💡 Каскад можно включать/выключать без удаления настроек — просто снимите галочку и нажмите «Применить».
 
 ---
 
