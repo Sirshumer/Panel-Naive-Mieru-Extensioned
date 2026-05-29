@@ -9,6 +9,46 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 74 (P1, mieru client config) — generated Mieru config did not connect
+
+Field-tested against a **known-working** Karing/sing-box mieru config from another
+server, the panel's generated mieru outbound differed in two ways that break the
+client's mieru parser:
+
+- We emitted `multiplex: { enabled: false }` (an object). The working client uses
+  the string enum **`multiplexing: "MULTIPLEXING_HIGH"`**. The object form is for
+  other protocols' stream-multiplexing and is silently rejected by the mieru
+  outbound → no connection. **Fixed** in both `/config/mieru` and the mieru
+  outbound of `/config/universal`.
+- We sent both a single `server_port` **and** a `server_ports` array. The working
+  config sends only a single `server_port`. Dropped the array to match.
+- Mieru `server` now prefers the raw server IP (mieru is IP-based, no SNI/TLS),
+  and the standalone mieru config now includes the same minimal `dns` block as
+  the reference config.
+
+Server-side diagnosis confirmed the VPS itself is healthy: Caddy holds a valid
+Let's Encrypt cert (`curl -vI` → HTTP/2 200, verify ok), DNS A-record matches the
+server IP, firewall opens 80/443/2012-2022 — so the no-connection issue was the
+client config format, not the server.
+
+### UX fixes (`genspark_ai_developer_audit`)
+
+- **P2 — Email is now optional when adding a user.** The TLS certificate is
+  obtained at install time via Caddy's ACME (the global `email` directive), not
+  per-user, so a per-user email served no purpose. Removed the `required`
+  attribute and the `*` from the form, relaxed `validateUserInput()` (an email is
+  still format-checked *if* provided), and store `NULL` (not `''`) for empty
+  emails. Added a one-time DB migration that rebuilds `users.email` from
+  `TEXT NOT NULL UNIQUE` → `TEXT UNIQUE`, so multiple email-less users no longer
+  collide on the UNIQUE constraint. Existing emails are preserved.
+
+- **P3 — Removed the password prompt when downloading a client config.** The
+  config-download modal previously asked for the user's password even though the
+  admin is already authenticated and the server stores the plaintext password.
+  The naive link / QR now auto-load on open and all three downloads (naive,
+  mieru, universal) use the server's stored-password fallback — no extra input
+  required. Removed the `cfg-password` input + note from the modal.
+
 ### Audit & cascade hardening (`genspark_ai_developer_audit`)
 
 - **Bug 73 (P0, `install.sh`)** — **install aborted at `write_config_json`** on a

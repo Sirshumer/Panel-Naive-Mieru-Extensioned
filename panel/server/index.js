@@ -100,7 +100,7 @@ try {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id        TEXT PRIMARY KEY,
-      email     TEXT NOT NULL UNIQUE,
+      email     TEXT UNIQUE,
       username  TEXT NOT NULL UNIQUE,
       passHash  TEXT NOT NULL,
       password  TEXT NOT NULL DEFAULT '',
@@ -126,6 +126,48 @@ try {
   `);
   // Migrate: add password column if missing (upgrade from v1.0.x)
   try { db.exec(`ALTER TABLE users ADD COLUMN password TEXT NOT NULL DEFAULT ''`); } catch {}
+
+  // Migrate: make `email` nullable so it can be optional (TLS cert is set at
+  // install time via Caddy ACME, not per-user). Old schema had `email TEXT
+  // NOT NULL UNIQUE`, which rejects empty/absent emails and collides on ''.
+  // Rebuild the table only if the column is still NOT NULL.
+  try {
+    const cols = db.prepare(`PRAGMA table_info(users)`).all();
+    const emailCol = cols.find(c => c.name === 'email');
+    if (emailCol && emailCol.notnull === 1) {
+      db.exec(`
+        BEGIN TRANSACTION;
+        ALTER TABLE users RENAME TO users_legacy;
+        CREATE TABLE users (
+          id        TEXT PRIMARY KEY,
+          email     TEXT UNIQUE,
+          username  TEXT NOT NULL UNIQUE,
+          passHash  TEXT NOT NULL,
+          password  TEXT NOT NULL DEFAULT '',
+          expiry    TEXT,
+          protocols TEXT DEFAULT '["naive","mieru"]',
+          quotaMB   INTEGER DEFAULT 0,
+          usedMB    REAL    DEFAULT 0,
+          createdAt TEXT NOT NULL,
+          updatedAt TEXT NOT NULL,
+          lastSeen  TEXT
+        );
+        INSERT INTO users
+          (id,email,username,passHash,password,expiry,protocols,quotaMB,usedMB,createdAt,updatedAt,lastSeen)
+        SELECT
+          id,
+          CASE WHEN email='' THEN NULL ELSE email END,
+          username,passHash,password,expiry,protocols,quotaMB,usedMB,createdAt,updatedAt,lastSeen
+        FROM users_legacy;
+        DROP TABLE users_legacy;
+        COMMIT;
+      `);
+      console.log('[DB] migrated users.email -> nullable (email is now optional)');
+    }
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch {}
+    console.error('[DB] email-nullable migration skipped:', e.message);
+  }
 } catch (err) {
   console.error('[DB] SQLite unavailable:', err.message, '— using in-memory store');
 }
@@ -632,8 +674,10 @@ const EMAIL_RE        = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 function validateUserInput({ email, username, password, protocols, quotaMB, quotaGb }, requirePassword) {
   if (!username || !USERNAME_RE.test(username))
     return { error: 'username required and must match [a-zA-Z0-9_.-] (max 64 chars)' };
-  if (!email || !EMAIL_RE.test(email))
-    return { error: 'valid email is required' };
+  // Email is optional (TLS cert is configured at install time via Caddy ACME,
+  // not per-user). If provided, it must still be a valid address.
+  if (email !== undefined && email !== null && email !== '' && !EMAIL_RE.test(email))
+    return { error: 'email is invalid' };
   if (requirePassword) {
     if (!password) return { error: 'password is required for new users' };
     if (password.length < 8) return { error: 'password must be at least 8 characters' };
@@ -703,7 +747,10 @@ app.post('/api/users', requireAuth, (req, res) => {
   const now  = new Date().toISOString();
   const user = {
     id:        uuidv4(),
-    email, username,
+    // Email is optional: store NULL (not '') so the UNIQUE constraint allows
+    // multiple users without an email.
+    email:     (email && email.trim()) ? email.trim() : null,
+    username,
     passHash:  bcrypt.hashSync(password, 12),
     password,
     expiry:    expiry || null,
@@ -741,7 +788,7 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
 
   const updated = {
     ...user,
-    email:     email     ?? user.email,
+    email:     email !== undefined ? ((email && email.trim()) ? email.trim() : null) : user.email,
     username:  username  ?? user.username,
     expiry:    expiry    !== undefined ? (expiry || null) : user.expiry,
     protocols: protocols
@@ -1016,28 +1063,39 @@ app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
     serverPorts.push(p);
   }
 
+  // Bug 74: align mieru outbound with the field-tested working client format
+  // (Karing / sing-box mieru):
+  //   - use `multiplexing: "MULTIPLEXING_HIGH"` (string enum), NOT
+  //     `multiplex: { enabled: false }` (that object form is for other
+  //     protocols' stream multiplexing and silently breaks the mieru parser);
+  //   - use a single `server_port` (the working config does NOT send a
+  //     `server_ports` array — sending both confuses the client);
+  //   - prefer the raw server IP (mieru is IP-based, no SNI/TLS).
   const singboxCfg = {
-    log: { level: 'info', timestamp: true },
+    log: { level: 'info' },
+    dns: {
+      servers: [
+        { tag: 'google', address: '8.8.8.8' },
+        { tag: 'local',  address: '1.1.1.1', detour: 'direct' }
+      ]
+    },
     outbounds: [
       {
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
         server_port: _portStart70a,
-        // Bug 12: include server_ports for full range awareness
-        server_ports: serverPorts,
-        username: user.username, password,
         // Bug 5: transport field (TCP/UDP) — not protocol
         transport: 'TCP',
-        multiplex: { enabled: false }
+        username: user.username, password,
+        // Bug 74: string enum, not an object
+        multiplexing: 'MULTIPLEXING_HIGH'
       },
-      { type: 'direct', tag: 'direct' },
-      { type: 'dns',    tag: 'dns-out' }
+      { type: 'direct', tag: 'direct' }
     ],
-    route: {
-      rules: [{ protocol: 'dns', outbound: 'dns-out' }],
-      final: 'mieru-out'
-    }
+    route: { final: 'mieru-out' }
   };
+  // Keep the full port range available for clients/tooling that want it.
+  void serverPorts;
   const filename = `mieru-${user.username}-${cfg.domain}.json`;
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.setHeader('Content-Type', 'application/json');
@@ -1049,14 +1107,8 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
   if (!user) return res.status(404).json({ error: 'User not found' });
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
 
-  // Bug 12: server_ports for Mieru outbound
-  // Bug 70: same parseInt guard as in /config/mieru route
+  // Bug 70: parseInt guard prevents an infinite loop when values are strings/NaN
   const _portStart70b = parseInt(cfg.mieruPortStart, 10) || 2000;
-  const _portEnd70b   = parseInt(cfg.mieruPortEnd,   10) || 2010;
-  const serverPorts = [];
-  for (let p = _portStart70b; p <= _portEnd70b; p++) {
-    serverPorts.push(p);
-  }
 
   const universalCfg = {
     log: { level: 'info', timestamp: true },
@@ -1083,15 +1135,14 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
         tls: { enabled: true, server_name: cfg.domain }
       },
       {
+        // Bug 74: working mieru format — string `multiplexing`, single port,
+        // no `server_ports` array, no `multiplex` object.
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
         server_port: _portStart70b,
-        // Bug 12: server_ports array
-        server_ports: serverPorts,
-        username: user.username, password,
-        // Bug 5: transport field
         transport: 'TCP',
-        multiplex: { enabled: false }
+        username: user.username, password,
+        multiplexing: 'MULTIPLEXING_HIGH'
       },
       { type: 'direct', tag: 'direct' },
       { type: 'dns',    tag: 'dns-out' }
