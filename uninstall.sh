@@ -1,14 +1,10 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — uninstall.sh  v1.2.3
+# Panel Naive + Mieru by RIXXX — uninstall.sh  v1.2.5
 # Removes all panel components, services, configs, and data.
 #
-# v1.2.3: Full cleanup for caddy-forwardproxy-naive migration:
-#   - Stops and removes caddy-naive.service (primary) and naive.service (legacy)
-#   - Removes caddy-naive binary, Caddyfile, /etc/caddy-naive/, fake-site
-#   - Removes /usr/local/bin/naive (legacy) and /etc/naive/ (legacy)
-#   - Clears UFW rules added by v1.2.x and v1.2.3 installs
-#   - Removes PM2 panel process, panel files, DB, logs
+# v1.2.3: Full cleanup for caddy-forwardproxy-naive migration.
+# v1.2.5: Also removes /var/lib/caddy (ACME cert storage, Bug 43).
 # ==============================================================================
 set -euo pipefail
 
@@ -23,7 +19,7 @@ die()       { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 [[ $EUID -ne 0 ]] && die "Run as root (sudo bash uninstall.sh)"
 
 echo -e "\n${RED}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${RED}${BOLD}║   Panel Naive + Mieru — UNINSTALL  v1.2.3                ║${NC}"
+echo -e "${RED}${BOLD}║   Panel Naive + Mieru — UNINSTALL  v1.2.5                ║${NC}"
 echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}\n"
 
 echo -e "${YELLOW}${BOLD}WARNING:${NC} This will permanently remove ALL panel data, users,"
@@ -125,6 +121,8 @@ if [[ -f /var/lib/rixxx-panel/db.sqlite ]]; then
   log_info "SQLite database securely removed ✓"
 fi
 rm -rf /var/lib/rixxx-panel
+# Bug 43 / v1.2.5: /var/lib/caddy stores ACME TLS certificates — remove on uninstall
+rm -rf /var/lib/caddy 2>/dev/null || true
 log_info "Runtime data removed ✓"
 
 # ── Remove logs ───────────────────────────────────────────────────────────────
