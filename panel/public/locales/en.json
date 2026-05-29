@@ -109,6 +109,9 @@
   "config": {
     "downloadTitle": "Download Client Config",
     "downloadNote": "The user's stored password is embedded automatically. Copy the link or download a config file.",
+    "mieruPortLabel": "Mieru port (for JSON configs)",
+    "mieruPortHint": "Leave at the range start unless you want a specific port.",
+    "mieruPortOutOfRange": "Port must be within the Mieru range",
     "passwordNote": "Enter the user's plain-text password to embed in the config file.",
     "passwordLabel": "Password",
     "passwordPlaceholder": "User password",

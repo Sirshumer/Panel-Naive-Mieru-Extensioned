@@ -1066,6 +1066,16 @@ app.get('/api/users/:id/config/naive', requireAuth, (req, res) => {
 });
 
 // Bug 5: transport field (not protocol); Bug 12: server_ports array
+// P3 (selectable mieru port): validate a requested port against the configured
+//   range. mita listens on the WHOLE range (portRange "start-end"), so any port
+//   inside [start,end] is valid for the client to dial. Returns `start` when the
+//   request is absent, non-numeric, or outside the range.
+function pickMieruPort(requested, start, end) {
+  const p = parseInt(requested, 10);
+  if (Number.isInteger(p) && p >= start && p <= end) return p;
+  return start;
+}
+
 app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -1080,6 +1090,10 @@ app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
   for (let p = _portStart70a; p <= _portEnd70a; p++) {
     serverPorts.push(p);
   }
+  // P3 (selectable port): allow the client to pick which port from the
+  //   configured mieru range is written into server_port. Falls back to the
+  //   range start when ?port= is absent or out of range.
+  const mieruPort = pickMieruPort(req.query.port, _portStart70a, _portEnd70a);
 
   // Bug 74: align mieru outbound with the field-tested working client format
   // (Karing / sing-box mieru):
@@ -1101,7 +1115,7 @@ app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
       {
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
-        server_port: _portStart70a,
+        server_port: mieruPort,
         // Bug 5: transport field (TCP/UDP) — not protocol
         transport: 'TCP',
         username: user.username, password,
@@ -1127,6 +1141,9 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
 
   // Bug 70: parseInt guard prevents an infinite loop when values are strings/NaN
   const _portStart70b = parseInt(cfg.mieruPortStart, 10) || 2000;
+  const _portEnd70b   = parseInt(cfg.mieruPortEnd,   10) || 2010;
+  // P3 (selectable port): honour ?port= within the configured range.
+  const mieruPortU = pickMieruPort(req.query.port, _portStart70b, _portEnd70b);
 
   const universalCfg = {
     log: { level: 'info', timestamp: true },
@@ -1157,7 +1174,7 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
         // no `server_ports` array, no `multiplex` object.
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
-        server_port: _portStart70b,
+        server_port: mieruPortU,
         transport: 'TCP',
         username: user.username, password,
         multiplexing: 'MULTIPLEXING_HIGH'
@@ -1238,7 +1255,10 @@ app.get('/api/status', requireAuth, async (req, res) => {
 // User traffic stats
 app.get('/api/stats/users', requireAuth, (req, res) => {
   const exec_ = cmd => { try { return execSync(cmd, { timeout: 8000 }).toString(); } catch { return ''; } };
-  const raw   = exec_('mita describe users 2>/dev/null');
+  // Bug 78: the real mieru server command is `mita get users` (NOT the
+  //   non-existent `mita describe users`, which always returned '' → traffic 0).
+  //   Output is a table: User  LastActive  1DayDownload  1DayUpload  30DaysDownload  30DaysUpload
+  const raw   = exec_('mita get users 2>/dev/null');
   const live  = parseMitaUsers(raw);
   const users = getAllUsers().map(u => {
     const s = live.find(x => x.username === u.username) || {};
@@ -1248,39 +1268,64 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
       expiry:     u.expiry,
       protocols:  JSON.parse(u.protocols || '[]'),
       quotaMB:    u.quotaMB,
-      usedMB:     s.usedMB    || u.usedMB || 0,
-      uploadMB:   s.uploadMB  || 0,
+      usedMB:     (s.usedMB != null ? s.usedMB : (u.usedMB || 0)),
+      uploadMB:   s.uploadMB   || 0,
       downloadMB: s.downloadMB || 0,
-      lastSeen:   u.lastSeen
+      // Prefer the live LastActive reported by mita; fall back to stored value.
+      lastSeen:   s.lastSeen || u.lastSeen
     };
   });
   res.json(users);
 });
 
+// Bug 78: parse the `mita get users` table.
+//   User  LastActive            1DayDownload  1DayUpload  30DaysDownload  30DaysUpload
+//   abcd  2025-04-23T01:02:03Z  938.1MiB      12.9MiB     4.0GiB          31.8MiB
+//   "used" = 30-day download + 30-day upload (best per-key cumulative metric mita exposes).
+//   Sizes use binary IEC units (B / KiB / MiB / GiB / TiB) and may also appear as KB/MB/GB.
 function parseMitaUsers(raw) {
   const users = [];
   if (!raw) return users;
-  const lines = raw.split('\n');
-  let cur = null;
-  for (const line of lines) {
-    const nameM = line.match(/username[:\s]+(\S+)/i) || line.match(/^user[:\s]+(\S+)/i);
-    if (nameM) { if (cur) users.push(cur); cur = { username: nameM[1], uploadMB: 0, downloadMB: 0, usedMB: 0 }; }
-    if (cur) {
-      const upM   = line.match(/upload[:\s]+([\d.]+)\s*(MB|GB|KB)/i);
-      const downM = line.match(/download[:\s]+([\d.]+)\s*(MB|GB|KB)/i);
-      if (upM)   cur.uploadMB   = toMB(parseFloat(upM[1]),   upM[2]);
-      if (downM) cur.downloadMB = toMB(parseFloat(downM[1]), downM[2]);
-    }
+  const sizeRe = /^([\d.]+)\s*([KMGT]?i?B)$/i;
+  for (const rawLine of raw.split('\n')) {
+    const line = rawLine.trim();
+    if (!line) continue;
+    // skip header / separator rows
+    if (/^user\b/i.test(line) || /^[-=\s]+$/.test(line)) continue;
+    const cols = line.split(/\s+/);
+    if (cols.length < 6) continue;
+    const username = cols[0];
+    const lastActive = cols[1];
+    // last 4 columns are the size figures
+    const sizeCols = cols.slice(-4);
+    const vals = sizeCols.map(c => {
+      const m = c.match(sizeRe);
+      return m ? toMB(parseFloat(m[1]), m[2]) : null;
+    });
+    if (vals.some(v => v === null)) continue; // not a data row
+    const [d1, u1, d30, u30] = vals;
+    void d1; void u1;
+    const downloadMB = d30;
+    const uploadMB   = u30;
+    users.push({
+      username,
+      uploadMB,
+      downloadMB,
+      usedMB:   uploadMB + downloadMB,
+      lastSeen: /^\d{4}-\d{2}-\d{2}T/.test(lastActive) ? lastActive : null
+    });
   }
-  if (cur) users.push(cur);
-  users.forEach(u => { u.usedMB = u.uploadMB + u.downloadMB; });
   return users;
 }
-function toMB(v, u) {
-  switch ((u || '').toUpperCase()) {
-    case 'KB': return v / 1024;
-    case 'GB': return v * 1024;
-    default:   return v;
+// Convert a size value to MB. Accepts both IEC (KiB/MiB/GiB/TiB) and
+//   decimal-ish (KB/MB/GB/TB) unit spellings; bare "B" → bytes.
+function toMB(v, unit) {
+  switch ((unit || '').toUpperCase()) {
+    case 'B':                return v / 1048576;
+    case 'KB': case 'KIB':   return v / 1024;
+    case 'GB': case 'GIB':   return v * 1024;
+    case 'TB': case 'TIB':   return v * 1048576;
+    default:                 return v; // MB / MiB
   }
 }
 
@@ -1422,7 +1467,9 @@ cron.schedule('*/5 * * * *', () => {
 cron.schedule('* * * * *', () => {
   if (!db) return;
   try {
-    const raw  = execSync('mita describe users 2>/dev/null', { timeout: 5000 }).toString();
+    // Bug 78: use `mita get users` (the real command); `mita describe users`
+    //   does not exist and always produced empty output.
+    const raw  = execSync('mita get users 2>/dev/null', { timeout: 5000 }).toString();
     const live = parseMitaUsers(raw);
     if (!live.length) return;
     const ts   = new Date().toISOString();
@@ -1430,7 +1477,7 @@ cron.schedule('* * * * *', () => {
     live.forEach(s => ins.run(s.username, s.uploadMB, s.downloadMB, ts));
     live.forEach(s => {
       const u = getUserByUsername(s.username);
-      if (u) upsertUser({ ...u, usedMB: s.usedMB, lastSeen: ts, updatedAt: ts });
+      if (u) upsertUser({ ...u, usedMB: s.usedMB, lastSeen: s.lastSeen || ts, updatedAt: ts });
     });
   } catch {}
 });
