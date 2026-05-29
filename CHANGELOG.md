@@ -9,6 +9,27 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 77 (`update.sh`) — **the actual** silent-exit cause: `check_root`/`check_install`
+
+Even after Bug 76's ERR trap, `sudo bash update.sh --force -y` still printed
+**nothing** and returned to the prompt (exit 1). A `bash -x` trace pinned it down:
+the script died immediately after `check_root` at `[[ 0 -ne 0 ]]`.
+
+Root cause — a classic `set -e` footgun. The one-liner functions were:
+```sh
+check_root()    { [[ $EUID -ne 0 ]] && die "Run as root"; }
+check_install() { [[ ! -f "$PANEL_CONFIG" ]] && die "..."; }
+```
+On the **happy path** (running as root / panel installed), the `[[ ]]` test is
+**false**, the `&&` short-circuits, and the test's exit status `1` becomes the
+**function's** return value. When `main` then calls `check_root` as a plain
+command, that non-zero return trips `set -e` → the whole script aborts before
+any `log_*` runs (and the function-return doesn't reliably fire the ERR trap).
+
+**Fix**: rewrote both as explicit `if` blocks ending in `return 0`. Verified with
+`bash -x`: the script now runs end-to-end, copies the panel files, and reports
+`Panel updated ✓ (v1.2.6 markers present)`.
+
 ### Bug 76 (`update.sh`) — update silently did nothing / skipped panel files
 
 After a clean update, the live panel in `/opt/panel-naive-mieru` still ran the
