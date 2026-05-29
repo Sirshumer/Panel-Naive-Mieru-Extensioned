@@ -140,20 +140,25 @@ function render(cfg, naiveUsers) {
   redir https://{host}{uri} permanent
 }
 
-${domain}:${port} {
-  # Bug 28: TLS is managed automatically by Caddy (no explicit tls directive needed)
+:${port}, ${domain} {
+  # Bug 83: match the known-good reference server exactly:
+  #   - listen on ":${port}, ${domain}" (catch-all :${port} + the domain) so the
+  #     CONNECT request matches this site regardless of how the client sets SNI/Host
+  #   - explicit "tls <email>" inside the block (not relying on the global email)
+  #   - no route{} wrapper — forward_proxy/file_server directly in the site block
+  #     (ordering comes from the global "order forward_proxy before file_server")
+  tls ${email}
 
-  route {
-    forward_proxy {
-      # Bug 23: no bare "basic_auth" token; each line IS the credential directive
-      # Bug 29: order — credentials → hide_ip → hide_via → probe_resistance
+  forward_proxy {
+    # Bug 23: no bare "basic_auth" token; each line IS the credential directive
+    # Bug 29: order — credentials → hide_ip → hide_via → probe_resistance
 ${authLines}
-      hide_ip
-      hide_via${probeLine}${upstreamLine}
-    }
-    file_server {
-      root ${fakeSite}
-    }
+    hide_ip
+    hide_via${probeLine}${upstreamLine}
+  }
+
+  file_server {
+    root ${fakeSite}
   }
 }
 `;

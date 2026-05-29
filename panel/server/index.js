@@ -355,20 +355,21 @@ function buildCaddyfile(config, users) {
   redir https://{host}{uri} permanent
 }
 
-${config.domain || 'localhost'}:${config.naivePort || 443} {
-  # Bug 28: TLS managed automatically by Caddy — no explicit tls directive
+:${config.naivePort || 443}, ${config.domain || 'localhost'} {
+  # Bug 83: match the known-good reference server exactly (":<port>, <domain>"
+  # listener + explicit tls + no route{} wrapper).
+  tls ${config.adminEmail || ''}
 
-  route {
-    forward_proxy {
-      # Bug 23: no bare "basic_auth" token; each line IS the credential directive
-      # Bug 29: order — credentials → hide_ip → hide_via → probe_resistance
+  forward_proxy {
+    # Bug 23: no bare "basic_auth" token; each line IS the credential directive
+    # Bug 29: order — credentials → hide_ip → hide_via → probe_resistance
 ${authLines}
-      hide_ip
-      hide_via${probeLine}${upstreamLine}
-    }
-    file_server {
-      root ${resolvedFakeSiteDir}
-    }
+    hide_ip
+    hide_via${probeLine}${upstreamLine}
+  }
+
+  file_server {
+    root ${resolvedFakeSiteDir}
   }
 }
 `;

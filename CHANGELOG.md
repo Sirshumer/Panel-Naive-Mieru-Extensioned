@@ -9,6 +9,29 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 83 (`panel` + `install.sh` + `update.sh`) — Caddyfile site block to match reference exactly
+
+Live testing: even after Bug 80/81 the naive key still wouldn't connect, while the
+user's reference server worked. Side-by-side of both Caddyfiles showed the site
+block differed structurally:
+
+* Reference: `:443, poppuri.site { tls <email>; forward_proxy {...}; file_server {...} }`
+* Ours:      `jazz.magniysovetuy.site:443 { route { forward_proxy {...} file_server {...} } }`
+
+Three differences fixed so ours is byte-for-byte equivalent to the working server:
+1. **Listener** `:<port>, <domain>` (catch-all `:443` **plus** the domain) instead of
+   the domain-only `<domain>:<port>`. The catch-all ensures the CONNECT request
+   matches this site regardless of how the client sets SNI/Host (the likely cause of
+   the key not connecting).
+2. **Explicit `tls <email>`** inside the site block (instead of relying solely on the
+   global `email` + automatic HTTPS).
+3. **Removed the `route { }` wrapper** — `forward_proxy` and `file_server` now sit
+   directly in the site block; ordering still comes from the global
+   `order forward_proxy before file_server`.
+
+Applied to all four generators: `caddyTemplate.js`, `index.js` inline fallback,
+`install.sh`, `update.sh`.
+
 ### Bug 82 (`update.sh` + `install.sh`) — `node -e` couldn't find `better-sqlite3`
 
 Live update showed the Caddyfile rebuild crashing with
