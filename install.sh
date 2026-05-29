@@ -564,7 +564,9 @@ write_caddyfile() {
   # Bug 23: credential lines are  basic_auth <user> <pass>  (no bare keyword)
   local naive_users_json="[]"
   if [[ -f "$DB_PATH" ]] && command -v node &>/dev/null; then
-    naive_users_json=$(node -e "
+    # Bug 82: run from $PANEL_DIR so better-sqlite3 resolves (else the try/catch
+    # silently returns [] and a --force reinstall would drop all naive users).
+    naive_users_json=$(cd "$PANEL_DIR" 2>/dev/null && node -e "
       try {
         const Database = require('better-sqlite3');
         const db = new Database('$DB_PATH', { readonly: true });

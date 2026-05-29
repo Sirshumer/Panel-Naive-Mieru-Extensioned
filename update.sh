@@ -271,7 +271,10 @@ rebuild_caddyfile_direct() {
 
   local template_js="${PANEL_DIR}/server/caddyTemplate.js"
 
-  node -e "
+  # Bug 82: run node from the panel dir so it can resolve better-sqlite3 and the
+  # other node_modules (they live under $PANEL_DIR, not the script's cwd which is
+  # the git checkout — that has no node_modules → "Cannot find module").
+  ( cd "$PANEL_DIR" && node -e "
     const Database = require('better-sqlite3');
     const fs       = require('fs');
     const path     = require('path');
@@ -368,7 +371,7 @@ rebuild_caddyfile_direct() {
     fs.renameSync(tmp, '$CADDY_FILE');
     console.log('[Caddyfile] rebuilt with', naiveUsers.length, 'user(s)');
     db.close();
-  " || {
+  " ) || {
     log_warn "Node Caddyfile rebuild failed — Caddyfile will be rebuilt on next panel operation"
     return 1
   }
@@ -394,7 +397,8 @@ rebuild_mita_state_direct() {
   log_step "Rebuilding mita-state.json from database"
   [[ ! -f "$DB_PATH" ]] && { log_warn "DB not found — skipping mita state rebuild"; return; }
 
-  node -e "
+  # Bug 82: run node from the panel dir so better-sqlite3 resolves correctly.
+  ( cd "$PANEL_DIR" && node -e "
     const Database = require('better-sqlite3');
     const fs       = require('fs');
     const db       = new Database('$DB_PATH', { readonly: true });
@@ -429,7 +433,7 @@ rebuild_mita_state_direct() {
     fs.renameSync(tmp, '$MITA_STATE_FILE');
     console.log('[mita-state] wrote', users.length, 'user(s)');
     db.close();
-  " 2>/dev/null || {
+  " ) 2>/dev/null || {
     log_warn "Node mita state rebuild failed"
     return 1
   }
