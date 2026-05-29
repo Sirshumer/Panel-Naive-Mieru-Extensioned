@@ -11,6 +11,19 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Audit & cascade hardening (`genspark_ai_developer_audit`)
 
+- **Bug 73 (P0, `install.sh`)** — **install aborted at `write_config_json`** on a
+  clean Ubuntu 24.04: the admin password was passed to `node -e` as
+  `process.argv[2]`, but `node -e` has no script-path arg so the value lands at
+  `argv[1]`. `argv[2]` was `undefined` → `bcrypt.hashSync` threw → the
+  `htpasswd` fallback failed too (apache2-utils not installed) → `die`, so
+  `config.json` was never written and the panel/PM2 never started (`:3000` dead).
+  **Fix**: pass the password via the `RIXXX_ADMIN_PASS` env var and read it from
+  `process.env` (also avoids shell-quoting issues with special chars); the
+  fallback now installs `apache2-utils` first. Added `install_panel` fallback to
+  `$PWD/panel` and wrapped `npm install` in a subshell so the main shell's cwd is
+  preserved. Regression checks added to `tests/e2e.sh`.
+
+
 Pre-test tech-lead audit. The Mieru cascade was re-architected from native `egress`
 (Variant A) to the field-tested **Variant B** (redsocks + iptables + mieru-client),
 because the Exit node is a full Mieru server (`mita`), not a raw SOCKS5 endpoint.

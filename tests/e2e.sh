@@ -492,6 +492,17 @@ assert "ARM error: install.sh references v1.2.6 (not older)" \
 assert "uninstall.sh removes /var/lib/caddy" \
   "grep -q 'rm -rf /var/lib/caddy' '$REPO_ROOT/uninstall.sh'"
 
+# Bug 73 (P0): write_config_json must pass the admin password via env var and
+# read it from process.env (NOT process.argv[2], which is undefined for node -e).
+assert "Bug73: install.sh bcrypt uses RIXXX_ADMIN_PASS env (not argv[2])" \
+  "grep -q 'RIXXX_ADMIN_PASS' '$REPO_ROOT/install.sh' && ! grep -q 'hashSync(process.argv\\[2\\]' '$REPO_ROOT/install.sh'"
+assert "Bug73: install.sh reads pw from process.env.RIXXX_ADMIN_PASS" \
+  "grep -q 'process.env.RIXXX_ADMIN_PASS' '$REPO_ROOT/install.sh'"
+assert "Bug73: install.sh htpasswd fallback installs apache2-utils" \
+  "grep -q 'apache2-utils' '$REPO_ROOT/install.sh'"
+assert "install.sh install_panel falls back to PWD/panel" \
+  "grep -q 'PWD/panel' '$REPO_ROOT/install.sh'"
+
 # ── Cascade Variant B (static) checks ─────────────────────────────────────────
 log_step "Step 9c: Cascade Variant B (redsocks + iptables + mieru-client)"
 
