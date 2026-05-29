@@ -9,6 +9,31 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 79 (`install.sh` + `update.sh`) — caddy-naive "Caddyfile: permission denied"
+
+**P1 — Naive shown as disabled in the panel.** On the live server `caddy-naive`
+was in a `failed` state, restart-looping with:
+```
+Error: reading config from file: open /etc/caddy-naive/Caddyfile: permission denied
+```
+
+Root cause — a directory-traversal permission bug. The service runs as
+`User=caddy`, but the installer set up `/etc/caddy-naive` with
+`chgrp caddy + chmod -R g+r + chmod 640 Caddyfile`. That gives the **group** read
+on the files, but a **640 directory** (`drw-r-----`) has **no execute (x) bit for
+the group**, so the `caddy` user cannot *traverse* the directory to open the file
+inside it — hence "permission denied", even though the file's own perms looked OK.
+
+**Fix** (both scripts):
+- Own the whole config dir as `root:caddy`.
+- Directory → **750** (`rwxr-x---`, group can traverse + list).
+- Files → **640** (`rw-r-----`, group can read).
+- Order matters: chmod the top dir to 750 **first**, then `find` the contents
+  (a 640 dir can't be descended into by `find`). Verified in a sandbox.
+- `update.sh` gains a `fix_caddy_perms()` helper, called from
+  `rebuild_caddyfile_direct`, `do_repair`, and `do_update` (which now also
+  restarts caddy-naive), so existing broken installs self-heal on update.
+
 ### Bug 78 (panel) — Monitoring traffic always 0 + selectable Mieru port
 
 **P2 — traffic never updated.** Both `/api/stats/users` and the 60-second traffic

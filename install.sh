@@ -991,8 +991,23 @@ start_services() {
   chown root:caddy "$CADDY_BIN" 2>/dev/null || true
   chmod 755 "$CADDY_BIN" 2>/dev/null || true
   setcap 'cap_net_bind_service=+ep' "$CADDY_BIN" 2>/dev/null || true
-  chgrp -R caddy "$CADDY_CONFIG_DIR" 2>/dev/null || true
-  chmod -R g+r  "$CADDY_CONFIG_DIR" 2>/dev/null || true
+
+  # Bug 79: caddy-naive runs as User=caddy and failed at startup with
+  #   "reading config from file: open /etc/caddy-naive/Caddyfile: permission denied".
+  #   The previous `chgrp caddy + chmod g+r + chmod 640` set the GROUP and read
+  #   bits on files, but a 640 directory (drw-r-----) has NO execute (x) bit for
+  #   the group, so the caddy user cannot *traverse* the dir to open the file.
+  #   Fix: own the whole config dir as root:caddy, give the DIRECTORY 750
+  #   (rwxr-x---, group can traverse + read) and the secret/config FILES 640.
+  chown -R root:caddy "$CADDY_CONFIG_DIR" 2>/dev/null || true
+  # Order matters: make the top dir traversable FIRST, otherwise `find` cannot
+  # descend into a 640 dir to chmod the files inside it.
+  chmod 750 "$CADDY_CONFIG_DIR" 2>/dev/null || true
+  # Directories: 750 so the caddy group can enter and list them.
+  find "$CADDY_CONFIG_DIR" -type d -exec chmod 750 {} + 2>/dev/null || true
+  # Files: 640 so the caddy group can read them (no write, no exec).
+  find "$CADDY_CONFIG_DIR" -type f -exec chmod 640 {} + 2>/dev/null || true
+  # Belt-and-suspenders: ensure the Caddyfile is right.
   chmod 640 "$CADDY_FILE" 2>/dev/null || true
 
   systemctl daemon-reload
