@@ -9,6 +9,24 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### UX fixes (`genspark_ai_developer_audit`)
+
+- **P2 — Email is now optional when adding a user.** The TLS certificate is
+  obtained at install time via Caddy's ACME (the global `email` directive), not
+  per-user, so a per-user email served no purpose. Removed the `required`
+  attribute and the `*` from the form, relaxed `validateUserInput()` (an email is
+  still format-checked *if* provided), and store `NULL` (not `''`) for empty
+  emails. Added a one-time DB migration that rebuilds `users.email` from
+  `TEXT NOT NULL UNIQUE` → `TEXT UNIQUE`, so multiple email-less users no longer
+  collide on the UNIQUE constraint. Existing emails are preserved.
+
+- **P3 — Removed the password prompt when downloading a client config.** The
+  config-download modal previously asked for the user's password even though the
+  admin is already authenticated and the server stores the plaintext password.
+  The naive link / QR now auto-load on open and all three downloads (naive,
+  mieru, universal) use the server's stored-password fallback — no extra input
+  required. Removed the `cfg-password` input + note from the modal.
+
 ### Audit & cascade hardening (`genspark_ai_developer_audit`)
 
 - **Bug 73 (P0, `install.sh`)** — **install aborted at `write_config_json`** on a

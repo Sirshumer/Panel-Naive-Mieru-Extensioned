@@ -300,8 +300,8 @@
                 <input type="text" id="u-username" data-i18n-ph="users.usernamePlaceholder" placeholder="john_doe" required />
               </div>
               <div class="form-group">
-                <label data-i18n="users.email">Email *</label>
-                <input type="email" id="u-email" data-i18n-ph="users.emailPlaceholder" placeholder="john@example.com" required />
+                <label data-i18n="users.email">Email</label>
+                <input type="email" id="u-email" data-i18n-ph="users.emailPlaceholder" placeholder="john@example.com" />
               </div>
             </div>
             <div class="form-row">
@@ -350,13 +350,9 @@
             <button class="modal-close" data-action="close-config-modal" aria-label="Close">✕</button>
           </div>
           <div class="modal-body">
-            <p style="margin-bottom:12px;color:var(--text-secondary);font-size:13px" data-i18n="config.passwordNote">
-              Enter the user's plain-text password to embed in the config file.
+            <p style="margin-bottom:12px;color:var(--text-secondary);font-size:13px" data-i18n="config.downloadNote">
+              The user's stored password is embedded automatically. Copy the link or download a config file.
             </p>
-            <div class="form-group">
-              <label data-i18n="config.passwordLabel">Password</label>
-              <input type="password" id="cfg-password" data-i18n-ph="config.passwordPlaceholder" placeholder="User password" />
-            </div>
             <div id="naive-link-box" class="code-box hidden"></div>
             <div id="qr-container" class="qr-container hidden">
               <canvas id="qr-canvas"></canvas>

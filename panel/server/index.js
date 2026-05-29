@@ -100,7 +100,7 @@ try {
   db.exec(`
     CREATE TABLE IF NOT EXISTS users (
       id        TEXT PRIMARY KEY,
-      email     TEXT NOT NULL UNIQUE,
+      email     TEXT UNIQUE,
       username  TEXT NOT NULL UNIQUE,
       passHash  TEXT NOT NULL,
       password  TEXT NOT NULL DEFAULT '',
@@ -126,6 +126,48 @@ try {
   `);
   // Migrate: add password column if missing (upgrade from v1.0.x)
   try { db.exec(`ALTER TABLE users ADD COLUMN password TEXT NOT NULL DEFAULT ''`); } catch {}
+
+  // Migrate: make `email` nullable so it can be optional (TLS cert is set at
+  // install time via Caddy ACME, not per-user). Old schema had `email TEXT
+  // NOT NULL UNIQUE`, which rejects empty/absent emails and collides on ''.
+  // Rebuild the table only if the column is still NOT NULL.
+  try {
+    const cols = db.prepare(`PRAGMA table_info(users)`).all();
+    const emailCol = cols.find(c => c.name === 'email');
+    if (emailCol && emailCol.notnull === 1) {
+      db.exec(`
+        BEGIN TRANSACTION;
+        ALTER TABLE users RENAME TO users_legacy;
+        CREATE TABLE users (
+          id        TEXT PRIMARY KEY,
+          email     TEXT UNIQUE,
+          username  TEXT NOT NULL UNIQUE,
+          passHash  TEXT NOT NULL,
+          password  TEXT NOT NULL DEFAULT '',
+          expiry    TEXT,
+          protocols TEXT DEFAULT '["naive","mieru"]',
+          quotaMB   INTEGER DEFAULT 0,
+          usedMB    REAL    DEFAULT 0,
+          createdAt TEXT NOT NULL,
+          updatedAt TEXT NOT NULL,
+          lastSeen  TEXT
+        );
+        INSERT INTO users
+          (id,email,username,passHash,password,expiry,protocols,quotaMB,usedMB,createdAt,updatedAt,lastSeen)
+        SELECT
+          id,
+          CASE WHEN email='' THEN NULL ELSE email END,
+          username,passHash,password,expiry,protocols,quotaMB,usedMB,createdAt,updatedAt,lastSeen
+        FROM users_legacy;
+        DROP TABLE users_legacy;
+        COMMIT;
+      `);
+      console.log('[DB] migrated users.email -> nullable (email is now optional)');
+    }
+  } catch (e) {
+    try { db.exec('ROLLBACK'); } catch {}
+    console.error('[DB] email-nullable migration skipped:', e.message);
+  }
 } catch (err) {
   console.error('[DB] SQLite unavailable:', err.message, '— using in-memory store');
 }
@@ -632,8 +674,10 @@ const EMAIL_RE        = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 function validateUserInput({ email, username, password, protocols, quotaMB, quotaGb }, requirePassword) {
   if (!username || !USERNAME_RE.test(username))
     return { error: 'username required and must match [a-zA-Z0-9_.-] (max 64 chars)' };
-  if (!email || !EMAIL_RE.test(email))
-    return { error: 'valid email is required' };
+  // Email is optional (TLS cert is configured at install time via Caddy ACME,
+  // not per-user). If provided, it must still be a valid address.
+  if (email !== undefined && email !== null && email !== '' && !EMAIL_RE.test(email))
+    return { error: 'email is invalid' };
   if (requirePassword) {
     if (!password) return { error: 'password is required for new users' };
     if (password.length < 8) return { error: 'password must be at least 8 characters' };
@@ -703,7 +747,10 @@ app.post('/api/users', requireAuth, (req, res) => {
   const now  = new Date().toISOString();
   const user = {
     id:        uuidv4(),
-    email, username,
+    // Email is optional: store NULL (not '') so the UNIQUE constraint allows
+    // multiple users without an email.
+    email:     (email && email.trim()) ? email.trim() : null,
+    username,
     passHash:  bcrypt.hashSync(password, 12),
     password,
     expiry:    expiry || null,
@@ -741,7 +788,7 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
 
   const updated = {
     ...user,
-    email:     email     ?? user.email,
+    email:     email !== undefined ? ((email && email.trim()) ? email.trim() : null) : user.email,
     username:  username  ?? user.username,
     expiry:    expiry    !== undefined ? (expiry || null) : user.expiry,
     protocols: protocols

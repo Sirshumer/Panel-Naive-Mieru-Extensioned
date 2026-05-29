@@ -535,7 +535,7 @@ async function saveUser() {
   if (el('p-naive').checked) protocols.push('naive');
   if (el('p-mieru').checked) protocols.push('mieru');
 
-  if (!username || !email)  return showUserError(t('users.usernameRequired'));
+  if (!username)            return showUserError(t('users.usernameRequired'));
   if (!id && !password)     return showUserError(t('users.passwordRequired'));
   if (password && password.length < 8) return showUserError(t('users.passwordTooShort'));
   if (!protocols.length)    return showUserError(t('users.protocolRequired'));
@@ -593,21 +593,32 @@ async function deleteUser(id, username) {
 
 function openConfigDownload(id) {
   state.selectedUserId = id;
-  el('cfg-password').value = '';
   el('naive-link-box').classList.add('hidden');
   el('naive-link-box').textContent = '';
   el('qr-container').classList.add('hidden');
   el('config-modal').classList.remove('hidden');
+  // P3: no password prompt — the server uses the user's stored password.
+  // Auto-load the naive link + QR right away.
+  loadNaiveLink();
 }
 
 function closeConfigModal() { el('config-modal').classList.add('hidden'); }
 
-async function downloadNaiveLink() {
-  const password = el('cfg-password').value;
-  if (!password) { toast(t('config.enterPassword'), 'error'); return; }
+// Fetch + render the naive link/QR (no copy/toast) — used on modal open.
+async function loadNaiveLink() {
   try {
     const data = await api('GET',
-      `/api/users/${state.selectedUserId}/config/naive?password=${encodeURIComponent(password)}`);
+      `/api/users/${state.selectedUserId}/config/naive`);
+    el('naive-link-box').textContent = data.link;
+    el('naive-link-box').classList.remove('hidden');
+    generateQR(data.link);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+async function downloadNaiveLink() {
+  try {
+    const data = await api('GET',
+      `/api/users/${state.selectedUserId}/config/naive`);
 
     el('naive-link-box').textContent = data.link;
     el('naive-link-box').classList.remove('hidden');
@@ -639,11 +650,9 @@ async function generateQR(text) {
 }
 
 async function downloadMieruConfig() {
-  const password = el('cfg-password').value;
-  if (!password) { toast(t('config.enterPassword'), 'error'); return; }
   try {
     const res = await fetch(
-      `/api/users/${state.selectedUserId}/config/mieru?password=${encodeURIComponent(password)}`,
+      `/api/users/${state.selectedUserId}/config/mieru`,
       { credentials: 'include' });
     if (res.status === 401) { redirectToLogin(); return; }
     if (!res.ok) throw new Error(await res.text());
@@ -656,11 +665,9 @@ async function downloadMieruConfig() {
 }
 
 async function downloadUniversalConfig() {
-  const password = el('cfg-password').value;
-  if (!password) { toast(t('config.enterPassword'), 'error'); return; }
   try {
     const res = await fetch(
-      `/api/users/${state.selectedUserId}/config/universal?password=${encodeURIComponent(password)}`,
+      `/api/users/${state.selectedUserId}/config/universal`,
       { credentials: 'include' });
     if (res.status === 401) { redirectToLogin(); return; }
     if (!res.ok) throw new Error(await res.text());
