@@ -9,6 +9,40 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Audit & cascade hardening (`genspark_ai_developer_audit`)
+
+Pre-test tech-lead audit. The Mieru cascade was re-architected from native `egress`
+(Variant A) to the field-tested **Variant B** (redsocks + iptables + mieru-client),
+because the Exit node is a full Mieru server (`mita`), not a raw SOCKS5 endpoint.
+
+- **P0 fix** — Mieru native egress SOCKS5 auth field corrected `username` → `user`
+  (`app.js`), matching the official `socks5Authentication.{user,password}` schema.
+- **P0 fix** — version sync to `1.2.6` across `uninstall.sh`, `tests/e2e.sh`,
+  and `install.sh` ARM messages (previously `1.2.5`, would fail the e2e version step).
+- **Added `panel/scripts/cascade_mieru.sh`** — orchestrator for Variant B with
+  `setup` / `teardown` / `status`. Encapsulates the proven manual guide while
+  avoiding its pitfalls: `profiles` (plural), no `mtu` in client config,
+  `Type=forking` + `mieru start`, redsocks restarted with mieru via
+  `ExecStartPost`, anti-loop `RETURN` for the resolved Exit IP, watchdog that
+  restarts only after 3 consecutive failures, **lazy install** of
+  `redsocks` + `mieru-client` on first enable, and the **full Exit port range**.
+- **Server (`index.js`)** — `POST /api/settings/cascade` now runs
+  `cascade_mieru.sh setup/teardown` for the Mieru leg (Naive leg still via
+  Caddyfile `upstream`); `buildMitaStateFile()` no longer injects native egress
+  when a Variant B exit host is set (legacy egress kept as explicit fallback);
+  new `cfg.cascadeMieru { host, portStart, portEnd, user, pass }`; new
+  `GET /api/settings/cascade/status`; `/api/config` masks the exit password
+  (returns a boolean) so secrets never reach the browser; `runCascadeMieru()`
+  uses `execFileSync` (no shell) so credentials are argv-safe.
+- **UI** — exit **port range** (start/end) inputs, host/IP + username/password
+  relabelled, blank-password-keeps-existing, a **Check status** button and a
+  status panel; ru/en i18n keys added.
+- **`install.sh`** — new `tune_network()` step finally invokes
+  `scripts/sysctl_tune.sh` (BBR + UDP buffers).
+- **`uninstall.sh`** — full cascade cleanup (iptables `REDSOCKS` chain,
+  `mieru.service`, redsocks + drop-in, `/etc/redsocks.conf`, watchdog + cron,
+  shred of client config + state) and an optional redsocks apt-purge prompt.
+
 ### Added
 
 - **Cascade / Relay architecture (NaiveProxy + Mieru)** — Settings UI now supports chaining traffic through an intermediate "Exit" node:
