@@ -9,6 +9,34 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 85 (`update.sh`) — `--repair` (and `--status`/`--expose`/`--ssh-only`) exited 1 SILENTLY before doing anything
+
+Live testing: `sudo bash update.sh --repair -y` returned `EXIT=1` with **zero
+output** and the Caddyfile was never rebuilt (still the old Bug 83-era layout),
+so Bug 84's direct rebuild never even ran.
+
+Root cause — the classic Bug 77 `set -e` trap: the **last** statement of
+`parse_args` was
+```bash
+[[ -z "$MODE" ]] && MODE="update"
+```
+When a mode flag was supplied (e.g. `--repair` → `MODE="repair"`), the test
+`[[ -z "repair" ]]` is FALSE, so `parse_args` **returned 1**. In `main()`,
+`parse_args "$@"` is a plain command → `set -euo pipefail` aborted the whole
+script immediately, and because the failure was a function *return* the `ERR`
+trap was skipped → no message at all. This only hit mode flags; a bare update
+left `MODE` empty, so the test was TRUE → return 0 → it worked (which is why
+`--force -y` always ran but `--repair` never did).
+
+Fix: replace the trailing one-liner with an explicit `if` block and a trailing
+`return 0`:
+```bash
+if [[ -z "$MODE" ]]; then MODE="update"; fi
+return 0
+```
+Now `--repair`/`--status`/`--expose`/`--ssh-only` reach their handlers, and with
+Bug 84 `--repair` rebuilds the Caddyfile directly from the on-disk template.
+
 ### Bug 84 (`update.sh`) — `--repair` regenerated a STALE Caddyfile via the panel API
 
 After Bug 83 was merged and deployed (the on-disk `caddyTemplate.js` in
