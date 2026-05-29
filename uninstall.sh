@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — uninstall.sh  v1.2.5
+# Panel Naive + Mieru by RIXXX — uninstall.sh  v1.2.6
 # Removes all panel components, services, configs, and data.
 #
 # v1.2.3: Full cleanup for caddy-forwardproxy-naive migration.
 # v1.2.5: Also removes /var/lib/caddy (ACME cert storage, Bug 43).
+# v1.2.6: Cascade/relay cleanup (mieru-client, redsocks, iptables, watchdog).
 # ==============================================================================
 set -euo pipefail
 
@@ -19,7 +20,7 @@ die()       { echo -e "${RED}[ERROR]${NC} $*" >&2; exit 1; }
 [[ $EUID -ne 0 ]] && die "Run as root (sudo bash uninstall.sh)"
 
 echo -e "\n${RED}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
-echo -e "${RED}${BOLD}║   Panel Naive + Mieru — UNINSTALL  v1.2.5                ║${NC}"
+echo -e "${RED}${BOLD}║   Panel Naive + Mieru — UNINSTALL  v1.2.6                ║${NC}"
 echo -e "${RED}${BOLD}╚══════════════════════════════════════════════════════════╝${NC}\n"
 
 echo -e "${YELLOW}${BOLD}WARNING:${NC} This will permanently remove ALL panel data, users,"

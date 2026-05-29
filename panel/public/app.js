@@ -703,7 +703,7 @@ async function loadSettings() {
     const cascadeMieruPortEl = el('s-cascade-mieru-port');
     if (cascadeMieruPortEl) cascadeMieruPortEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.port) || 1080;
     const cascadeMieruUserEl = el('s-cascade-mieru-user');
-    if (cascadeMieruUserEl) cascadeMieruUserEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.socks5Authentication?.username) || '';
+    if (cascadeMieruUserEl) cascadeMieruUserEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.socks5Authentication?.user) || '';
     const cascadeMieruPassEl = el('s-cascade-mieru-pass');
     if (cascadeMieruPassEl) cascadeMieruPassEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.socks5Authentication?.password) || '';
     document.getElementById('about-version').textContent = `v${cfg.version || '1.2.4'}`;
@@ -852,7 +852,9 @@ async function changeCascade() {
       protocol: 'SOCKS5_PROXY_PROTOCOL',
       host: mieruHost,
       port: mieruPort,
-      socks5Authentication: mieruUser ? { username: mieruUser, password: mieruPass } : undefined
+      // mita egress requires the field name "user" (NOT "username") per
+      // mieru docs/server-install.md → socks5Authentication.{user,password}
+      socks5Authentication: mieruUser ? { user: mieruUser, password: mieruPass } : undefined
     }],
     rules: [{ ipRanges: ['*'], domainNames: ['*'], action: 'DIRECT' }]
   } : {};
