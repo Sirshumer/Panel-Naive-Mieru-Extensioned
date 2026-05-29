@@ -9,6 +9,21 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 81b (`update.sh`) — migrate existing installs to bare + regenerate on update
+
+Follow-up after live testing: `--force` update did **not** regenerate the Caddyfile
+(it only restarted caddy), and existing `config.json` had a `probeSecret` but no
+`probeMode`, so back-compat kept the old `probe_resistance <secret>` line and the
+`servers { protocols h1 h2 }` block never appeared. Two fixes:
+
+1. **`migrate_config()`** — on `update`/`repair`, when `probeMode` is missing it is
+   set to `'bare'` (matching the reference server). The stored `probeSecret` is kept
+   so the user can switch back to `secret` from the panel later.
+2. **`do_update` now regenerates the Caddyfile** via `rebuild_caddyfile_direct()`
+   (caddyTemplate.js) after migration, so the protocols block and bare
+   `probe_resistance` take effect on a plain `update.sh --force` without needing
+   a separate `--repair`.
+
 ### Bug 81 (`panel` + `install.sh` + `update.sh`) — probe_resistance mode (bare/secret/off)
 
 **Naive config parity with a known-good reference server.** The user compared our
