@@ -278,114 +278,148 @@ rebuild_caddyfile_direct() {
   # (root is wrong — caddy-naive.service runs as User=caddy)
   id caddy &>/dev/null && chown caddy:caddy /var/log/caddy-naive /var/lib/caddy || true
 
-  local template_js="${PANEL_DIR}/server/caddyTemplate.js"
+  # Bug 86: build the Caddyfile via a TEMP .js FILE rather than an inline
+  # `node -e "<huge double-quoted blob>"`.
+  #
+  # The previous inline form embedded the whole rebuild script inside a
+  # double-quoted bash string, so bash pre-processed it: `$DB_PATH` /
+  # `$PANEL_CONFIG` / `$CADDY_FILE` were string-substituted, and any stray `$`,
+  # backtick or `\` in the JS was at the mercy of bash quoting. On the live
+  # server this silently produced a node program that exited 0 *without* writing
+  # the new Caddyfile (the `[Caddyfile] rebuilt with N user(s)` line never
+  # appeared in --repair output), yet the subsequent `caddy validate` happily
+  # validated the STALE file → false "Caddyfile rebuilt ✓". Running the exact
+  # same logic from a real .js file (paths passed via process.env, no bash
+  # interpolation) wrote the correct Bug 83 Caddyfile immediately.
+  #
+  # Fix: write the script with a QUOTED heredoc (<<'NODE_EOF' — no expansion),
+  # pass every path through the environment, and `node "$rebuild_js"`. This
+  # removes all bash-quoting hazards and makes a real failure exit non-zero
+  # (caught below) instead of silently no-op'ing.
+  # Bug 86b: node resolves `require('better-sqlite3')` relative to the SCRIPT
+  # FILE's directory, not the cwd. A /tmp/*.js would look in /tmp/node_modules
+  # and fail (reintroducing the Bug 82 "Cannot find module" problem). Write the
+  # temp script INTO $PANEL_DIR so the panel's node_modules are on the lookup path.
+  local rebuild_js; rebuild_js=$(mktemp "${PANEL_DIR}/.rebuild-caddy.XXXXXX.js")
+  cat > "$rebuild_js" <<'NODE_EOF'
+const Database = require('better-sqlite3');
+const fs       = require('fs');
+
+const DB_PATH      = process.env.RB_DB_PATH;
+const PANEL_CONFIG = process.env.RB_PANEL_CONFIG;
+const CADDY_FILE   = process.env.RB_CADDY_FILE;
+const CADDY_CFGDIR = process.env.RB_CADDY_CFGDIR;
+const TEMPLATE_JS  = process.env.RB_TEMPLATE_JS;
+const FAKE_SITE    = process.env.RB_FAKE_SITE;
+
+const db  = new Database(DB_PATH, { readonly: true });
+const cfg = JSON.parse(fs.readFileSync(PANEL_CONFIG, 'utf8'));
+
+// Bug 34: filter to naive-protocol users; placeholder emitted by template when empty
+const naiveUsers = db.prepare('SELECT username, password, protocols FROM users').all()
+  .filter(u => {
+    try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
+    catch { return true; }
+  })
+  .map(u => ({ username: u.username, password: u.password || '' }))
+  // Bug 67: skip users with no plaintext password — empty password produces
+  // "basic_auth user " (trailing space) which Caddy rejects as invalid syntax
+  .filter(u => u.password.trim() !== '');
+
+const probeSecret = cfg.probeSecret ||
+  (() => { try { return fs.readFileSync(CADDY_CFGDIR + '/probe_secret', 'utf8').trim(); } catch { return ''; } })();
+// Bug 81: probe_resistance mode — derive from probeSecret when unset.
+let probeMode = (cfg.probeMode || '').trim().toLowerCase();
+if (!probeMode) probeMode = probeSecret ? 'secret' : 'bare';
+
+// Bug 26: use shared template for consistency with install.sh
+let content;
+if (fs.existsSync(TEMPLATE_JS)) {
+  const tpl = require(TEMPLATE_JS);
+  content = tpl.render({
+    adminEmail:  cfg.adminEmail  || '',
+    domain:      cfg.domain      || 'localhost',
+    naivePort:   cfg.naivePort   || 443,
+    fakeSiteDir: cfg.fakeSiteDir || FAKE_SITE,
+    probeSecret,
+    probeMode,
+    logFile:     '/var/log/caddy-naive/access.log',
+    upstream:    (cfg.cascadeEnabled && cfg.cascadeNaiveUpstream) ? cfg.cascadeNaiveUpstream : ''
+  }, naiveUsers);
+} else {
+  // Fallback (template not available): emit correct Bug 83 syntax directly
+  const crypto = require('crypto');
+  let authLines;
+  if (naiveUsers.length > 0) {
+    authLines = naiveUsers.map(u => '    basic_auth ' + u.username + ' ' + u.password).join('\n');
+  } else {
+    const rnd = crypto.randomBytes(20).toString('hex');
+    authLines = '    basic_auth _placeholder_' + rnd.slice(0, 16) + ' _disabled_' + rnd.slice(16);
+  }
+  let probeLine;
+  if (probeMode === 'off') probeLine = '';
+  else if (probeMode === 'secret' && probeSecret) probeLine = '\n    probe_resistance ' + probeSecret;
+  else probeLine = '\n    probe_resistance';
+  content = [
+    '{',
+    '  order forward_proxy before file_server',
+    '  servers {',
+    '    protocols h1 h2',
+    '  }',
+    '  email ' + (cfg.adminEmail || ''),
+    '  admin off',
+    '  log {',
+    '    output file /var/log/caddy-naive/access.log {',
+    '      roll_size     50mb',
+    '      roll_keep_for 720h',
+    '    }',
+    '    format json',
+    '  }',
+    '}',
+    '',
+    ':80 {',
+    '  redir https://{host}{uri} permanent',
+    '}',
+    '',
+    // Bug 83: ':<port>, <domain>' listener + explicit tls + no route{} wrapper
+    ':' + (cfg.naivePort || 443) + ', ' + (cfg.domain || 'localhost') + ' {',
+    '  tls ' + (cfg.adminEmail || ''),
+    '',
+    '  forward_proxy {',
+    authLines,
+    '    hide_ip',
+    '    hide_via' + probeLine,
+    '  }',
+    '',
+    '  file_server {',
+    '    root ' + (cfg.fakeSiteDir || FAKE_SITE),
+    '  }',
+    '}'
+  ].join('\n');
+}
+
+const tmp = CADDY_FILE + '.new';
+fs.writeFileSync(tmp, content, { mode: 0o640 });
+fs.renameSync(tmp, CADDY_FILE);
+console.log('[Caddyfile] rebuilt with ' + naiveUsers.length + ' user(s) → ' + CADDY_FILE);
+db.close();
+NODE_EOF
 
   # Bug 82: run node from the panel dir so it can resolve better-sqlite3 and the
-  # other node_modules (they live under $PANEL_DIR, not the script's cwd which is
-  # the git checkout — that has no node_modules → "Cannot find module").
-  ( cd "$PANEL_DIR" && node -e "
-    const Database = require('better-sqlite3');
-    const fs       = require('fs');
-    const path     = require('path');
-    const db       = new Database('$DB_PATH', { readonly: true });
-    const cfg      = JSON.parse(fs.readFileSync('$PANEL_CONFIG', 'utf8'));
-
-    // Bug 34: filter to naive-protocol users; placeholder emitted by template when empty
-    const naiveUsers = db.prepare('SELECT username, password, protocols FROM users').all()
-      .filter(u => {
-        try { return JSON.parse(u.protocols || '[\"naive\",\"mieru\"]').includes('naive'); }
-        catch { return true; }
-      })
-      .map(u => ({ username: u.username, password: u.password || '' }))
-      // Bug 67: skip users with no plaintext password — empty password produces
-      // "basic_auth user " (trailing space) which Caddy rejects as invalid syntax
-      .filter(u => u.password.trim() !== '');
-
-    const probeSecret = cfg.probeSecret ||
-      (() => { try { return fs.readFileSync('$CADDY_CONFIG_DIR/probe_secret','utf8').trim(); } catch { return ''; } })();
-    // Bug 81: probe_resistance mode — derive from probeSecret when unset.
-    let probeMode = (cfg.probeMode || '').trim().toLowerCase();
-    if (!probeMode) probeMode = probeSecret ? 'secret' : 'bare';
-
-    // Bug 26: use shared template for consistency with install.sh
-    const tplPath = '$template_js';
-    let content;
-    if (fs.existsSync(tplPath)) {
-      const tpl = require(tplPath);
-      content = tpl.render({
-        adminEmail:  cfg.adminEmail  || '',
-        domain:      cfg.domain      || 'localhost',
-        naivePort:   cfg.naivePort   || 443,
-        fakeSiteDir: cfg.fakeSiteDir || '$FAKE_SITE_DIR',
-        probeSecret,
-        probeMode,
-        logFile:     '/var/log/caddy-naive/access.log',
-        upstream:    (cfg.cascadeEnabled && cfg.cascadeNaiveUpstream) ? cfg.cascadeNaiveUpstream : ''
-      }, naiveUsers);
-    } else {
-      // Fallback (template not available): emit correct syntax directly
-      // Bug 23: basic_auth <user> <pass> (no bare keyword)
-      const crypto = require('crypto');
-      let authLines;
-      if (naiveUsers.length > 0) {
-        authLines = naiveUsers.map(u => '    basic_auth ' + u.username + ' ' + u.password).join('\n');
-      } else {
-        const rnd = crypto.randomBytes(20).toString('hex');
-        authLines = '    basic_auth _placeholder_' + rnd.slice(0,16) + ' _disabled_' + rnd.slice(16);
-      }
-      // Bug 81: 'off' → none; 'secret' → with token; 'bare' → keyword only
-      let probeLine;
-      if (probeMode === 'off') probeLine = '';
-      else if (probeMode === 'secret' && probeSecret) probeLine = '\n    probe_resistance ' + probeSecret;
-      else probeLine = '\n    probe_resistance';
-      // Bug 28/30/38: no tls directive, order directive, roll_keep_for
-      content = [
-        '{',
-        '  order forward_proxy before file_server',
-        '  servers {',
-        '    protocols h1 h2',
-        '  }',
-        '  email ' + (cfg.adminEmail || ''),
-        '  admin off',
-        '  log {',
-        '    output file /var/log/caddy-naive/access.log {',
-        '      roll_size     50mb',
-        '      roll_keep_for 720h',
-        '    }',       // closes output {} inside log {}
-        '    format json',
-        '  }',         // Bug 68: closes log {} (was '}' \u2014 wrong indent, left global block unclosed)
-        '}',           // closes global {}
-        '',
-        ':80 {',
-        '  redir https://{host}{uri} permanent',
-        '}',
-        '',
-        // Bug 83: ':<port>, <domain>' listener + explicit tls + no route{} wrapper
-        ':' + (cfg.naivePort || 443) + ', ' + (cfg.domain || 'localhost') + ' {',
-        '  tls ' + (cfg.adminEmail || ''),
-        '',
-        '  forward_proxy {',
-        authLines,
-        '    hide_ip',
-        '    hide_via' + probeLine,
-        '  }',
-        '',
-        '  file_server {',
-        '    root ' + (cfg.fakeSiteDir || '$FAKE_SITE_DIR'),
-        '  }',
-        '}'
-      ].join('\n');
-    }
-
-    const tmp = '$CADDY_FILE' + '.new';
-    fs.writeFileSync(tmp, content, { mode: 0o640 });
-    fs.renameSync(tmp, '$CADDY_FILE');
-    console.log('[Caddyfile] rebuilt with', naiveUsers.length, 'user(s)');
-    db.close();
-  " ) || {
+  # other node_modules (they live under $PANEL_DIR, not the script's cwd).
+  if ! ( cd "$PANEL_DIR" && \
+         RB_DB_PATH="$DB_PATH" \
+         RB_PANEL_CONFIG="$PANEL_CONFIG" \
+         RB_CADDY_FILE="$CADDY_FILE" \
+         RB_CADDY_CFGDIR="$CADDY_CONFIG_DIR" \
+         RB_TEMPLATE_JS="${PANEL_DIR}/server/caddyTemplate.js" \
+         RB_FAKE_SITE="$FAKE_SITE_DIR" \
+         node "$rebuild_js" ); then
+    rm -f "$rebuild_js"
     log_warn "Node Caddyfile rebuild failed — Caddyfile will be rebuilt on next panel operation"
     return 1
-  }
+  fi
+  rm -f "$rebuild_js"
 
   # Bug 39: validate after rebuild so --repair fails loudly if template is wrong
   local caddy_bin; caddy_bin=$(jq -r '.caddyBin // "/usr/local/bin/caddy-naive"' "$PANEL_CONFIG" 2>/dev/null || echo '/usr/local/bin/caddy-naive')
