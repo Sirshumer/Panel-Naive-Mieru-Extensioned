@@ -34,7 +34,7 @@ const http           = require('http');
 const { WebSocketServer } = require('ws');
 const fs             = require('fs');
 const path           = require('path');
-const { execSync }   = require('child_process');
+const { execSync, execFileSync } = require('child_process');
 const si             = require('systeminformation');
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
@@ -73,7 +73,11 @@ try {
     probeSecret:   '',
     mitaStateFile: MITA_STATE_FILE,
     trafficPattern: 'NOOP', mtu: 1400, udpEnabled: false,
-    cascadeEnabled: false, cascadeNaiveUpstream: '', cascadeMieruEgress: {},
+    // Cascade (relay): Naive uses Caddyfile upstream; Mieru uses Variant B
+    // (redsocks+iptables+mieru-client) orchestrated by scripts/cascade_mieru.sh.
+    cascadeEnabled: false, cascadeNaiveUpstream: '',
+    cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '' },
+    cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
     language: 'ru', version: '1.2.6'
   };
 }
@@ -385,8 +389,16 @@ function buildMitaStateFile() {
     if (patMap[pat]) mieruCfg.trafficPattern = patMap[pat];
   }
 
-  // v1.2.6: cascade — mieru egress (outbound proxy chain)
-  if (cfg.cascadeEnabled && cfg.cascadeMieruEgress && cfg.cascadeMieruEgress.proxies && cfg.cascadeMieruEgress.proxies.length > 0) {
+  // v1.2.6 cascade (Mieru): Variant B is used instead of mita native egress.
+  // The entry mita stays a plain server; the RU->EU relay is handled externally
+  // by scripts/cascade_mieru.sh (mieru-client + redsocks + iptables). We
+  // therefore intentionally do NOT inject `mieruCfg.egress` here.
+  // Legacy Variant A native egress is only applied if an operator explicitly
+  // sets cascadeMieruEgress.proxies AND no Variant B host is configured.
+  if (cfg.cascadeEnabled
+      && (!cfg.cascadeMieru || !cfg.cascadeMieru.host)
+      && cfg.cascadeMieruEgress && Array.isArray(cfg.cascadeMieruEgress.proxies)
+      && cfg.cascadeMieruEgress.proxies.length > 0) {
     mieruCfg.egress = {
       proxies: cfg.cascadeMieruEgress.proxies,
       rules: cfg.cascadeMieruEgress.rules || [{ ipRanges: ['*'], domainNames: ['*'], action: 'DIRECT' }]
@@ -423,6 +435,31 @@ function restartMieru() {
     shredFile(file + '.last');
     return true;
   } catch { return false; }
+}
+
+// ── Mieru cascade (Variant B) — scripts/cascade_mieru.sh orchestrator ─────────
+const CASCADE_SCRIPT = path.join(__dirname, '../scripts/cascade_mieru.sh');
+
+// Run cascade_mieru.sh {setup|teardown|status}. Returns { ok, output }.
+// Uses execFileSync (no shell) so the exit credentials are passed as argv and
+// never interpolated into a shell string.
+function runCascadeMieru(action, opts = {}) {
+  try {
+    const args = [CASCADE_SCRIPT, action];
+    if (action === 'setup') {
+      args.push(
+        '--exit-host',       String(opts.host || ''),
+        '--exit-port-start', String(opts.portStart || ''),
+        '--exit-port-end',   String(opts.portEnd || ''),
+        '--exit-user',       String(opts.user || ''),
+        '--exit-pass',       String(opts.pass || '')
+      );
+    }
+    const out = execFileSync('bash', args, { timeout: 120000 }).toString();
+    return { ok: true, output: out };
+  } catch (e) {
+    return { ok: false, output: (e.stdout ? e.stdout.toString() : '') + (e.stderr ? e.stderr.toString() : e.message) };
+  }
 }
 
 function shredFile(fp) {
@@ -845,31 +882,91 @@ app.post('/api/services/rebuild-all', requireAuth, (req, res) => {
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
-// ── v1.2.6: Cascade settings ──────────────────────────────────────────────────
+// ── v1.2.6: Cascade settings (Variant B) ──────────────────────────────────────
+// Naive cascade  → Caddyfile `upstream` (handled by buildCaddyfile).
+// Mieru cascade  → Variant B (mieru-client + redsocks + iptables) orchestrated
+//                  by scripts/cascade_mieru.sh. The entry mita stays plain.
 app.get('/api/settings/cascade', requireAuth, (req, res) => {
-  const safe = {
+  const m = cfg.cascadeMieru || {};
+  res.json({
     cascadeEnabled: !!cfg.cascadeEnabled,
     cascadeNaiveUpstream: cfg.cascadeNaiveUpstream || '',
-    cascadeMieruEgress: cfg.cascadeMieruEgress || {}
-  };
-  res.json(safe);
+    cascadeMieru: {
+      host:      m.host || '',
+      portStart: m.portStart || 2012,
+      portEnd:   m.portEnd   || 2022,
+      user:      m.user || '',
+      // never return the stored exit password; UI shows a placeholder
+      hasPass:   !!m.pass
+    }
+  });
+});
+
+// Live cascade status (calls cascade_mieru.sh status).
+app.get('/api/settings/cascade/status', requireAuth, (req, res) => {
+  const r = runCascadeMieru('status');
+  res.json({ ok: r.ok, output: r.output });
 });
 
 app.post('/api/settings/cascade', requireAuth, (req, res) => {
-  const { cascadeEnabled, cascadeNaiveUpstream, cascadeMieruEgress } = req.body;
-  cfg.cascadeEnabled = !!cascadeEnabled;
-  if (cascadeNaiveUpstream !== undefined) cfg.cascadeNaiveUpstream = String(cascadeNaiveUpstream || '').trim();
-  if (cascadeMieruEgress !== undefined) cfg.cascadeMieruEgress = cascadeMieruEgress || {};
+  const { cascadeEnabled, cascadeNaiveUpstream, cascadeMieru } = req.body;
+  const enabled = !!cascadeEnabled;
+  cfg.cascadeEnabled = enabled;
+  if (cascadeNaiveUpstream !== undefined) {
+    cfg.cascadeNaiveUpstream = String(cascadeNaiveUpstream || '').trim();
+  }
+
+  // Merge Mieru exit settings. A blank password means "keep existing".
+  const prev = cfg.cascadeMieru || {};
+  if (cascadeMieru !== undefined) {
+    const m = cascadeMieru || {};
+    cfg.cascadeMieru = {
+      host:      String(m.host ?? prev.host ?? '').trim(),
+      portStart: parseInt(m.portStart ?? prev.portStart ?? 2012, 10) || 2012,
+      portEnd:   parseInt(m.portEnd   ?? prev.portEnd   ?? 2022, 10) || 2022,
+      user:      String(m.user ?? prev.user ?? '').trim(),
+      pass:      (m.pass !== undefined && String(m.pass).length > 0)
+                   ? String(m.pass)
+                   : (prev.pass || '')
+    };
+  }
   saveConfig();
 
-  // Rebuild Caddyfile (naive upstream) and mita config (mieru egress)
   try {
+    // 1) Naive leg — rebuild Caddyfile (upstream applied when enabled).
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
     const caddyOk = reloadCaddy();
-    const mitaOk  = applyMitaConfig();
-    res.json({ ok: true, caddyOk, mitaOk,
-      message: 'Cascade settings applied. Caddy and mita reloaded.' });
+
+    // 2) Mieru leg — Variant B orchestration.
+    let cascadeOk = true, cascadeOut = '';
+    const m = cfg.cascadeMieru || {};
+    const hasMieruExit = enabled && m.host && m.user && m.pass;
+    if (hasMieruExit) {
+      const r = runCascadeMieru('setup', {
+        host: m.host, portStart: m.portStart, portEnd: m.portEnd,
+        user: m.user, pass: m.pass
+      });
+      cascadeOk = r.ok; cascadeOut = r.output;
+    } else {
+      // Cascade disabled (or no Mieru exit configured) → ensure relay is down.
+      const r = runCascadeMieru('teardown');
+      cascadeOk = r.ok; cascadeOut = r.output;
+    }
+
+    // Entry mita stays a plain server in Variant B — just re-apply its config.
+    const mitaOk = applyMitaConfig();
+
+    res.json({
+      ok: caddyOk && cascadeOk,
+      caddyOk, mitaOk, cascadeOk,
+      cascadeOutput: cascadeOut,
+      message: enabled
+        ? (hasMieruExit
+            ? 'Cascade enabled. Naive upstream + Mieru relay (Variant B) applied.'
+            : 'Cascade enabled for Naive only (no Mieru exit configured).')
+        : 'Cascade disabled. Relay torn down.'
+    });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
