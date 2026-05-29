@@ -9,6 +9,30 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 76 (`update.sh`) — update silently did nothing / skipped panel files
+
+After a clean update, the live panel in `/opt/panel-naive-mieru` still ran the
+old code (P3 password prompt present, no `downloadNote`/Bug-75 markers), and
+`sudo bash update.sh -y` printed **nothing** and returned to the prompt.
+
+Two root causes:
+1. **Silent abort** — `set -euo pipefail` with no ERR trap: any un-handled
+   non-zero command (e.g. a hiccup in `npm install --production`, or a `jq`
+   parse under command substitution) aborted the whole script with zero output.
+2. **"Already up-to-date" lie** — the version file had already been bumped to
+   `1.2.6` by an earlier *partial* run that never copied the panel files, so the
+   next `-y` run treated it as current and skipped the file sync.
+
+**Fixes**:
+- Added an `ERR` trap that prints the failing line + a hint to re-run with
+  `--force -y` — no more silent exits.
+- `update_panel()` now: falls back to the local `./panel` checkout if `git clone`
+  fails, copies **all** files with `cp -a "$src/."`, runs `npm install` as
+  **non-fatal**, restarts PM2 with `--update-env`, and **verifies** a v1.2.6
+  sentinel (`downloadNote`) actually landed.
+- In non-interactive mode (`-y`), an "up-to-date" version no longer skips the
+  panel re-sync (the copy is idempotent and cheap).
+
 ### Bug 75 (P1, mieru server) — mita stayed IDLE, so the proxy never listened
 
 Server logs showed `mita` running but reporting `app status IDLE`, and
