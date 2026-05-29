@@ -151,6 +151,27 @@ load_config() {
   FAKE_SITE_DIR=$(jq -r '.fakeSiteDir   // "/var/www/fake-site"'    "$PANEL_CONFIG")
 }
 
+# ── Bug 81: config migration ──────────────────────────────────────────────────
+# Existing installs (pre-Bug 81) have a probeSecret set but no probeMode field.
+# The panel's back-compat would treat that as 'secret' mode (probe_resistance
+# <secret>), which differs from the known-good reference server's BARE
+# probe_resistance. On update we set probeMode='bare' when it is missing so the
+# generated Caddyfile matches the reference. The stored probeSecret is kept so
+# the user can switch back to 'secret' mode from the panel at any time.
+migrate_config() {
+  [[ -f "$PANEL_CONFIG" ]] || return 0
+  command -v jq &>/dev/null || return 0
+  local has_mode; has_mode=$(jq -r 'has("probeMode")' "$PANEL_CONFIG" 2>/dev/null)
+  if [[ "$has_mode" != "true" ]]; then
+    local tmp; tmp=$(mktemp)
+    if jq '.probeMode = "bare"' "$PANEL_CONFIG" > "$tmp" 2>/dev/null && [[ -s "$tmp" ]]; then
+      cat "$tmp" > "$PANEL_CONFIG"
+      log_info "Config migrated: probeMode='bare' (matches reference server) ✓"
+    fi
+    rm -f "$tmp"
+  fi
+}
+
 # ── Backup ────────────────────────────────────────────────────────────────────
 auto_backup() {
   local ts; ts=$(date +%Y-%m-%d-%H%M%S)
@@ -873,6 +894,10 @@ do_repair() {
 
   auto_backup >/dev/null
 
+  # Bug 81: migrate config (set probeMode='bare' for pre-Bug 81 installs) so the
+  # rebuilt Caddyfile matches the reference server's bare probe_resistance.
+  migrate_config
+
   # Step 1: ensure fake site exists
   if [[ ! -f "${FAKE_SITE_DIR}/index.html" ]]; then
     log_info "Recreating fake site..."
@@ -952,6 +977,9 @@ do_update() {
 
   auto_backup >/dev/null
 
+  # Bug 81: migrate config (set probeMode='bare' for pre-Bug 81 installs).
+  migrate_config
+
   # Update components
   update_caddy_naive     # replaces update_naiveproxy() from v1.2.x
   update_mieru
@@ -961,6 +989,13 @@ do_update() {
   ensure_caddy_service
 
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
+
+  # Bug 80/81: regenerate the Caddyfile from the (now-migrated) config + DB so the
+  # new `servers { protocols h1 h2 }` block and probeMode take effect on update.
+  # Older `do_update` only restarted caddy without re-rendering the config, so the
+  # stale Caddyfile kept the old probe_resistance secret and lacked the protocols
+  # block. rebuild_caddyfile_direct uses caddyTemplate.js (single source of truth).
+  rebuild_caddyfile_direct || log_warn "Caddyfile rebuild returned non-zero — check above"
 
   # Bug 79: fix caddy-naive config permissions and (re)start it. Older installs
   # left the Caddyfile owned root:root (group caddy couldn't read it), so
