@@ -1255,6 +1255,21 @@ print_banner() {
   echo ""
 }
 
+# ── Network tuning (BBR + UDP buffers) ────────────────────────────────────────
+tune_network() {
+  log_step "$(t 'Сетевая оптимизация (BBR, буферы UDP)' 'Network tuning (BBR, UDP buffers)')"
+  local tune="${PANEL_DIR}/scripts/sysctl_tune.sh"
+  if [[ -f "$tune" ]]; then
+    bash "$tune" 2>/dev/null && \
+      log_info "$(t 'BBR и сетевые буферы применены ✓' 'BBR and network buffers applied ✓')" || \
+      log_warn "$(t 'Не удалось применить сетевую оптимизацию (не критично)' \
+                   'Could not apply network tuning (non-fatal)')"
+  else
+    log_warn "$(t "sysctl_tune.sh не найден в $PANEL_DIR/scripts — пропуск" \
+                 "sysctl_tune.sh not found in $PANEL_DIR/scripts — skipping")"
+  fi
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
   parse_install_args "$@"
@@ -1278,6 +1293,7 @@ main() {
   install_panel
   write_config_json
   write_version
+  tune_network      # BBR + UDP buffers (uses panel/scripts/sysctl_tune.sh)
   maybe_ufw
   start_services
   smoke_test
