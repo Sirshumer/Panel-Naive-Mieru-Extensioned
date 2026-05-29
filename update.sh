@@ -118,10 +118,23 @@ EOF
 }
 
 # ── Prerequisite checks ───────────────────────────────────────────────────────
-check_root()    { [[ $EUID -ne 0 ]] && die "Run as root"; }
+# Bug 77: under `set -e`, a function whose LAST statement is `[[ cond ]] && die`
+# returns the exit status of the `[[ ]]` test. On the happy path the test is
+# FALSE → the function returns 1 → the *caller* (e.g. `check_root` in main) is a
+# plain command that exits non-zero → `set -e` aborts the whole script with NO
+# output and the ERR trap on a function return is skipped. This is exactly why
+# `sudo bash update.sh --force -y` printed nothing and returned to the prompt
+# (traced: it died right after `check_root` → `[[ 0 -ne 0 ]]`). Use explicit
+# `if` blocks with a trailing `return 0`.
+check_root() {
+  if [[ $EUID -ne 0 ]]; then die "Run as root"; fi
+  return 0
+}
 check_install() {
-  [[ ! -f "$PANEL_CONFIG" ]] && \
+  if [[ ! -f "$PANEL_CONFIG" ]]; then
     die "Panel not installed. Run install.sh first."
+  fi
+  return 0
 }
 
 load_config() {
