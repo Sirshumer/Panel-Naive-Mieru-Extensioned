@@ -922,14 +922,18 @@ FAKEHTML
   ensure_caddy_service
 
   # Step 3: rebuild Caddyfile + mita state from DB
-  # Try API first (preserves running state), fall back to direct rebuild
-  if curl -sf http://127.0.0.1:3000/api/services/rebuild-all \
-       -X POST -b /tmp/.repair-cookie 2>/dev/null | grep -q '"ok":true'; then
-    log_info "Config rebuild via API ✓"
-  else
-    rebuild_caddyfile_direct
-    rebuild_mita_state_direct
-  fi
+  # Bug 84: ALWAYS rebuild directly from the on-disk caddyTemplate.js (the single
+  # source of truth that --update freshly copied into $PANEL_DIR). Previously
+  # --repair POSTed to /api/services/rebuild-all FIRST, which is rendered by the
+  # *running* PM2 panel process. If that process had not reloaded the new
+  # index.js yet (e.g. update_panel copied the files but the panel was still
+  # serving old in-memory code), the API regenerated the STALE Caddyfile format
+  # (route{} wrapper, domain-only listener) even though the on-disk template was
+  # already the new Bug 83 layout — and the direct fallback never ran because the
+  # API "succeeded". Going direct guarantees the rebuilt Caddyfile reflects the
+  # template on disk, independent of whatever code the panel happens to be running.
+  rebuild_caddyfile_direct
+  rebuild_mita_state_direct
 
   # Step 4: apply mita config
   if [[ -f "$MITA_STATE_FILE" ]]; then

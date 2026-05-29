@@ -9,6 +9,26 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 84 (`update.sh`) — `--repair` regenerated a STALE Caddyfile via the panel API
+
+After Bug 83 was merged and deployed (the on-disk `caddyTemplate.js` in
+`$PANEL_DIR` was confirmed to be the new format, 7346 bytes), the live
+`/etc/caddy-naive/Caddyfile` was *still* the old layout (`route {}` wrapper,
+domain-only listener) even though the rebuild reported success.
+
+Root cause: `do_repair` POSTed to `/api/services/rebuild-all` **first**, which is
+rendered by the **running PM2 panel process** using its *in-memory* `buildCaddyfile()`
+from `index.js`. If that process hadn't reloaded the new `index.js` yet, the API
+regenerated the OLD Caddyfile format — and the `rebuild_caddyfile_direct` fallback
+(which uses the on-disk template, the single source of truth) **never ran** because
+the API call "succeeded". So the new template on disk was ignored.
+
+Fix: `do_repair` now **always** calls `rebuild_caddyfile_direct` /
+`rebuild_mita_state_direct` directly, dropping the API-first path. The rebuilt
+Caddyfile therefore always reflects `$PANEL_DIR/server/caddyTemplate.js` regardless
+of whatever code the panel happens to have loaded in memory. (`do_update` already
+used the direct rebuild and restarts PM2 with `--update-env`, so it was unaffected.)
+
 ### Bug 83 (`panel` + `install.sh` + `update.sh`) — Caddyfile site block to match reference exactly
 
 Live testing: even after Bug 80/81 the naive key still wouldn't connect, while the
