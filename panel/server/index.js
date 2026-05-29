@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru by RIXXX — Express backend  v1.2.5
+ * Panel Naive + Mieru by RIXXX — Express backend  v1.2.6
  * Node.js 20 LTS + Express + better-sqlite3 + WebSocket + node-cron
  *
  * v1.2.3: Migrated from standalone naive binary to caddy-forwardproxy-naive.

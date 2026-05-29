@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# Panel Naive + Mieru by RIXXX — install.sh  v1.2.5
+# Panel Naive + Mieru by RIXXX — install.sh  v1.2.6
 # Caddy-forwardproxy-naive (amd64-only) + Mieru (mita) + fake-site + probe-resistance
 # Supports: Ubuntu 20.04/22.04/24.04, Debian 11/12 | x86_64 only
 # ==============================================================================
@@ -10,7 +10,7 @@ set -euo pipefail
 INSTALL_LOG="/var/log/rixxx-panel-install.log"
 mkdir -p "$(dirname "$INSTALL_LOG")"
 exec > >(tee -a "$INSTALL_LOG") 2>&1
-echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] install.sh v1.2.5 started (PID $$)"
+echo "[$(date -u +%Y-%m-%dT%H:%M:%SZ)] install.sh v1.2.6 started (PID $$)"
 
 # ── Bug 19: ERR trap — log failure location and guide user to recovery ────────
 on_error() {
