@@ -9,6 +9,22 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 75 (P1, mieru server) — mita stayed IDLE, so the proxy never listened
+
+Server logs showed `mita` running but reporting `app status IDLE`, and
+`/var/lib/rixxx-panel/mita-state.json` held the correct port bindings + user — yet
+mieru clients couldn't connect. Root cause: when a user is added via the panel,
+`applyMitaConfig()` ran `mita apply config` followed by `mita reload`. Per the
+upstream docs, **`mita reload` only re-reads the config of an already-RUNNING
+server — it does NOT lift the service from IDLE → RUNNING.** Since the installer
+intentionally does not start mita while `users[]` is empty (Bug 4), the first
+panel-driven config update reloaded an IDLE server that never bound its ports.
+
+**Fix**: `applyMitaConfig()` now checks `mita status`; if RUNNING it `reload`s,
+otherwise it `mita start`s (falling back to `systemctl restart mita`). `install.sh`
+likewise now issues `mita start` (not just a daemon restart) once the first user
+exists, so the proxy actually enters RUNNING and binds 2012–2022.
+
 ### Bug 74 (P1, mieru client config) — generated Mieru config did not connect
 
 Field-tested against a **known-working** Karing/sing-box mieru config from another

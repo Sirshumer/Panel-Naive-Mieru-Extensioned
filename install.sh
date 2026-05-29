@@ -1045,9 +1045,17 @@ except Exception:
     print(0)
 " 2>/dev/null || echo 0)
   if [[ "$_mita_users" -gt 0 ]]; then
-    systemctl restart mita && \
-      log_info "$(t 'mita запущен ✓' 'mita started ✓')" || \
-      log_warn "$(t 'mita не запустился — journalctl -u mita -n 30' 'mita failed — journalctl -u mita -n 30')"
+    # Bug 75: the daemon (mita run) starting is NOT enough — the proxy stays in
+    # state IDLE until `mita start` is issued. Restart the daemon, then start the
+    # proxy so it actually binds the configured ports.
+    systemctl restart mita 2>/dev/null || true
+    sleep 1
+    if mita start 2>/dev/null; then
+      log_info "$(t 'mita запущен ✓' 'mita started ✓')"
+    else
+      log_warn "$(t 'mita не запустился — journalctl -u mita -n 30 / mita status' \
+                   'mita failed to start — journalctl -u mita -n 30 / mita status')"
+    fi
   else
     log_info "$(t 'mita: нет пользователей — сервис запустится автоматически после добавления первого пользователя' \
                'mita: no users yet — service will start automatically after first user is added via panel')"

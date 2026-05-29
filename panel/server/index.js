@@ -462,7 +462,25 @@ function applyMitaConfig() {
   const file = buildMitaStateFile();
   try {
     execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 15000 });
-    execSync('mita reload 2>/dev/null', { timeout: 15000 });
+
+    // Bug 75: a fresh mita install sits in state IDLE (the installer does NOT
+    // start it while users[] is empty — Bug 4). `mita reload` only re-reads the
+    // config of an already-RUNNING server; it will NOT lift IDLE -> RUNNING, so
+    // the proxy never starts listening and mieru clients can't connect.
+    // Therefore: detect status and `mita start` when IDLE, otherwise `reload`.
+    let status = '';
+    try { status = execSync('mita status 2>/dev/null', { timeout: 10000 }).toString(); }
+    catch { status = ''; }
+
+    if (/RUNNING/i.test(status)) {
+      execSync('mita reload 2>/dev/null', { timeout: 15000 });
+    } else {
+      // IDLE (or unknown): start the service so it binds the configured ports.
+      // Fall back to systemctl restart if `mita start` is unavailable.
+      try { execSync('mita start 2>/dev/null', { timeout: 15000 }); }
+      catch { execSync('systemctl restart mita 2>/dev/null || true', { timeout: 15000 }); }
+    }
+
     shredFile(file + '.last');
     return true;
   } catch { return false; }
