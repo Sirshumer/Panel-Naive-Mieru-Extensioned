@@ -25,6 +25,14 @@ otherwise it `mita start`s (falling back to `systemctl restart mita`). `install.
 likewise now issues `mita start` (not just a daemon restart) once the first user
 exists, so the proxy actually enters RUNNING and binds 2012–2022.
 
+Verified on the live server: after `mita start`, `mita status` → `RUNNING` and
+`mita describe config` showed the user with `hashedPassword`
+`2af72f0fee0af51523d57bca1e436aca52b85dd644e2f5e6c76d1bdc1c1129bf`. Confirmed via
+the upstream protocol spec (`hashedPassword = SHA256(password || 0x00 ||
+username)`) that this hash matches the expected plaintext password — i.e. the
+panel stores and applies the correct mieru credential. (The empty `password` field
+in `describe config` is expected: mita only keeps the hash.)
+
 ### Bug 74 (P1, mieru client config) — generated Mieru config did not connect
 
 Field-tested against a **known-working** Karing/sing-box mieru config from another
