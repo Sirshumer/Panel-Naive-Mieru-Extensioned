@@ -9,6 +9,38 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 87 (`panel`) — subscription JSON used `type:"http"` for naive (should be `type:"naive"`)
+
+Live testing: from the universal subscription the **mieru** outbound worked but
+the **naive** one did not, while the manual `naive+https://…` key worked fine.
+The user also noticed Karing labelled the subscription's outbound `naive-out`
+but the manual key `jazz.magniysovetuy.site:443` — a tell that the two were
+*different outbound types*.
+
+Root cause: `/api/users/:id/config/universal` emitted the naive outbound as
+```json
+{ "type": "http", "tag": "naive-out", … }
+```
+A plain `type:http` is an ordinary HTTP-CONNECT proxy. It performs TLS + CONNECT
+but lacks NaiveProxy's Cronet/Chromium traffic shaping (HTTP/2 framing, padding,
+header order) that the `caddy-forwardproxy-naive` server expects — so the server
+never tunnels its traffic. The manual key parses to `type:naive` (Cronet), which
+is why it worked.
+
+Fix: emit the sing-box NaiveProxy outbound per the official spec
+(<https://sing-box.sagernet.org/configuration/outbound/naive/>):
+```json
+{ "type": "naive", "tag": "naive-out",
+  "server": "<domain>", "server_port": <port>,
+  "username": "<u>", "password": "<p>",
+  "quic": false,
+  "tls": { "enabled": true, "server_name": "<domain>" } }
+```
+`quic:false` matches the server's `servers { protocols h1 h2 }` (Bug 80 — HTTP/3
+disabled); `tls` carries only `server_name` (the naive outbound ignores other TLS
+fields). Karing ships the `with_naive_outbound` build (libcronet), so
+`type:naive` works there exactly like the manual key.
+
 ### Bug 86 (`update.sh`) — `rebuild_caddyfile_direct` silently wrote nothing (inline `node -e` bash-quoting)
 
 Even after Bug 84/85 let `--repair` reach the rebuild, the live

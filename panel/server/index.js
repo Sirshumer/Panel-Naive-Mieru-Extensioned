@@ -1221,10 +1221,20 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
         interval: '3m', tolerance: 50
       },
       {
-        // Naive via Caddy-forwardproxy: uses HTTP CONNECT over TLS
-        type: 'http', tag: 'naive-out',
+        // Bug 87: NaiveProxy outbound MUST be type "naive", NOT "http".
+        // A plain `type:http` is an ordinary HTTP-CONNECT proxy; it completes
+        // TLS + CONNECT but lacks NaiveProxy's Cronet/Chromium traffic shaping
+        // (HTTP/2 framing, padding, header order) that the caddy-forwardproxy
+        // server expects — so the manual `naive+https://…` key worked while the
+        // subscription's http outbound did not. Karing bundles the
+        // with_naive_outbound build (libcronet), so type:naive works there.
+        // `quic:false` matches the server's global `servers { protocols h1 h2 }`
+        // (Bug 80 — HTTP/3 disabled); tls only carries server_name (the only
+        // TLS field the naive outbound honours besides certificate/ech).
+        type: 'naive', tag: 'naive-out',
         server: cfg.domain, server_port: cfg.naivePort,
         username: user.username, password,
+        quic: false,
         tls: { enabled: true, server_name: cfg.domain }
       },
       {
