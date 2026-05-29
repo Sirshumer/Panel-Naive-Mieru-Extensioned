@@ -447,6 +447,50 @@ check_version_in "panel/public/app.js"   "$REPO_ROOT/panel/public/app.js"       
 check_version_in "panel/package.json"    "$REPO_ROOT/panel/package.json"           "\"version\": \"1\\.2\\.5\""
 check_version_in "CHANGELOG.md"          "$REPO_ROOT/CHANGELOG.md"                 "\[v1\\.2\\.5\]"
 check_version_in "caddyTemplate.js"      "$REPO_ROOT/panel/server/caddyTemplate.js" "v1\\.2\\.5"
+check_version_in "uninstall.sh"          "$REPO_ROOT/uninstall.sh"                  "v1\\.2\\.5"
+
+# ── Regression checks for post-release audit bugs 65-70 ──────────────────────
+log_step "Step 9b: Post-release audit regression checks (Bugs 65-70)"
+
+# Bug 65: ProtectSystem=strict (not full) in both install.sh and update.sh
+assert "Bug65: install.sh has ProtectSystem=strict" \
+  "grep -q 'ProtectSystem=strict' '$REPO_ROOT/install.sh'"
+assert "Bug65: install.sh has NO ProtectSystem=full" \
+  "! grep -q '^ProtectSystem=full' '$REPO_ROOT/install.sh'"
+assert "Bug65: update.sh ensure_caddy_service has ProtectSystem=strict" \
+  "grep -q 'ProtectSystem=strict' '$REPO_ROOT/update.sh'"
+
+# Bug 66: rebuild_caddyfile_direct() does chown after mkdir
+assert "Bug66: update.sh rebuild chown /var/log/caddy-naive" \
+  "grep -q 'chown caddy:caddy.*var/log/caddy-naive' '$REPO_ROOT/update.sh'"
+assert "Bug66: update.sh rebuild creates /var/lib/caddy" \
+  "grep -q '/var/lib/caddy' '$REPO_ROOT/update.sh'"
+
+# Bug 67: empty-password filter in rebuild_caddyfile_direct()
+assert "Bug67: update.sh rebuild filters empty passwords" \
+  "grep -q \"password.trim.*!==.*''\" '$REPO_ROOT/update.sh'"
+
+# Bug 68: correct log-block closing braces in fallback
+assert "Bug68: update.sh fallback has '  }' before global-close brace" \
+  "grep -q \"'  }',.*// closes log\" '$REPO_ROOT/update.sh'"
+
+# Bug 69: parseInt in rebuild_mita_state_direct
+assert "Bug69: update.sh mita-state rebuild has parseInt portStart" \
+  "grep -A5 'portStart.*parseInt.*mieruPortStart' '$REPO_ROOT/update.sh' | grep -q 'mieruPortEnd'"
+
+# Bug 70: parseInt in index.js config/mieru and config/universal
+assert "Bug70: index.js config/mieru has parseInt portStart" \
+  "grep -q '_portStart70a.*parseInt.*mieruPortStart' '$REPO_ROOT/panel/server/index.js'"
+assert "Bug70: index.js config/universal has parseInt portStart" \
+  "grep -q '_portStart70b.*parseInt.*mieruPortStart' '$REPO_ROOT/panel/server/index.js'"
+
+# ARM error messages
+assert "ARM error: install.sh references v1.2.5 (not v1.2.4)" \
+  "! grep -q 'not supported in v1.2.4' '$REPO_ROOT/install.sh'"
+
+# uninstall.sh removes /var/lib/caddy
+assert "uninstall.sh removes /var/lib/caddy" \
+  "grep -q 'rm -rf /var/lib/caddy' '$REPO_ROOT/uninstall.sh'"
 
 # ══════════════════════════════════════════════════════════════════════════════
 # Summary

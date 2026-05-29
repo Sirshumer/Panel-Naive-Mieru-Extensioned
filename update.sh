@@ -218,7 +218,10 @@ rebuild_caddyfile_direct() {
   [[ ! -f "$DB_PATH" ]] && { log_warn "DB not found at $DB_PATH — skipping Caddyfile rebuild"; return; }
   [[ ! -f "$PANEL_CONFIG" ]] && { log_warn "Panel config not found — skipping Caddyfile rebuild"; return; }
 
-  mkdir -p "$CADDY_CONFIG_DIR" /var/log/caddy-naive
+  mkdir -p "$CADDY_CONFIG_DIR" /var/log/caddy-naive /var/lib/caddy
+  # Bug 66: --repair must restore correct ownership on log and data dirs
+  # (root is wrong — caddy-naive.service runs as User=caddy)
+  id caddy &>/dev/null && chown caddy:caddy /var/log/caddy-naive /var/lib/caddy || true
 
   local template_js="${PANEL_DIR}/server/caddyTemplate.js"
 
@@ -235,7 +238,10 @@ rebuild_caddyfile_direct() {
         try { return JSON.parse(u.protocols || '[\"naive\",\"mieru\"]').includes('naive'); }
         catch { return true; }
       })
-      .map(u => ({ username: u.username, password: u.password || '' }));
+      .map(u => ({ username: u.username, password: u.password || '' }))
+      // Bug 67: skip users with no plaintext password — empty password produces
+      // "basic_auth user " (trailing space) which Caddy rejects as invalid syntax
+      .filter(u => u.password.trim() !== '');
 
     const probeSecret = cfg.probeSecret ||
       (() => { try { return fs.readFileSync('$CADDY_CONFIG_DIR/probe_secret','utf8').trim(); } catch { return ''; } })();
@@ -276,10 +282,10 @@ rebuild_caddyfile_direct() {
         '    output file /var/log/caddy-naive/access.log {',
         '      roll_size     50mb',
         '      roll_keep_for 720h',
-        '    }',
+        '    }',       // closes output {} inside log {}
         '    format json',
-        '}',
-        '}',
+        '  }',         // Bug 68: closes log {} (was '}' \u2014 wrong indent, left global block unclosed)
+        '}',           // closes global {}
         '',
         ':80 {',
         '  redir https://{host}{uri} permanent',
@@ -339,7 +345,11 @@ rebuild_mita_state_direct() {
       .map(u => ({ name: u.username, password: u.password || '' }));
 
     const portBindings = [];
-    for (let p = cfg.mieruPortStart; p <= cfg.mieruPortEnd; p++) {
+    // Bug 69: mieruPortStart/End may be strings or undefined in old configs;
+    // parseInt with fallback prevents an infinite loop (NaN comparisons are false)
+    const portStart = parseInt(cfg.mieruPortStart, 10) || 2000;
+    const portEnd   = parseInt(cfg.mieruPortEnd,   10) || 2010;
+    for (let p = portStart; p <= portEnd; p++) {
       portBindings.push({ port: p, protocol: 'TCP' });
       if (cfg.udpEnabled) portBindings.push({ port: p, protocol: 'UDP' });
     }
@@ -388,11 +398,14 @@ ExecStart=${CADDY_BIN} run --config ${CADDY_FILE} --adapter caddyfile
 ExecReload=/bin/kill -USR1 \$MAINPID
 TimeoutStopSec=5
 Restart=on-failure
-RestartSec=5
+RestartSec=10
 LimitNOFILE=1048576
 PrivateTmp=true
-ProtectSystem=full
-ReadWritePaths=/var/log/caddy-naive /etc/caddy-naive
+# Bug 65: ProtectSystem=strict (not full) required with ReadWritePaths /etc paths
+ProtectSystem=strict
+Environment=XDG_DATA_HOME=/var/lib/caddy
+Environment=XDG_CONFIG_HOME=/var/lib/caddy
+ReadWritePaths=/var/log/caddy-naive /etc/caddy-naive /var/lib/caddy
 AmbientCapabilities=CAP_NET_BIND_SERVICE
 
 [Install]

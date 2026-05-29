@@ -892,8 +892,12 @@ app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
 
   // Build server_ports array (Bug 12)
+  // Bug 70: mieruPortStart/End may be strings or undefined; parseInt prevents
+  // an infinite for-loop when NaN comparisons silently return false
+  const _portStart70a = parseInt(cfg.mieruPortStart, 10) || 2000;
+  const _portEnd70a   = parseInt(cfg.mieruPortEnd,   10) || 2010;
   const serverPorts = [];
-  for (let p = cfg.mieruPortStart; p <= cfg.mieruPortEnd; p++) {
+  for (let p = _portStart70a; p <= _portEnd70a; p++) {
     serverPorts.push(p);
   }
 
@@ -903,7 +907,7 @@ app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
       {
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
-        server_port: cfg.mieruPortStart,
+        server_port: _portStart70a,
         // Bug 12: include server_ports for full range awareness
         server_ports: serverPorts,
         username: user.username, password,
@@ -931,8 +935,11 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
 
   // Bug 12: server_ports for Mieru outbound
+  // Bug 70: same parseInt guard as in /config/mieru route
+  const _portStart70b = parseInt(cfg.mieruPortStart, 10) || 2000;
+  const _portEnd70b   = parseInt(cfg.mieruPortEnd,   10) || 2010;
   const serverPorts = [];
-  for (let p = cfg.mieruPortStart; p <= cfg.mieruPortEnd; p++) {
+  for (let p = _portStart70b; p <= _portEnd70b; p++) {
     serverPorts.push(p);
   }
 
@@ -963,7 +970,7 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
       {
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
-        server_port: cfg.mieruPortStart,
+        server_port: _portStart70b,
         // Bug 12: server_ports array
         server_ports: serverPorts,
         username: user.username, password,

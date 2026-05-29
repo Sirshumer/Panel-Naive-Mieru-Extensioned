@@ -39,7 +39,7 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [v1.2.5] — 2026-05-07
+## [v1.2.5] — 2026-05-07 (rev.2 — post-release audit)
 
 ### Fixed (P0 — release blockers)
 
@@ -86,6 +86,26 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - `update.sh` header → `v1.2.5`; `TARGET_VERSION="1.2.5"`.
 - `README.md` / `README.en.md` version badges → `v1.2.5`.
 - `tests/e2e.sh` version checks updated to `1.2.5`; added check for `mita.service` enabled (Bug 64).
+
+### Fixed (rev.2 — post-release code audit, same version)
+
+- **Bug 65 (P1, `install.sh` + `update.sh`)**: `ProtectSystem=full` was used in both `write_caddy_service()` (install.sh) and `ensure_caddy_service()` (update.sh), but `ProtectSystem=full` makes `/etc` read-only **system-wide**, overriding `ReadWritePaths=/etc/caddy-naive` on some kernel versions. The correct pairing is `ProtectSystem=strict`. **Fix**: both service-writing functions changed to `ProtectSystem=strict`.
+
+- **Bug 66 (P2, `update.sh`)**: `rebuild_caddyfile_direct()` created `/var/log/caddy-naive` (and the new `/var/lib/caddy`) without `chown caddy:caddy`, so `--repair` would recreate directories owned by root after a full reinstall. **Fix**: `mkdir -p … /var/lib/caddy` followed immediately by `chown caddy:caddy /var/log/caddy-naive /var/lib/caddy` (guarded by `id caddy &>/dev/null`).
+
+- **Bug 67 (P1, `update.sh`)**: In the Node inline block of `rebuild_caddyfile_direct()`, the `.map()` that built naive user objects passed empty string through (`password: u.password || ''`), producing `basic_auth username ` (trailing space) which Caddy rejects. The `.filter(u => u.password.trim() !== '')` guard from Bug 44 was missing here. **Fix**: `.filter(u => u.password.trim() !== '')` added after `.map()`.
+
+- **Bug 68 (P1, `update.sh`)**: In the same inline Caddyfile fallback array, the closing brace sequence for the `log {}` sub-block was wrong — `'    }'` / `'}'` / `'}'` instead of `'    }'` / `'  }'` / `'}'`. This left the global block syntactically unclosed, producing an invalid Caddyfile that failed `caddy validate`. **Fix**: corrected to `'    }'` (closes `output {}`), `'  }'` (closes `log {}`), `'}'` (closes global `{}`).
+
+- **Bug 69 (P1, `update.sh`)**: `rebuild_mita_state_direct()` iterated `cfg.mieruPortStart … cfg.mieruPortEnd` without `parseInt` guards, same problem as Bug 51 in index.js. **Fix**: `parseInt(..., 10) || 2000/2010` applied before the loop.
+
+- **Bug 70 (P1, `panel/server/index.js`)**: `/api/users/:id/config/mieru` and `/api/users/:id/config/universal` iterated `cfg.mieruPortStart … cfg.mieruPortEnd` in `for` loops without `parseInt` guards (same class as Bug 51 in `buildMitaStateFile`). On a config with string values or missing keys, both loops would silently produce empty `server_ports` arrays or loop forever. **Fix**: `parseInt(..., 10) || 2000/2010` guards added in both routes.
+
+- **ARM error messages (`install.sh`)**: `detect_arch()` error strings for ARM64 and ARMv7 still referenced `v1.2.4`. **Fix**: updated to `v1.2.5`.
+
+- **`uninstall.sh` version** bumped `v1.2.3 → v1.2.5`; also removes `/var/lib/caddy` (ACME cert storage added in Bug 43).
+
+- **`update.sh` `ensure_caddy_service()`**: Also applies `RestartSec=10` (from Bug 62), `XDG_DATA_HOME`, `XDG_CONFIG_HOME`, and `/var/lib/caddy` in `ReadWritePaths` so repaired services match the units written by `install.sh`.
 
 ---
 

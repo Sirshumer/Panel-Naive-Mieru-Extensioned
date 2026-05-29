@@ -155,11 +155,11 @@ detect_arch() {
     x86_64|amd64) ARCH="amd64"; DEB_ARCH="amd64" ;;
     # Bug 1: caddy-forwardproxy-naive is amd64-only; ARM not supported
     aarch64|arm64) die "$(t \
-      'caddy-forwardproxy-naive поддерживает только amd64. ARM64 не поддерживается в v1.2.4.' \
-      'caddy-forwardproxy-naive only supports amd64. ARM64 is not supported in v1.2.4.')" ;;
+      'caddy-forwardproxy-naive поддерживает только amd64. ARM64 не поддерживается в v1.2.5.' \
+      'caddy-forwardproxy-naive only supports amd64. ARM64 is not supported in v1.2.5.')" ;;
     armv7l) die "$(t \
-      'caddy-forwardproxy-naive поддерживает только amd64. ARMv7 не поддерживается в v1.2.4.' \
-      'caddy-forwardproxy-naive only supports amd64. ARMv7 is not supported in v1.2.4.')" ;;
+      'caddy-forwardproxy-naive поддерживает только amd64. ARMv7 не поддерживается в v1.2.5.' \
+      'caddy-forwardproxy-naive only supports amd64. ARMv7 is not supported in v1.2.5.')" ;;
     *) die "$(t "Неподдерживаемая архитектура: $machine" "Unsupported architecture: $machine")" ;;
   esac
   log_info "$(t 'Архитектура' 'Architecture'): $machine → $ARCH ✓"
@@ -726,7 +726,10 @@ Restart=on-failure
 RestartSec=10
 LimitNOFILE=1048576
 PrivateTmp=true
-ProtectSystem=full
+# Bug 65: ProtectSystem=strict (not full) is required when ReadWritePaths
+# includes /etc paths; ProtectSystem=full makes all of /etc read-only
+# system-wide regardless of ReadWritePaths on older kernels.
+ProtectSystem=strict
 # Bug 43: ACME certs stored under XDG_DATA_HOME; both dirs need write access
 Environment=XDG_DATA_HOME=/var/lib/caddy
 Environment=XDG_CONFIG_HOME=/var/lib/caddy
