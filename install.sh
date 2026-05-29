@@ -835,7 +835,7 @@ setup_ufw() {
   _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" tcp "Mieru TCP"
   _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" udp "Mieru UDP"
   [[ "${EXPOSE_PANEL^^}" =~ ^(Y|Д)$ ]] && ufw allow 8080/tcp comment "Panel Web UI"
-  ufw --force enable
+  ufw --force enable || true
   log_info "$(t 'Правила UFW применены ✓' 'UFW rules applied ✓')"
 }
 
@@ -858,7 +858,6 @@ install_panel() {
   cd "$PANEL_DIR"
   npm install --production --silent
   log_info "$(t 'npm зависимости установлены ✓' 'npm dependencies installed ✓')"
-  cd /
 }
 
 # ── config.json ───────────────────────────────────────────────────────────────
@@ -870,9 +869,10 @@ write_config_json() {
 
   # Generate bcrypt hash via Node (rounds=12)
   local bcrypt_hash
-  bcrypt_hash=$(node -e "
+  # Bug fix: run from PANEL_DIR so require('bcryptjs') resolves; use argv[2] (-- shifts index)
+  bcrypt_hash=$(cd "$PANEL_DIR" && node -e "
     const bcrypt = require('bcryptjs');
-    process.stdout.write(bcrypt.hashSync(process.argv[1], 12));
+    process.stdout.write(bcrypt.hashSync(process.argv[2], 12));
   " -- "$ADMIN_PASS" 2>/dev/null) || {
     bcrypt_hash=$(htpasswd -bnBC 12 "" "$ADMIN_PASS" 2>/dev/null | tr -d ':\n' | sed 's/^[^\$]*//')
   }
