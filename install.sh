@@ -661,19 +661,22 @@ write_caddyfile() {
   redir https://{host}{uri} permanent
 }
 
-${DOMAIN}:${NAIVE_PORT} {
-  route {
-    forward_proxy {
+:${NAIVE_PORT}, ${DOMAIN} {
+  # Bug 83: match the known-good reference server (":<port>, <domain>" listener +
+  # explicit tls + no route{} wrapper).
+  tls ${ADMIN_EMAIL}
+
+  forward_proxy {
 ${auth_lines}
-      hide_ip
-      hide_via"
+    hide_ip
+    hide_via"
     [[ -n "$probe_line" ]] && caddyfile_content+="
-      ${probe_line}"
+${probe_line}"
     caddyfile_content+="
-    }
-    file_server {
-      root ${FAKE_SITE_DIR}
-    }
+  }
+
+  file_server {
+    root ${FAKE_SITE_DIR}
   }
 }"
   fi
