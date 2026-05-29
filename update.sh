@@ -26,6 +26,18 @@ log_step()  { echo -e "\n${CYAN}${BOLD}▶ $*${NC}"; }
 log_dry()   { echo -e "${YELLOW}[DRY-RUN]${NC} $*"; }
 die()       { log_error "$*"; exit 1; }
 
+# Bug 76: never fail silently. With `set -e`, any un-handled non-zero command
+# aborted the script with no message (the user saw an empty prompt). This trap
+# prints the failing line + command so problems are always visible.
+on_error() {
+  local exit_code=$?
+  local line_no=${1:-?}
+  log_error "update.sh aborted at line ${line_no} (exit ${exit_code})."
+  log_error "Re-run with: sudo bash update.sh --force -y   (or check the message above)"
+  exit "$exit_code"
+}
+trap 'on_error $LINENO' ERR
+
 # ── Constants ─────────────────────────────────────────────────────────────────
 TARGET_VERSION="1.2.6"
 PANEL_DIR="/opt/panel-naive-mieru"
@@ -549,23 +561,50 @@ update_mieru() {
 }
 
 # ── Update panel ──────────────────────────────────────────────────────────────
+# Bug 76: this step previously could be skipped or die silently:
+#   - under `set -e`, a failing `npm install` aborted the whole script with no
+#     clear message and left a partial copy;
+#   - the version bump happened even on a partial run, so the next `-y` run saw
+#     "already up-to-date" and never re-copied the panel files.
+# Now: clone (or fall back to the local checkout), copy ALL panel files, run
+# npm install non-fatally, restart PM2, and verify a known sentinel landed.
 update_panel() {
   log_step "Updating web panel"
   $DRY_RUN && { log_dry "Would pull latest panel from $REPO_URL"; return; }
 
   local tmp; tmp=$(mktemp -d)
-  git clone --depth 1 "${REPO_URL}.git" "$tmp" 2>/dev/null || {
-    log_warn "Could not clone latest panel — skipping panel update"
+  local src=""
+  if git clone --depth 1 "${REPO_URL}.git" "$tmp" 2>/dev/null && [[ -d "$tmp/panel" ]]; then
+    src="$tmp/panel"
+    log_info "Fetched latest panel from $REPO_URL"
+  elif [[ -d "$(pwd)/panel" ]]; then
+    # Fallback: use the local checkout the operator already `git pull`-ed.
+    src="$(pwd)/panel"
+    log_warn "git clone failed — using local checkout at $src"
+  else
+    log_warn "No panel source available (clone failed, no local ./panel) — skipping"
     rm -rf "$tmp"; return
-  }
+  fi
 
-  if [[ -d "$tmp/panel" ]]; then
-    pm2 stop panel-naive-mieru 2>/dev/null || true
-    cp -r "$tmp/panel/"* "$PANEL_DIR/"
-    cd "$PANEL_DIR" && npm install --production --silent && cd /
-    pm2 restart panel-naive-mieru 2>/dev/null || \
-      pm2 start "$PANEL_DIR/server/index.js" --name panel-naive-mieru --time
-    log_info "Panel updated ✓"
+  pm2 stop panel-naive-mieru 2>/dev/null || true
+
+  mkdir -p "$PANEL_DIR"
+  # Copy everything including dotfiles; cp -a preserves structure.
+  cp -a "$src/." "$PANEL_DIR/"
+
+  # npm install must NOT be fatal — keep going even on a transient failure.
+  ( cd "$PANEL_DIR" && npm install --omit=dev --silent ) \
+    || ( cd "$PANEL_DIR" && npm install --production --silent ) \
+    || log_warn "npm install reported a problem — continuing (deps may already be present)"
+
+  pm2 restart panel-naive-mieru --update-env 2>/dev/null \
+    || pm2 start "$PANEL_DIR/server/index.js" --name panel-naive-mieru --time
+
+  # Bug 76: verify the new code actually landed (sentinel added in v1.2.6 P3).
+  if grep -q "downloadNote" "$PANEL_DIR/public/index.html" 2>/dev/null; then
+    log_info "Panel updated ✓ (v1.2.6 markers present)"
+  else
+    log_warn "Panel files copied but v1.2.6 marker not found — check $PANEL_DIR"
   fi
   rm -rf "$tmp"
 }
@@ -837,9 +876,15 @@ do_update() {
   log_info "Installed version: $current  |  Target: $TARGET_VERSION"
 
   if ! $FORCE && ! version_gt "$TARGET_VERSION" "$current"; then
-    log_info "Already up-to-date ($current)"
-    if ! $YES; then
-      read -rp "Force update anyway? [y/N]: " confirm
+    log_info "Version file already reports $current (target $TARGET_VERSION)."
+    if $YES; then
+      # Bug 76: in non-interactive mode, re-sync the panel files anyway. The
+      # version file may have been bumped by an earlier *partial* run that never
+      # copied the new code, so "up-to-date" can be a lie. Re-copying is cheap
+      # and idempotent.
+      log_info "Non-interactive (-y): re-syncing panel files to be safe."
+    else
+      read -rp "Re-sync / force update anyway? [y/N]: " confirm
       [[ "${confirm^^}" != "Y" ]] && { log_info "Nothing to do."; exit 0; }
     fi
   fi
