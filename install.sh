@@ -155,11 +155,11 @@ detect_arch() {
     x86_64|amd64) ARCH="amd64"; DEB_ARCH="amd64" ;;
     # Bug 1: caddy-forwardproxy-naive is amd64-only; ARM not supported
     aarch64|arm64) die "$(t \
-      'caddy-forwardproxy-naive поддерживает только amd64. ARM64 не поддерживается в v1.2.5.' \
-      'caddy-forwardproxy-naive only supports amd64. ARM64 is not supported in v1.2.5.')" ;;
+      'caddy-forwardproxy-naive поддерживает только amd64. ARM64 не поддерживается в v1.2.6.' \
+      'caddy-forwardproxy-naive only supports amd64. ARM64 is not supported in v1.2.6.')" ;;
     armv7l) die "$(t \
-      'caddy-forwardproxy-naive поддерживает только amd64. ARMv7 не поддерживается в v1.2.5.' \
-      'caddy-forwardproxy-naive only supports amd64. ARMv7 is not supported in v1.2.5.')" ;;
+      'caddy-forwardproxy-naive поддерживает только amd64. ARMv7 не поддерживается в v1.2.6.' \
+      'caddy-forwardproxy-naive only supports amd64. ARMv7 is not supported in v1.2.6.')" ;;
     *) die "$(t "Неподдерживаемая архитектура: $machine" "Unsupported architecture: $machine")" ;;
   esac
   log_info "$(t 'Архитектура' 'Architecture'): $machine → $ARCH ✓"

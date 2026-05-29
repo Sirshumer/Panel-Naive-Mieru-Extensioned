@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# tests/e2e.sh — End-to-end regression test for Panel Naive + Mieru v1.2.5
+# tests/e2e.sh — End-to-end regression test for Panel Naive + Mieru v1.2.6
 #
 # Tests:
 #   install → validate → service-check → create-user-via-API → re-validate →
@@ -102,7 +102,7 @@ detect_admin_pass() {
 }
 
 # ─────────────────────────────────────────────────────────────────────────────
-log_step "E2E test suite — Panel Naive + Mieru v1.2.5"
+log_step "E2E test suite — Panel Naive + Mieru v1.2.6"
 echo "  Domain:    $DOMAIN"
 echo "  Email:     $EMAIL"
 echo "  Port:      $NAIVE_PORT"
@@ -201,7 +201,7 @@ assert "Panel process running (PM2)"         "pm2 list 2>/dev/null | grep -q pan
 assert "Panel responds on :3000"             "curl -sf '$PANEL_URL/' -o /dev/null"
 assert "config.json present"                 "[[ -f '$PANEL_CONFIG' ]]"
 assert "version file present"                "[[ -f '$VERSION_FILE' ]]"
-assert "panel version in file is 1.2.5"      "grep -q '1.2.5' '$VERSION_FILE'"
+assert "panel version in file is 1.2.6"      "grep -q '1.2.6' '$VERSION_FILE'"
 assert "DB present"                          "[[ -f '$DB_PATH' ]]"
 assert "mita-state.json present"             "[[ -f '$MITA_STATE_FILE' ]]"
 
@@ -430,7 +430,7 @@ fi
 # STEP 9 — Version consistency check (without install)
 # ══════════════════════════════════════════════════════════════════════════════
 log_step "Step 9: Version consistency across all files"
-VERSION_EXPECTED="1.2.5"
+VERSION_EXPECTED="1.2.6"
 check_version_in() {
   local label="$1" file="$2" pattern="$3"
   if [[ -f "$file" ]] && grep -qP "$pattern" "$file" 2>/dev/null; then
@@ -439,15 +439,15 @@ check_version_in() {
     fail "Version $VERSION_EXPECTED NOT found in $label"
   fi
 }
-check_version_in "install.sh"            "$REPO_ROOT/install.sh"                   "1\\.2\\.5"
-check_version_in "update.sh"             "$REPO_ROOT/update.sh"                    "TARGET_VERSION=\"1\\.2\\.5\""
-check_version_in "panel/server/index.js" "$REPO_ROOT/panel/server/index.js"        "v1\\.2\\.5"
-check_version_in "panel/public/index.html" "$REPO_ROOT/panel/public/index.html"    "v1\\.2\\.5"
-check_version_in "panel/public/app.js"   "$REPO_ROOT/panel/public/app.js"          "v1\\.2\\.5"
-check_version_in "panel/package.json"    "$REPO_ROOT/panel/package.json"           "\"version\": \"1\\.2\\.5\""
-check_version_in "CHANGELOG.md"          "$REPO_ROOT/CHANGELOG.md"                 "\[v1\\.2\\.5\]"
-check_version_in "caddyTemplate.js"      "$REPO_ROOT/panel/server/caddyTemplate.js" "v1\\.2\\.5"
-check_version_in "uninstall.sh"          "$REPO_ROOT/uninstall.sh"                  "v1\\.2\\.5"
+check_version_in "install.sh"            "$REPO_ROOT/install.sh"                   "1\\.2\\.6"
+check_version_in "update.sh"             "$REPO_ROOT/update.sh"                    "TARGET_VERSION=\"1\\.2\\.6\""
+check_version_in "panel/server/index.js" "$REPO_ROOT/panel/server/index.js"        "v1\\.2\\.6"
+check_version_in "panel/public/index.html" "$REPO_ROOT/panel/public/index.html"    "v1\\.2\\.6"
+check_version_in "panel/public/app.js"   "$REPO_ROOT/panel/public/app.js"          "v1\\.2\\.6"
+check_version_in "panel/package.json"    "$REPO_ROOT/panel/package.json"           "\"version\": \"1\\.2\\.6\""
+check_version_in "CHANGELOG.md"          "$REPO_ROOT/CHANGELOG.md"                 "\[v1\\.2\\.6\]"
+check_version_in "caddyTemplate.js"      "$REPO_ROOT/panel/server/caddyTemplate.js" "v1\\.2\\.6"
+check_version_in "uninstall.sh"          "$REPO_ROOT/uninstall.sh"                  "v1\\.2\\.6"
 
 # ── Regression checks for post-release audit bugs 65-70 ──────────────────────
 log_step "Step 9b: Post-release audit regression checks (Bugs 65-70)"
@@ -485,8 +485,8 @@ assert "Bug70: index.js config/universal has parseInt portStart" \
   "grep -q '_portStart70b.*parseInt.*mieruPortStart' '$REPO_ROOT/panel/server/index.js'"
 
 # ARM error messages
-assert "ARM error: install.sh references v1.2.5 (not v1.2.4)" \
-  "! grep -q 'not supported in v1.2.4' '$REPO_ROOT/install.sh'"
+assert "ARM error: install.sh references v1.2.6 (not older)" \
+  "! grep -q 'not supported in v1.2.[45]' '$REPO_ROOT/install.sh'"
 
 # uninstall.sh removes /var/lib/caddy
 assert "uninstall.sh removes /var/lib/caddy" \
