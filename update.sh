@@ -85,7 +85,16 @@ parse_args() {
     esac
     shift
   done
-  [[ -z "$MODE" ]] && MODE="update"
+  # Bug 85: under `set -e`, this `[[ ]] && ...` was the LAST statement in
+  # parse_args. When a MODE flag was given (e.g. --repair), the test
+  # `[[ -z "repair" ]]` is FALSE, so parse_args RETURNED 1 → the caller in
+  # main() (`parse_args "$@"`) is a plain command that exits non-zero →
+  # `set -e` aborted the whole script with NO output, and the ERR trap on a
+  # function return is skipped (exactly the Bug 77 failure mode). This is why
+  # `--repair` exited 1 silently while `--force -y` (MODE empty → test TRUE →
+  # return 0) worked. Use an explicit `if` + trailing `return 0`.
+  if [[ -z "$MODE" ]]; then MODE="update"; fi
+  return 0
 }
 
 print_help() {
