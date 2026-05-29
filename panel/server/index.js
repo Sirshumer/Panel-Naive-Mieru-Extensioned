@@ -71,6 +71,7 @@ try {
     fakeSiteDir:   FAKE_SITE_DIR,
     fakeSiteUrl:   'https://www.example.com',
     probeSecret:   '',
+    probeMode:     'bare',   // Bug 81: 'off' | 'bare' | 'secret' (matches known-good ref)
     mitaStateFile: MITA_STATE_FILE,
     trafficPattern: 'NOOP', mtu: 1400, udpEnabled: false,
     // Cascade (relay): Naive uses Caddyfile upstream; Mieru uses Variant B
@@ -274,6 +275,11 @@ function buildCaddyfile(config, users) {
       ? fs.readFileSync(path.join(resolvedCaddyCfgDir, 'probe_secret'), 'utf8').trim()
       : '');
 
+  // Bug 81: probe_resistance mode ('off' | 'bare' | 'secret').
+  // Back-compat: derive from probeSecret when unset.
+  let probeMode = (config.probeMode || '').trim().toLowerCase();
+  if (!probeMode) probeMode = probeSecret ? 'secret' : 'bare';
+
   // Bug 26: delegate to the shared template module (single source of truth).
   // Falls back to an inline render if the template file is not yet deployed.
   const tplPath = path.join(__dirname, 'caddyTemplate.js');
@@ -285,6 +291,7 @@ function buildCaddyfile(config, users) {
       naivePort:   config.naivePort   || 443,
       fakeSiteDir: resolvedFakeSiteDir,
       probeSecret,
+      probeMode,
       logFile:     LOG_CADDY,
       upstream:    (config.cascadeEnabled && config.cascadeNaiveUpstream) ? config.cascadeNaiveUpstream : '',
     }, naiveUsers);
@@ -306,8 +313,16 @@ function buildCaddyfile(config, users) {
     authLines = `    basic_auth _placeholder_${rnd.slice(0, 16)} _disabled_${rnd.slice(16)}`;
   }
 
-  // Bug 29: probe_resistance comes after hide_ip + hide_via
-  const probeLine = probeSecret ? `\n    probe_resistance ${probeSecret}` : '';
+  // Bug 29 + Bug 81: probe_resistance comes after hide_ip + hide_via.
+  // 'off' → none; 'secret' → with token; 'bare' → keyword only.
+  let probeLine;
+  if (probeMode === 'off') {
+    probeLine = '';
+  } else if (probeMode === 'secret' && probeSecret) {
+    probeLine = `\n    probe_resistance ${probeSecret}`;
+  } else {
+    probeLine = `\n    probe_resistance`;
+  }
 
   // v1.2.6: cascade — upstream proxy support (inline fallback)
   const upstreamUrl = (config.cascadeEnabled && config.cascadeNaiveUpstream) ? config.cascadeNaiveUpstream : '';
@@ -319,6 +334,10 @@ function buildCaddyfile(config, users) {
   return `{
   # Bug 30: evaluate forwardproxy before file_server
   order forward_proxy before file_server
+  # Bug 80: HTTP/1.1 + HTTP/2 only (disable HTTP/3 / QUIC)
+  servers {
+    protocols h1 h2
+  }
   email ${config.adminEmail || ''}
   admin off
   log {
@@ -935,12 +954,15 @@ app.post('/api/settings/language', requireAuth, (req, res) => {
   res.json({ ok: true, language });
 });
 
-// Probe secret update — rebuilds Caddyfile and reloads Caddy
+// Probe secret update — rebuilds Caddyfile and reloads Caddy.
+// Setting a secret also switches probeMode to 'secret'.
 app.post('/api/settings/probe-secret', requireAuth, (req, res) => {
   const { probeSecret } = req.body;
   if (!probeSecret || probeSecret.length < 8)
     return res.status(400).json({ error: 'probe_secret must be at least 8 characters' });
-  cfg.probeSecret = probeSecret; saveConfig();
+  cfg.probeSecret = probeSecret;
+  cfg.probeMode = 'secret';          // Bug 81: setting a secret implies secret mode
+  saveConfig();
   // Persist to file for install.sh smoke tests
   try {
     fs.writeFileSync(path.join(resolvedCaddyCfgDir, 'probe_secret'), probeSecret, { mode: 0o600 });
@@ -950,6 +972,41 @@ app.post('/api/settings/probe-secret', requireAuth, (req, res) => {
     writeCaddyfileAtomic(content);
     const ok = reloadCaddy();
     res.json({ ok, message: 'Probe secret updated. Caddy reloaded.' });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Bug 81: probe_resistance mode toggle ('off' | 'bare' | 'secret').
+//   'off'    → remove probe_resistance entirely
+//   'bare'   → bare  probe_resistance  (no secret) — matches known-good ref server
+//   'secret' → probe_resistance <secret>  (requires an existing/provided secret)
+app.post('/api/settings/probe-mode', requireAuth, (req, res) => {
+  const { probeMode, probeSecret } = req.body || {};
+  const mode = String(probeMode || '').trim().toLowerCase();
+  if (!['off', 'bare', 'secret'].includes(mode))
+    return res.status(400).json({ error: "probeMode must be one of: off, bare, secret" });
+
+  if (mode === 'secret') {
+    // A secret is required — either provided now or already stored.
+    const newSecret = (probeSecret || '').trim();
+    if (newSecret) {
+      if (newSecret.length < 8)
+        return res.status(400).json({ error: 'probe_secret must be at least 8 characters' });
+      cfg.probeSecret = newSecret;
+      try {
+        fs.writeFileSync(path.join(resolvedCaddyCfgDir, 'probe_secret'), newSecret, { mode: 0o600 });
+      } catch {}
+    } else if (!(cfg.probeSecret || '').trim()) {
+      return res.status(400).json({ error: "secret mode requires a probe_secret (>= 8 chars)" });
+    }
+  }
+
+  cfg.probeMode = mode;
+  saveConfig();
+  try {
+    const content = buildCaddyfile(cfg, getAllUsers());
+    writeCaddyfileAtomic(content);
+    const ok = reloadCaddy();
+    res.json({ ok, probeMode: mode, message: `probe_resistance mode set to '${mode}'. Caddy reloaded.` });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1395,7 +1452,8 @@ app.get('/api/diagnostics', requireAuth, async (_req, res) => {
     mitaConfig:   exec_('mita describe config 2>/dev/null'),
     timeSynced:   exec_('timedatectl status 2>/dev/null').includes('synchronized: yes'),
     mitaStateFile: resolvedMitaFile,
-    probeSecretSet: !!(cfg.probeSecret)
+    probeSecretSet: !!(cfg.probeSecret),
+    probeMode: (cfg.probeMode || (cfg.probeSecret ? 'secret' : 'bare'))
   });
 });
 

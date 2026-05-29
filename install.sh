@@ -81,6 +81,7 @@ parse_install_args() {
       --mieru-end)      INPUT_MIERU_END="${2:-}";       shift ;;
       --fake-site-url)  INPUT_FAKE_SITE_URL="${2:-}";   shift ;;
       --probe-secret)   INPUT_PROBE_SECRET="${2:-}";    shift ;;
+      --probe-mode)     INPUT_PROBE_MODE="${2:-}";      shift ;;
       --lang)
         case "${2:-ru}" in en) LANG_RU=false ;; *) LANG_RU=true ;; esac
         shift ;;
@@ -380,6 +381,8 @@ gather_config() {
     # Bug 1 new fields: fake-site URL and probe secret
     FAKE_SITE_URL="${INPUT_FAKE_SITE_URL:-https://www.example.com}"
     PROBE_SECRET="${INPUT_PROBE_SECRET:-$(openssl rand -hex 16)}"
+    # Bug 81: default probe_resistance mode = bare (matches known-good reference).
+    PROBE_MODE="${INPUT_PROBE_MODE:-bare}"
     USE_UFW="Y"
     EXPOSE_PANEL="N"
     log_info "$(t 'Конфигурация принята из аргументов ✓' 'Configuration loaded from arguments ✓')"
@@ -445,6 +448,9 @@ gather_config() {
   else
     PROBE_SECRET="$INPUT_PROBE_SECRET"
   fi
+  # Bug 81: default probe_resistance mode = bare (matches known-good reference).
+  # The secret above is still stored so the panel can switch to 'secret' mode later.
+  PROBE_MODE="${INPUT_PROBE_MODE:-bare}"
 
   # Admin credentials
   echo ""
@@ -588,6 +594,7 @@ write_caddyfile() {
         naivePort:   ${NAIVE_PORT},
         fakeSiteDir: '${FAKE_SITE_DIR}',
         probeSecret: '${PROBE_SECRET}',
+        probeMode:   '${PROBE_MODE:-bare}',
         logFile:     '/var/log/caddy-naive/access.log'
       };
       process.stdout.write(t.render(cfg, users));
@@ -616,8 +623,13 @@ write_caddyfile() {
       auth_lines="    basic_auth ${placeholder_user} ${placeholder_pass}"
     fi
 
+    # Bug 81: probe_resistance mode — 'off' (none) | 'bare' (keyword only) | 'secret' (with token)
     local probe_line=""
-    [[ -n "${PROBE_SECRET:-}" ]] && probe_line="    probe_resistance ${PROBE_SECRET}"
+    case "${PROBE_MODE:-bare}" in
+      off)    probe_line="" ;;
+      secret) [[ -n "${PROBE_SECRET:-}" ]] && probe_line="    probe_resistance ${PROBE_SECRET}" || probe_line="    probe_resistance" ;;
+      *)      probe_line="    probe_resistance" ;;
+    esac
 
     # Bug 28: no tls directive — Caddy automatic HTTPS handles it
     # Bug 29: order: basic_auth → hide_ip → hide_via → probe_resistance
@@ -627,6 +639,10 @@ write_caddyfile() {
     caddyfile_content="{
   # Bug 30: ensure forward_proxy is evaluated before file_server
   order forward_proxy before file_server
+  # Bug 80: HTTP/1.1 + HTTP/2 only (disable HTTP/3 / QUIC)
+  servers {
+    protocols h1 h2
+  }
   email ${ADMIN_EMAIL}
   admin off
   log {
@@ -923,6 +939,7 @@ data = {
     "fakeSiteDir":     "$FAKE_SITE_DIR",
     "fakeSiteUrl":     "$FAKE_SITE_URL",
     "probeSecret":     "$PROBE_SECRET",
+    "probeMode":       "${PROBE_MODE:-bare}",
     "mitaStateFile":   "$MITA_STATE_FILE",
     "trafficPattern":  "NOOP",
     "mtu":             1400,

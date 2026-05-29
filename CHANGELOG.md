@@ -9,6 +9,35 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 81 (`panel` + `install.sh` + `update.sh`) — probe_resistance mode (bare/secret/off)
+
+**Naive config parity with a known-good reference server.** The user compared our
+generated Caddyfile against a working reference (`poppuri.site`) and found we always
+emitted `probe_resistance <secret>`, whereas the reference uses a **bare**
+`probe_resistance` (no secret). With a secret, the masquerade site is only reachable
+via a special secret domain — bare is simpler and matches the working server.
+
+- New **`probeMode`** config field: `'off' | 'bare' | 'secret'`.
+  - `off`    → no `probe_resistance` line at all.
+  - `bare`   → bare `probe_resistance` (no secret) — **new default**, matches reference.
+  - `secret` → `probe_resistance <secret>` (legacy behaviour; requires a secret domain).
+- Back-compat: when `probeMode` is unset it is derived from `probeSecret`
+  (non-empty → `secret`, empty → `bare`), so existing installs keep their behaviour.
+- `caddyTemplate.js`, `index.js` inline fallback, `install.sh` + `update.sh` inline
+  fallbacks all honour `probeMode`.
+- Panel UI: Settings → Probe Resistance card now has a **mode selector**; the secret
+  input is shown only in `secret` mode. New `POST /api/settings/probe-mode` endpoint;
+  `POST /api/settings/probe-secret` now also sets `probeMode='secret'`.
+- Status endpoint now returns `probeMode`. Locales (ru/en) updated.
+
+### Bug 80 (`panel` + `install.sh` + `update.sh`) — disable HTTP/3/QUIC (`protocols h1 h2`)
+
+The working reference server pins Caddy to HTTP/1.1 + HTTP/2 via a global
+`servers { protocols h1 h2 }` block; our generated config left HTTP/3/QUIC enabled.
+NaiveProxy tunnels over HTTP/2 `CONNECT`, and HTTP/3 can break some clients. Added the
+block to all four Caddyfile generators (`caddyTemplate.js`, `index.js` inline fallback,
+`install.sh`, `update.sh`) so naive matches the known-good reference.
+
 ### Bug 79b (`install.sh` + `update.sh`) — caddy-naive perms follow-up
 
 Live-server diagnostics after Bug 79 showed the config **directory** was actually

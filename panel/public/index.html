@@ -398,7 +398,20 @@
           <div class="card-header" data-i18n="settings.probeSecretTitle">Probe Resistance Secret</div>
           <div class="card-body">
             <p class="card-desc" data-i18n="settings.probeSecretDesc">Secret token clients present in headers. Unrecognised clients see the fake site instead.</p>
+
+            <!-- Bug 81: probe_resistance mode selector -->
             <div class="form-group">
+              <label data-i18n="settings.probeModeLabel">Probe Resistance Mode</label>
+              <select id="s-probe-mode">
+                <option value="bare"   data-i18n="settings.probeModeBare">Bare — probe_resistance (no secret, like reference)</option>
+                <option value="secret" data-i18n="settings.probeModeSecret">Secret — probe_resistance &lt;secret&gt;</option>
+                <option value="off"    data-i18n="settings.probeModeOff">Off — disabled</option>
+              </select>
+              <small class="form-hint" data-i18n="settings.probeModeHint">"Bare" matches a known-good reference server. "Secret" requires a special domain to reach the masquerade.</small>
+            </div>
+
+            <!-- secret input — only relevant for 'secret' mode -->
+            <div class="form-group" id="probe-secret-group">
               <label data-i18n="settings.probeSecretLabel">Probe Secret (min 8 chars)</label>
               <div class="input-pw-wrap">
                 <input type="password" id="s-probe-secret"
@@ -409,7 +422,7 @@
                 </button>
               </div>
             </div>
-            <button class="btn btn-primary mt-2" data-action="change-probe-secret" data-i18n="settings.applyProbeSecret">Apply Secret</button>
+            <button class="btn btn-primary mt-2" data-action="apply-probe-mode" data-i18n="settings.applyProbeMode">Apply</button>
             <div id="probe-secret-msg" class="msg-inline hidden"></div>
           </div>
         </div>

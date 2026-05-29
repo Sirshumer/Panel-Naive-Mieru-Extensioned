@@ -235,6 +235,7 @@ function handleDelegatedClick(e) {
     case 'change-language':      changeLanguage(); break;
     case 'change-password':      changePassword(); break;
     case 'change-probe-secret':  changeProbeSecret(); break;
+    case 'apply-probe-mode':     applyProbeMode(); break;
     case 'change-cascade':       changeCascade(); break;
     case 'cascade-status':       checkCascadeStatus(); break;
 
@@ -735,6 +736,14 @@ async function loadSettings() {
     // v1.2.5: probe secret (masked)
     const probeEl = el('s-probe-secret');
     if (probeEl) probeEl.placeholder = cfg.probeSecret ? '••••••••' : (t('settings.probeSecretPlaceholder') || 'Enter probe secret');
+    // Bug 81: probe_resistance mode selector + secret-input visibility
+    const probeModeSel = el('s-probe-mode');
+    if (probeModeSel) {
+      const mode = cfg.probeMode || (cfg.probeSecret ? 'secret' : 'bare');
+      probeModeSel.value = mode;
+      probeModeSel.onchange = toggleProbeSecretVisibility;
+      toggleProbeSecretVisibility();
+    }
     // v1.2.6: cascade settings (Variant B — cfg.cascadeMieru)
     const casc = cfg.cascadeMieru || {};
     const cascadeEnabledEl = el('s-cascade-enabled');
@@ -855,22 +864,43 @@ async function changePassword() {
   }
 }
 
-// v1.2.5: Probe secret update — rebuilds Caddyfile and reloads Caddy
-async function changeProbeSecret() {
-  const secret = el('s-probe-secret')?.value?.trim();
-  if (!secret || secret.length < 8) {
+// Bug 81: show/hide the secret input depending on the selected probe mode.
+function toggleProbeSecretVisibility() {
+  const sel = el('s-probe-mode');
+  const grp = el('probe-secret-group');
+  if (!sel || !grp) return;
+  grp.style.display = (sel.value === 'secret') ? '' : 'none';
+}
+
+// v1.2.5 / Bug 81: legacy entry point — delegate to applyProbeMode.
+async function changeProbeSecret() { return applyProbeMode(); }
+
+// Bug 81: probe_resistance mode toggle ('off' | 'bare' | 'secret').
+async function applyProbeMode() {
+  const mode = el('s-probe-mode')?.value || 'bare';
+  const secret = el('s-probe-secret')?.value?.trim() || '';
+
+  // For 'secret' mode require a valid secret unless one is already stored.
+  if (mode === 'secret' && !state.config?.probeSecret && (!secret || secret.length < 8)) {
     showMsg('probe-secret-msg', t('settings.probeSecretTooShort') || 'Probe secret должен быть не менее 8 символов', false);
     return;
   }
-  const btn = document.querySelector('[data-action="change-probe-secret"]');
+
+  const btn = document.querySelector('[data-action="apply-probe-mode"]');
   setBtnBusy(btn, true);
   try {
-    const res = await api('POST', '/api/settings/probe-secret', { probeSecret: secret });
-    showMsg('probe-secret-msg', res.message || t('settings.probeSecretUpdated') || 'Probe secret обновлён', true);
-    el('s-probe-secret').value = '';
-    el('s-probe-secret').placeholder = '••••••••';
-    state.config.probeSecret = secret;
-    toast(t('settings.probeSecretUpdated') || 'Probe secret обновлён — Caddy перезагружен', 'success');
+    const body = { probeMode: mode };
+    if (mode === 'secret' && secret) body.probeSecret = secret;
+    const res = await api('POST', '/api/settings/probe-mode', body);
+    showMsg('probe-secret-msg', res.message || t('settings.probeModeUpdated') || 'Probe mode обновлён', true);
+    state.config = state.config || {};
+    state.config.probeMode = mode;
+    if (mode === 'secret' && secret) {
+      state.config.probeSecret = secret;
+      el('s-probe-secret').value = '';
+      el('s-probe-secret').placeholder = '••••••••';
+    }
+    toast(res.message || t('settings.probeModeUpdated') || 'Probe mode обновлён — Caddy перезагружен', 'success');
   } catch (err) {
     showMsg('probe-secret-msg', err.message, false);
   } finally {
