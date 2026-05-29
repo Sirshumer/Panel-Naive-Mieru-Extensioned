@@ -597,9 +597,39 @@ function openConfigDownload(id) {
   el('naive-link-box').textContent = '';
   el('qr-container').classList.add('hidden');
   el('config-modal').classList.remove('hidden');
+  // P3 (selectable mieru port): prefill the port selector from server config.
+  const start = parseInt(state.config?.mieruPortStart, 10) || 2012;
+  const end   = parseInt(state.config?.mieruPortEnd,   10) || 2022;
+  const portEl = el('cfg-mieru-port');
+  if (portEl) {
+    portEl.min = 1025; portEl.max = 65535;
+    portEl.placeholder = String(start);
+    portEl.value = '';                       // empty → server falls back to range start
+    portEl.dataset.start = String(start);
+    portEl.dataset.end   = String(end);
+  }
+  const rangeEl = el('cfg-mieru-port-range');
+  if (rangeEl) rangeEl.textContent = ` (${start}–${end})`;
   // P3: no password prompt — the server uses the user's stored password.
   // Auto-load the naive link + QR right away.
   loadNaiveLink();
+}
+
+// P3: build a `?port=` query string from the modal's port selector, validating
+//   the value against the configured mieru range. Returns '' when empty/invalid
+//   so the server falls back to the range start.
+function mieruPortQuery() {
+  const portEl = el('cfg-mieru-port');
+  if (!portEl) return '';
+  const v = parseInt(portEl.value, 10);
+  if (!Number.isInteger(v)) return '';
+  const start = parseInt(portEl.dataset.start, 10) || 1025;
+  const end   = parseInt(portEl.dataset.end,   10) || 65535;
+  if (v < start || v > end) {
+    toast(t('config.mieruPortOutOfRange') || `Port must be ${start}–${end}`, 'error');
+    return null; // signal invalid → caller should abort
+  }
+  return `?port=${v}`;
 }
 
 function closeConfigModal() { el('config-modal').classList.add('hidden'); }
@@ -651,8 +681,10 @@ async function generateQR(text) {
 
 async function downloadMieruConfig() {
   try {
+    const q = mieruPortQuery();
+    if (q === null) return;              // invalid port — abort (toast already shown)
     const res = await fetch(
-      `/api/users/${state.selectedUserId}/config/mieru`,
+      `/api/users/${state.selectedUserId}/config/mieru${q}`,
       { credentials: 'include' });
     if (res.status === 401) { redirectToLogin(); return; }
     if (!res.ok) throw new Error(await res.text());
@@ -666,8 +698,10 @@ async function downloadMieruConfig() {
 
 async function downloadUniversalConfig() {
   try {
+    const q = mieruPortQuery();
+    if (q === null) return;              // invalid port — abort (toast already shown)
     const res = await fetch(
-      `/api/users/${state.selectedUserId}/config/universal`,
+      `/api/users/${state.selectedUserId}/config/universal${q}`,
       { credentials: 'include' });
     if (res.status === 401) { redirectToLogin(); return; }
     if (!res.ok) throw new Error(await res.text());

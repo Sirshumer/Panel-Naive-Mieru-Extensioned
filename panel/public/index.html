@@ -353,6 +353,16 @@
             <p style="margin-bottom:12px;color:var(--text-secondary);font-size:13px" data-i18n="config.downloadNote">
               The user's stored password is embedded automatically. Copy the link or download a config file.
             </p>
+            <!-- P3: optional Mieru port selector for generated configs -->
+            <div class="form-group" style="margin-bottom:12px">
+              <label data-i18n="config.mieruPortLabel">Mieru port (for JSON configs)</label>
+              <input type="number" id="cfg-mieru-port" min="1025" max="65535"
+                     placeholder="2012" />
+              <p style="margin-top:4px;color:var(--text-secondary);font-size:12px">
+                <span data-i18n="config.mieruPortHint">Leave at the range start unless you want a specific port.</span>
+                <span id="cfg-mieru-port-range"></span>
+              </p>
+            </div>
             <div id="naive-link-box" class="code-box hidden"></div>
             <div id="qr-container" class="qr-container hidden">
               <canvas id="qr-canvas"></canvas>

@@ -9,6 +9,40 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 78 (panel) — Monitoring traffic always 0 + selectable Mieru port
+
+**P2 — traffic never updated.** Both `/api/stats/users` and the 60-second traffic
+snapshot cron called `mita describe users` — a command that **does not exist** in
+mita. It always returned empty output, so `parseMitaUsers` produced `[]` and every
+key showed 0 MB regardless of real usage.
+
+Root cause confirmed against the upstream mieru docs (`docs/operation.md`): the
+real command is **`mita get users`**, which prints a table:
+```
+User  LastActive            1DayDownload  1DayUpload  30DaysDownload  30DaysUpload
+abcd  2025-04-23T01:02:03Z  938.1MiB      12.9MiB     4.0GiB          31.8MiB
+```
+(There is also `mita get quotas` for quota progress.)
+
+**Fix**:
+- Replaced `mita describe users` → `mita get users` in both call sites.
+- Rewrote `parseMitaUsers` to parse the real table: per-user `usedMB` = 30-day
+  download + 30-day upload, `lastSeen` from the `LastActive` column.
+- Rewrote `toMB` to understand IEC units (`B`/`KiB`/`MiB`/`GiB`/`TiB`) as well as
+  the decimal spellings. Covered by a unit test against the documented output.
+
+**P3 — selectable Mieru port in generated configs.** The config generators always
+wrote the **range start** (e.g. 2012) into `server_port`. mita listens on the whole
+configured range, so any port inside it is valid to dial.
+
+**Fix**:
+- `/api/users/:id/config/mieru` and `/config/universal` now accept an optional
+  `?port=<n>` query param, validated against `[mieruPortStart, mieruPortEnd]` via
+  the new `pickMieruPort()` helper (falls back to the range start when omitted or
+  out of range — fully backward compatible).
+- Added a "Mieru port" selector to the config-download modal (prefilled with the
+  range, empty = range start) plus `config.mieruPort*` locale keys (ru/en).
+
 ### Bug 77 (`update.sh`) — **the actual** silent-exit cause: `check_root`/`check_install`
 
 Even after Bug 76's ERR trap, `sudo bash update.sh --force -y` still printed
