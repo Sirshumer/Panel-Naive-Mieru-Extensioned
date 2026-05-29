@@ -9,6 +9,25 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 79b (`install.sh` + `update.sh`) — caddy-naive perms follow-up
+
+Live-server diagnostics after Bug 79 showed the config **directory** was actually
+fine (`drwxr-xr-x root caddy`), but the **Caddyfile itself was owned `root:root`**
+(`-rw-r----- root root`) — so the caddy group's read bit was useless and the
+service still failed with `permission denied`. Two follow-ups:
+
+1. The real fix is the `chown -R root:caddy` already in `fix_caddy_perms()`; the
+   earlier update simply hadn't shipped it yet (stale local clone).
+2. **Failure-storm + ordering:** `update_caddy_naive` reinstalled the binary and
+   immediately `systemctl start`ed it *before* perms were fixed, tripping the
+   5-in-5-min restart limit (`Start request repeated too quickly`), so the later
+   `fix_caddy_perms` couldn't recover the service. Fixes:
+   - `update_caddy_naive` now calls `fix_caddy_perms` + `systemctl reset-failed`
+     **before** starting caddy after a binary reinstall (also re-applies setcap,
+     which `install` strips).
+   - `do_update` and `install.sh start_services` add `systemctl reset-failed`
+     before the (re)start.
+
 ### Bug 79 (`install.sh` + `update.sh`) — caddy-naive "Caddyfile: permission denied"
 
 **P1 — Naive shown as disabled in the panel.** On the live server `caddy-naive`
