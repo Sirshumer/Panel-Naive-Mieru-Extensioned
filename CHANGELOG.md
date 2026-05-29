@@ -9,6 +9,28 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 74 (P1, mieru client config) — generated Mieru config did not connect
+
+Field-tested against a **known-working** Karing/sing-box mieru config from another
+server, the panel's generated mieru outbound differed in two ways that break the
+client's mieru parser:
+
+- We emitted `multiplex: { enabled: false }` (an object). The working client uses
+  the string enum **`multiplexing: "MULTIPLEXING_HIGH"`**. The object form is for
+  other protocols' stream-multiplexing and is silently rejected by the mieru
+  outbound → no connection. **Fixed** in both `/config/mieru` and the mieru
+  outbound of `/config/universal`.
+- We sent both a single `server_port` **and** a `server_ports` array. The working
+  config sends only a single `server_port`. Dropped the array to match.
+- Mieru `server` now prefers the raw server IP (mieru is IP-based, no SNI/TLS),
+  and the standalone mieru config now includes the same minimal `dns` block as
+  the reference config.
+
+Server-side diagnosis confirmed the VPS itself is healthy: Caddy holds a valid
+Let's Encrypt cert (`curl -vI` → HTTP/2 200, verify ok), DNS A-record matches the
+server IP, firewall opens 80/443/2012-2022 — so the no-connection issue was the
+client config format, not the server.
+
 ### UX fixes (`genspark_ai_developer_audit`)
 
 - **P2 — Email is now optional when adding a user.** The TLS certificate is

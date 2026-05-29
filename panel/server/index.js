@@ -1063,28 +1063,39 @@ app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
     serverPorts.push(p);
   }
 
+  // Bug 74: align mieru outbound with the field-tested working client format
+  // (Karing / sing-box mieru):
+  //   - use `multiplexing: "MULTIPLEXING_HIGH"` (string enum), NOT
+  //     `multiplex: { enabled: false }` (that object form is for other
+  //     protocols' stream multiplexing and silently breaks the mieru parser);
+  //   - use a single `server_port` (the working config does NOT send a
+  //     `server_ports` array — sending both confuses the client);
+  //   - prefer the raw server IP (mieru is IP-based, no SNI/TLS).
   const singboxCfg = {
-    log: { level: 'info', timestamp: true },
+    log: { level: 'info' },
+    dns: {
+      servers: [
+        { tag: 'google', address: '8.8.8.8' },
+        { tag: 'local',  address: '1.1.1.1', detour: 'direct' }
+      ]
+    },
     outbounds: [
       {
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
         server_port: _portStart70a,
-        // Bug 12: include server_ports for full range awareness
-        server_ports: serverPorts,
-        username: user.username, password,
         // Bug 5: transport field (TCP/UDP) — not protocol
         transport: 'TCP',
-        multiplex: { enabled: false }
+        username: user.username, password,
+        // Bug 74: string enum, not an object
+        multiplexing: 'MULTIPLEXING_HIGH'
       },
-      { type: 'direct', tag: 'direct' },
-      { type: 'dns',    tag: 'dns-out' }
+      { type: 'direct', tag: 'direct' }
     ],
-    route: {
-      rules: [{ protocol: 'dns', outbound: 'dns-out' }],
-      final: 'mieru-out'
-    }
+    route: { final: 'mieru-out' }
   };
+  // Keep the full port range available for clients/tooling that want it.
+  void serverPorts;
   const filename = `mieru-${user.username}-${cfg.domain}.json`;
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.setHeader('Content-Type', 'application/json');
@@ -1096,14 +1107,8 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
   if (!user) return res.status(404).json({ error: 'User not found' });
   const password = req.query.password || user.password || 'YOUR_PASSWORD';
 
-  // Bug 12: server_ports for Mieru outbound
-  // Bug 70: same parseInt guard as in /config/mieru route
+  // Bug 70: parseInt guard prevents an infinite loop when values are strings/NaN
   const _portStart70b = parseInt(cfg.mieruPortStart, 10) || 2000;
-  const _portEnd70b   = parseInt(cfg.mieruPortEnd,   10) || 2010;
-  const serverPorts = [];
-  for (let p = _portStart70b; p <= _portEnd70b; p++) {
-    serverPorts.push(p);
-  }
 
   const universalCfg = {
     log: { level: 'info', timestamp: true },
@@ -1130,15 +1135,14 @@ app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
         tls: { enabled: true, server_name: cfg.domain }
       },
       {
+        // Bug 74: working mieru format — string `multiplexing`, single port,
+        // no `server_ports` array, no `multiplex` object.
         type: 'mieru', tag: 'mieru-out',
         server: cfg.serverIp || cfg.domain,
         server_port: _portStart70b,
-        // Bug 12: server_ports array
-        server_ports: serverPorts,
-        username: user.username, password,
-        // Bug 5: transport field
         transport: 'TCP',
-        multiplex: { enabled: false }
+        username: user.username, password,
+        multiplexing: 'MULTIPLEXING_HIGH'
       },
       { type: 'direct', tag: 'direct' },
       { type: 'dns',    tag: 'dns-out' }
