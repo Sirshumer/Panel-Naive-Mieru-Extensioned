@@ -1014,6 +1014,9 @@ start_services() {
 
   # ── 5. caddy-naive (Bug 61: non-fatal — continue if Caddy fails) ─────────────
   systemctl enable caddy-naive
+  # Bug 79b: clear any prior failure storm so restart isn't blocked by
+  # "Start request repeated too quickly" after we've just fixed perms/caps.
+  systemctl reset-failed caddy-naive 2>/dev/null || true
   systemctl restart caddy-naive || true
   sleep 2
   if systemctl is-active --quiet caddy-naive; then

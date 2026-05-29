@@ -542,6 +542,11 @@ update_caddy_naive() {
     if command -v setcap &>/dev/null; then
       setcap 'cap_net_bind_service=+ep' "$CADDY_BIN" 2>/dev/null || true
     fi
+    # Bug 79b: fix config perms BEFORE starting, and clear any prior failure
+    # storm — otherwise a broken-perms install hits "Start request repeated too
+    # quickly" and never recovers even after the perms are fixed later.
+    fix_caddy_perms
+    systemctl reset-failed caddy-naive 2>/dev/null || true
     systemctl start caddy-naive 2>/dev/null || true
     log_info "caddy-naive updated to $remote_tag ✓"
   else
@@ -947,9 +952,11 @@ do_update() {
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
 
   # Bug 79: fix caddy-naive config permissions and (re)start it. Older installs
-  # left /etc/caddy-naive at 640 (no group-execute), so caddy-naive failed with
-  # "Caddyfile: permission denied". Fix perms then restart so the fix takes hold.
+  # left the Caddyfile owned root:root (group caddy couldn't read it), so
+  # caddy-naive failed with "Caddyfile: permission denied". Fix perms, clear any
+  # failure storm (reset-failed), then restart so the fix actually takes hold.
   fix_caddy_perms
+  systemctl reset-failed caddy-naive 2>/dev/null || true
   systemctl restart caddy-naive 2>/dev/null && log_info "caddy-naive restarted ✓" || \
     log_warn "caddy-naive restart failed — journalctl -u caddy-naive -n 20"
 
