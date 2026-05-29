@@ -236,6 +236,7 @@ function handleDelegatedClick(e) {
     case 'change-password':      changePassword(); break;
     case 'change-probe-secret':  changeProbeSecret(); break;
     case 'change-cascade':       changeCascade(); break;
+    case 'cascade-status':       checkCascadeStatus(); break;
 
     // ── Monitoring
     case 'refresh-stats':    refreshStats(); break;
@@ -693,19 +694,28 @@ async function loadSettings() {
     // v1.2.5: probe secret (masked)
     const probeEl = el('s-probe-secret');
     if (probeEl) probeEl.placeholder = cfg.probeSecret ? '••••••••' : (t('settings.probeSecretPlaceholder') || 'Enter probe secret');
-    // v1.2.6: cascade settings
+    // v1.2.6: cascade settings (Variant B — cfg.cascadeMieru)
+    const casc = cfg.cascadeMieru || {};
     const cascadeEnabledEl = el('s-cascade-enabled');
     if (cascadeEnabledEl) cascadeEnabledEl.checked = cfg.cascadeEnabled === true;
     const cascadeNaiveEl = el('s-cascade-naive-upstream');
     if (cascadeNaiveEl) cascadeNaiveEl.value = cfg.cascadeNaiveUpstream || '';
     const cascadeMieruHostEl = el('s-cascade-mieru-host');
-    if (cascadeMieruHostEl) cascadeMieruHostEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.host) || '';
-    const cascadeMieruPortEl = el('s-cascade-mieru-port');
-    if (cascadeMieruPortEl) cascadeMieruPortEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.port) || 1080;
+    if (cascadeMieruHostEl) cascadeMieruHostEl.value = casc.host || '';
+    const cascadePortStartEl = el('s-cascade-mieru-port-start');
+    if (cascadePortStartEl) cascadePortStartEl.value = casc.portStart || 2012;
+    const cascadePortEndEl = el('s-cascade-mieru-port-end');
+    if (cascadePortEndEl) cascadePortEndEl.value = casc.portEnd || 2022;
     const cascadeMieruUserEl = el('s-cascade-mieru-user');
-    if (cascadeMieruUserEl) cascadeMieruUserEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.socks5Authentication?.user) || '';
+    if (cascadeMieruUserEl) cascadeMieruUserEl.value = casc.user || '';
+    // Password is never sent back by the API; show a placeholder if one is set.
     const cascadeMieruPassEl = el('s-cascade-mieru-pass');
-    if (cascadeMieruPassEl) cascadeMieruPassEl.value = (cfg.cascadeMieruEgress?.proxies?.[0]?.socks5Authentication?.password) || '';
+    if (cascadeMieruPassEl) {
+      cascadeMieruPassEl.value = '';
+      cascadeMieruPassEl.placeholder = casc.pass
+        ? '••••••• (set — leave blank to keep)'
+        : (cascadeMieruPassEl.placeholder || 'password');
+    }
     document.getElementById('about-version').textContent = `v${cfg.version || '1.2.4'}`;
   } catch {}
 }
@@ -828,36 +838,50 @@ async function changeProbeSecret() {
 }
 
 async function changeCascade() {
-  const enabled = el('s-cascade-enabled')?.checked || false;
-  const upstream = el('s-cascade-naive-upstream')?.value?.trim() || '';
+  const enabled   = el('s-cascade-enabled')?.checked || false;
+  const upstream  = el('s-cascade-naive-upstream')?.value?.trim() || '';
   const mieruHost = el('s-cascade-mieru-host')?.value?.trim() || '';
-  const mieruPort = parseInt(el('s-cascade-mieru-port')?.value, 10) || 1080;
+  const portStart = parseInt(el('s-cascade-mieru-port-start')?.value, 10) || 2012;
+  const portEnd   = parseInt(el('s-cascade-mieru-port-end')?.value, 10) || 2022;
   const mieruUser = el('s-cascade-mieru-user')?.value?.trim() || '';
-  const mieruPass = el('s-cascade-mieru-pass')?.value || '';
+  const mieruPass = el('s-cascade-mieru-pass')?.value || '';   // blank = keep existing
 
   if (enabled) {
-    if (!upstream) {
-      showMsg('cascade-msg', t('settings.cascadeNaiveUpstreamRequired') || 'Укажите Naive upstream URL', false);
+    // At least one leg (Naive upstream OR a Mieru exit host) must be configured.
+    if (!upstream && !mieruHost) {
+      showMsg('cascade-msg', t('settings.cascadeNeedOne')
+        || 'Укажите Naive upstream URL и/или Mieru exit host', false);
       return;
     }
-    if (!mieruHost) {
-      showMsg('cascade-msg', t('settings.cascadeMieruHostRequired') || 'Укажите Mieru exit host', false);
-      return;
+    // If a Mieru exit host is given, it needs port range + user.
+    if (mieruHost) {
+      if (portEnd < portStart) {
+        showMsg('cascade-msg', t('settings.cascadePortRangeInvalid')
+          || 'Конечный порт должен быть ≥ начального', false);
+        return;
+      }
+      if (!mieruUser) {
+        showMsg('cascade-msg', t('settings.cascadeMieruUserRequired')
+          || 'Укажите Mieru exit username', false);
+        return;
+      }
+      // Password required only when none is stored yet.
+      const hasStoredPass = !!(state.config && state.config.cascadeMieru && state.config.cascadeMieru.pass);
+      if (!mieruPass && !hasStoredPass) {
+        showMsg('cascade-msg', t('settings.cascadeMieruPassRequired')
+          || 'Укажите Mieru exit password', false);
+        return;
+      }
     }
   }
 
-  const cascadeMieruEgress = enabled && mieruHost ? {
-    proxies: [{
-      name: 'exit-relay',
-      protocol: 'SOCKS5_PROXY_PROTOCOL',
-      host: mieruHost,
-      port: mieruPort,
-      // mita egress requires the field name "user" (NOT "username") per
-      // mieru docs/server-install.md → socks5Authentication.{user,password}
-      socks5Authentication: mieruUser ? { user: mieruUser, password: mieruPass } : undefined
-    }],
-    rules: [{ ipRanges: ['*'], domainNames: ['*'], action: 'DIRECT' }]
-  } : {};
+  const cascadeMieru = {
+    host: mieruHost,
+    portStart,
+    portEnd,
+    user: mieruUser,
+    pass: mieruPass   // empty string → server keeps the existing password
+  };
 
   const btn = document.querySelector('[data-action="change-cascade"]');
   setBtnBusy(btn, true);
@@ -865,13 +889,44 @@ async function changeCascade() {
     const res = await api('POST', '/api/settings/cascade', {
       cascadeEnabled: enabled,
       cascadeNaiveUpstream: enabled ? upstream : '',
-      cascadeMieruEgress
+      cascadeMieru
     });
     showMsg('cascade-msg', res.message || t('settings.cascadeUpdated') || 'Каскад обновлён', true);
+    // Reflect new state locally (mask password as boolean, mirroring the API).
     state.config.cascadeEnabled = enabled;
-    state.config.cascadeNaiveUpstream = upstream;
-    state.config.cascadeMieruEgress = cascadeMieruEgress;
-    toast(t('settings.cascadeUpdated') || 'Каскад обновлён — сервисы перезагружены', 'success');
+    state.config.cascadeNaiveUpstream = enabled ? upstream : '';
+    state.config.cascadeMieru = {
+      host: mieruHost, portStart, portEnd, user: mieruUser,
+      pass: !!(mieruPass || (state.config.cascadeMieru && state.config.cascadeMieru.pass))
+    };
+    // Clear the password input and reflect "stored" placeholder.
+    const passEl = el('s-cascade-mieru-pass');
+    if (passEl) { passEl.value = ''; if (state.config.cascadeMieru.pass) passEl.placeholder = '••••••• (set — leave blank to keep)'; }
+    toast(t('settings.cascadeUpdated') || 'Каскад обновлён', 'success');
+    // Surface the cascade script output if present.
+    if (res.cascadeOutput) cascadeShowStatus(res.cascadeOutput);
+  } catch (err) {
+    showMsg('cascade-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// Render text into the cascade status <pre> block.
+function cascadeShowStatus(text) {
+  const pre = el('cascade-status');
+  if (!pre) return;
+  pre.textContent = text || '';
+  pre.classList.remove('hidden');
+}
+
+// "Проверить статус" button → GET /api/settings/cascade/status.
+async function checkCascadeStatus() {
+  const btn = document.querySelector('[data-action="cascade-status"]');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('GET', '/api/settings/cascade/status');
+    cascadeShowStatus(res.output || (res.ok ? 'OK' : 'no status'));
   } catch (err) {
     showMsg('cascade-msg', err.message, false);
   } finally {

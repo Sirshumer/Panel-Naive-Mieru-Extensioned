@@ -577,6 +577,24 @@ app.get('/api/me', requireAuth, (req, res) => {
 // ── Config API ────────────────────────────────────────────────────────────────
 app.get('/api/config', requireAuth, (req, res) => {
   const { adminPassHash, ...safe } = cfg;
+  // Never expose secrets to the browser. Mask the cascade exit password and the
+  // legacy native-egress proxy passwords; expose a boolean "set" flag instead.
+  if (safe.cascadeMieru && typeof safe.cascadeMieru === 'object') {
+    const { pass, ...cm } = safe.cascadeMieru;
+    safe.cascadeMieru = { ...cm, pass: !!pass };   // pass becomes true/false
+  }
+  if (safe.cascadeMieruEgress && Array.isArray(safe.cascadeMieruEgress.proxies)) {
+    safe.cascadeMieruEgress = {
+      ...safe.cascadeMieruEgress,
+      proxies: safe.cascadeMieruEgress.proxies.map(p => {
+        if (p && p.socks5Authentication) {
+          const { password, ...auth } = p.socks5Authentication;
+          return { ...p, socks5Authentication: { ...auth, password: !!password } };
+        }
+        return p;
+      })
+    };
+  }
   res.json(safe);
 });
 
