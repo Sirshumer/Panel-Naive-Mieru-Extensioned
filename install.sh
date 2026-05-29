@@ -846,20 +846,29 @@ setup_ufw() {
 install_panel() {
   log_step "$(t 'Установка веб-панели' 'Installing web panel')"
   mkdir -p "$PANEL_DIR"
-  local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-  if [[ -d "$script_dir/panel" ]]; then
-    cp -r "$script_dir/panel/"* "$PANEL_DIR/"
-    log_info "$(t "Файлы панели скопированы из $script_dir/panel ✓" "Panel files copied from $script_dir/panel ✓")"
+  # Locate the local panel/ source robustly: try the script's own directory,
+  # then the current working directory (covers `sudo bash install.sh` from the
+  # cloned repo even when BASH_SOURCE is relative).
+  local script_dir; script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" 2>/dev/null && pwd)"
+  local src=""
+  if [[ -n "$script_dir" && -d "$script_dir/panel" ]]; then
+    src="$script_dir/panel"
+  elif [[ -d "$PWD/panel" ]]; then
+    src="$PWD/panel"
+  fi
+
+  if [[ -n "$src" ]]; then
+    cp -r "$src/"* "$PANEL_DIR/"
+    log_info "$(t "Файлы панели скопированы из $src ✓" "Panel files copied from $src ✓")"
   else
-    log_warn "$(t 'Исходники не найдены — клонирование из репозитория...' \
-               'Panel source not found — cloning from repo...')"
+    log_warn "$(t 'Локальные исходники не найдены — клонирование из репозитория...' \
+               'Local panel source not found — cloning from repo...')"
     git clone --depth 1 "$REPO_URL" /tmp/panel-src 2>/dev/null || \
       die "$(t 'Не удалось клонировать репозиторий' 'Failed to clone panel source')"
     cp -r /tmp/panel-src/panel/* "$PANEL_DIR/"
     rm -rf /tmp/panel-src
   fi
-  cd "$PANEL_DIR"
-  npm install --production --silent
+  ( cd "$PANEL_DIR" && npm install --production --silent )
   log_info "$(t 'npm зависимости установлены ✓' 'npm dependencies installed ✓')"
 }
 
@@ -870,15 +879,26 @@ write_config_json() {
   local server_ip
   server_ip=$(curl -4 -fsSL https://api.ipify.org 2>/dev/null || hostname -I | awk '{print $1}')
 
-  # Generate bcrypt hash via Node (rounds=12)
+  # Generate bcrypt hash via Node (rounds=12).
+  # Bug 73 (P0): the password is passed via the RIXXX_ADMIN_PASS env var, NOT
+  # argv. With `node -e`, there is no script-path argument, so the first user
+  # arg lands at process.argv[1] (not argv[2]); the old code read argv[2] →
+  # undefined → bcrypt.hashSync threw → install aborted at write_config_json.
+  # Env-var passing also avoids any shell-quoting issues with special chars.
   local bcrypt_hash
-  # Bug fix: run from PANEL_DIR so require('bcryptjs') resolves; use argv[2] (-- shifts index)
-  bcrypt_hash=$(cd "$PANEL_DIR" && node -e "
+  bcrypt_hash=$(cd "$PANEL_DIR" && RIXXX_ADMIN_PASS="$ADMIN_PASS" node -e "
     const bcrypt = require('bcryptjs');
-    process.stdout.write(bcrypt.hashSync(process.argv[2], 12));
-  " -- "$ADMIN_PASS" 2>/dev/null) || {
-    bcrypt_hash=$(htpasswd -bnBC 12 "" "$ADMIN_PASS" 2>/dev/null | tr -d ':\n' | sed 's/^[^\$]*//')
-  }
+    const pw = process.env.RIXXX_ADMIN_PASS || '';
+    if (!pw) { process.exit(2); }
+    process.stdout.write(bcrypt.hashSync(pw, 12));
+  " 2>/dev/null) || true
+  # Fallback: htpasswd (apache2-utils) if Node hashing failed for any reason.
+  if [[ -z "$bcrypt_hash" ]]; then
+    if ! command -v htpasswd &>/dev/null; then
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2-utils 2>/dev/null || true
+    fi
+    bcrypt_hash=$(htpasswd -bnBC 12 "" "$ADMIN_PASS" 2>/dev/null | tr -d ':\n' | sed 's/^[^$]*//')
+  fi
   [[ -z "$bcrypt_hash" ]] && die "$(t 'Не удалось создать bcrypt-хеш пароля' 'Failed to generate bcrypt password hash')"
 
   python3 - <<PYCFG
