@@ -270,6 +270,9 @@ rebuild_caddyfile_direct() {
 
     const probeSecret = cfg.probeSecret ||
       (() => { try { return fs.readFileSync('$CADDY_CONFIG_DIR/probe_secret','utf8').trim(); } catch { return ''; } })();
+    // Bug 81: probe_resistance mode — derive from probeSecret when unset.
+    let probeMode = (cfg.probeMode || '').trim().toLowerCase();
+    if (!probeMode) probeMode = probeSecret ? 'secret' : 'bare';
 
     // Bug 26: use shared template for consistency with install.sh
     const tplPath = '$template_js';
@@ -282,6 +285,7 @@ rebuild_caddyfile_direct() {
         naivePort:   cfg.naivePort   || 443,
         fakeSiteDir: cfg.fakeSiteDir || '$FAKE_SITE_DIR',
         probeSecret,
+        probeMode,
         logFile:     '/var/log/caddy-naive/access.log',
         upstream:    (cfg.cascadeEnabled && cfg.cascadeNaiveUpstream) ? cfg.cascadeNaiveUpstream : ''
       }, naiveUsers);
@@ -296,11 +300,18 @@ rebuild_caddyfile_direct() {
         const rnd = crypto.randomBytes(20).toString('hex');
         authLines = '    basic_auth _placeholder_' + rnd.slice(0,16) + ' _disabled_' + rnd.slice(16);
       }
-      const probeLine = probeSecret ? '\n    probe_resistance ' + probeSecret : '';
+      // Bug 81: 'off' → none; 'secret' → with token; 'bare' → keyword only
+      let probeLine;
+      if (probeMode === 'off') probeLine = '';
+      else if (probeMode === 'secret' && probeSecret) probeLine = '\n    probe_resistance ' + probeSecret;
+      else probeLine = '\n    probe_resistance';
       // Bug 28/30/38: no tls directive, order directive, roll_keep_for
       content = [
         '{',
         '  order forward_proxy before file_server',
+        '  servers {',
+        '    protocols h1 h2',
+        '  }',
         '  email ' + (cfg.adminEmail || ''),
         '  admin off',
         '  log {',

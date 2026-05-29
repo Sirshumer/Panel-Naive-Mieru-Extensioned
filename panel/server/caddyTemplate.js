@@ -44,7 +44,9 @@ const crypto = require('crypto');
  *   .domain       {string}  VPN domain
  *   .naivePort    {number}  HTTPS port (default 443)
  *   .fakeSiteDir  {string}  path to fake-site root
- *   .probeSecret  {string}  probe_resistance token (optional)
+ *   .probeSecret  {string}  probe_resistance token (used only when probeMode='secret')
+ *   .probeMode    {string}  'off' | 'bare' | 'secret' (optional; derived from
+ *                           probeSecret when unset — non-empty→'secret', empty→'bare')
  *   .logFile      {string}  caddy access log path (optional)
  *   .upstream     {string}  upstream proxy URL, e.g. https://user:pass@exit.example.com:443 (optional)
  * @param {Array<{username:string, password:string}>} naiveUsers
@@ -79,10 +81,28 @@ function render(cfg, naiveUsers) {
     authLines = `    basic_auth _placeholder_${rnd.slice(0, 16)} _disabled_${rnd.slice(16)}`;
   }
 
-  // ── Bug 29: probe_resistance line (only when secret is non-empty) ─────────
-  const probeLine = probeSecret
-    ? `\n    probe_resistance ${probeSecret}`
-    : '';
+  // ── Bug 29 + Bug 81: probe_resistance line ───────────────────────────────
+  // Three modes (cfg.probeMode):
+  //   'off'    → no probe_resistance line at all
+  //   'bare'   → bare  probe_resistance  (no secret) — matches the known-good
+  //              reference server; the masquerade site is served on the main
+  //              domain, no special secret domain is required.
+  //   'secret' → probe_resistance <secret>  (requires a secret domain to reach
+  //              the masquerade content).
+  // Back-compat: if probeMode is unset, derive it from probeSecret
+  //   (non-empty → 'secret', empty → 'bare').
+  let probeMode = (cfg.probeMode || '').trim().toLowerCase();
+  if (!probeMode) probeMode = probeSecret ? 'secret' : 'bare';
+
+  let probeLine;
+  if (probeMode === 'off') {
+    probeLine = '';
+  } else if (probeMode === 'secret' && probeSecret) {
+    probeLine = `\n    probe_resistance ${probeSecret}`;
+  } else {
+    // 'bare' (or 'secret' with no secret available) → bare keyword
+    probeLine = `\n    probe_resistance`;
+  }
 
   // ── v1.2.6: cascade — upstream proxy support ──────────────────────────────
   const upstreamUrl = (cfg.upstream || '').trim();
@@ -98,6 +118,11 @@ function render(cfg, naiveUsers) {
   return `{
   # Bug 30: evaluate forwardproxy handler before file_server
   order forward_proxy before file_server
+  # Bug 80: restrict to HTTP/1.1 + HTTP/2 only (disable HTTP/3 / QUIC).
+  # NaiveProxy tunnels over HTTP/2 CONNECT; HTTP/3 can break some clients.
+  servers {
+    protocols h1 h2
+  }
   email ${email}
   admin off
   log {
