@@ -9,6 +9,38 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 86 (`update.sh`) — `rebuild_caddyfile_direct` silently wrote nothing (inline `node -e` bash-quoting)
+
+Even after Bug 84/85 let `--repair` reach the rebuild, the live
+`/etc/caddy-naive/Caddyfile` stayed OLD (mtime never changed) while the run
+reported `Caddyfile rebuilt ✓`. Decisive evidence: the `[Caddyfile] rebuilt with
+N user(s)` line that the node script prints **never appeared** in `--repair`
+output (the mita equivalent `[mita-state] wrote N user(s)` did), and running the
+*exact same logic* from a standalone `.js` file wrote the correct Bug 83
+Caddyfile instantly (`WROTE 1540 bytes … NOW NEW ✅`).
+
+Root cause: the rebuild ran as a giant **inline `node -e "<script>"`** embedded in
+a **double-quoted bash string**. Bash pre-processed the whole blob —
+`$DB_PATH`/`$PANEL_CONFIG`/`$CADDY_FILE` were string-substituted and any stray
+`$`, backtick or `\` was subject to bash quoting. On the live server this
+produced a node program that exited 0 **without writing the file**, after which
+`caddy validate` validated the STALE Caddyfile → false "rebuilt ✓".
+
+Fix: write the rebuild script with a **quoted heredoc** (`<<'NODE_EOF'`, zero bash
+expansion), pass every path via `process.env` (`RB_DB_PATH`, `RB_PANEL_CONFIG`,
+`RB_CADDY_FILE`, `RB_CADDY_CFGDIR`, `RB_TEMPLATE_JS`, `RB_FAKE_SITE`), and run
+`node "$rebuild_js"`. A real failure now exits non-zero and is caught
+(`log_warn` + `return 1`) instead of silently no-op'ing.
+
+* **Bug 86b:** the temp `.js` is written **inside `$PANEL_DIR`** (not `/tmp`),
+  because node resolves `require('better-sqlite3')` relative to the *script
+  file's* directory, not the cwd — a `/tmp/*.js` would look in
+  `/tmp/node_modules` and fail (re-triggering the Bug 82 "Cannot find module").
+
+Verified end-to-end with a throwaway SQLite DB + config: the script writes the
+exact reference layout (`:443, <domain> { tls <email>; forward_proxy {…}; …}`,
+no `route{}`, both users, `protocols h1 h2`, bare `probe_resistance`).
+
 ### Bug 85 (`update.sh`) — `--repair` (and `--status`/`--expose`/`--ssh-only`) exited 1 SILENTLY before doing anything
 
 Live testing: `sudo bash update.sh --repair -y` returned `EXIT=1` with **zero
