@@ -9,6 +9,20 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.2.6] — 2026-05-29
 
+### Bug 82 (`update.sh` + `install.sh`) — `node -e` couldn't find `better-sqlite3`
+
+Live update showed the Caddyfile rebuild crashing with
+`Error: Cannot find module 'better-sqlite3'`, so the config was **not** regenerated
+(stale Caddyfile kept the old secret + missing protocols block). Cause: the inline
+`node -e "…"` scripts run with cwd = the git checkout (`~/Panel-Naive-Mieru-by-RIXXX`),
+which has no `node_modules`; the modules live under `$PANEL_DIR`
+(`/opt/panel-naive-mieru`). Fix: wrap the DB-reading `node -e` blocks in
+`( cd "$PANEL_DIR" && node -e "…" )` so Node resolves `better-sqlite3` and the
+template correctly.
+- `update.sh`: `rebuild_caddyfile_direct()` and `rebuild_mita_state_direct()`.
+- `install.sh`: the `naive_users_json` reader (its silent `try/catch` previously
+  meant a `--force` reinstall could quietly drop all naive users).
+
 ### Bug 81b (`update.sh`) — migrate existing installs to bare + regenerate on update
 
 Follow-up after live testing: `--force` update did **not** regenerate the Caddyfile
