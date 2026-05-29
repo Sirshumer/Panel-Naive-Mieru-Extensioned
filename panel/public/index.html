@@ -496,7 +496,7 @@
         <div class="card" id="card-cascade">
           <div class="card-header" data-i18n="settings.cascadeTitle">Каскад / Relay</div>
           <div class="card-body">
-            <p class="card-desc" data-i18n="settings.cascadeDesc">Настройка relay: трафик идёт через этот сервер (entry) на выходной сервер (exit), а затем в интернет.</p>
+            <p class="card-desc" data-i18n="settings.cascadeDesc">Настройка relay: трафик идёт через этот сервер (entry) на выходной сервер (exit), а затем в интернет. Mieru использует вариант B (mieru-client + redsocks + iptables) — провайдер видит только этот (entry) сервер.</p>
             <label class="checkbox" style="margin-bottom:12px">
               <input type="checkbox" id="s-cascade-enabled" />
               <span data-i18n="settings.cascadeEnable">Включить каскад (relay)</span>
@@ -504,32 +504,41 @@
             <div class="form-group">
               <label data-i18n="settings.cascadeNaiveUpstreamLabel">Naive upstream URL</label>
               <input type="text" id="s-cascade-naive-upstream" placeholder="https://user:pass@exit.server:443" />
-              <small style="color:var(--text-muted);display:block;margin-top:4px" data-i18n="settings.cascadeNaiveUpstreamHint">Формат: https://user:pass@host:port</small>
+              <small style="color:var(--text-muted);display:block;margin-top:4px" data-i18n="settings.cascadeNaiveUpstreamHint">Формат: https://user:pass@host:port (оставьте пустым, чтобы не каскадировать Naive)</small>
             </div>
             <div class="form-group">
-              <label data-i18n="settings.cascadeMieruHostLabel">Mieru exit host (SOCKS5)</label>
-              <input type="text" id="s-cascade-mieru-host" placeholder="exit.server" />
+              <label data-i18n="settings.cascadeMieruHostLabel">Mieru exit host / IP</label>
+              <input type="text" id="s-cascade-mieru-host" placeholder="exit.server или 203.0.113.10" />
+              <small style="color:var(--text-muted);display:block;margin-top:4px" data-i18n="settings.cascadeMieruHostHint">Адрес выходной (EU) ноды, где установлен тот же скрипт. Оставьте пустым, чтобы не каскадировать Mieru.</small>
             </div>
             <div class="form-row">
               <div class="form-group">
-                <label data-i18n="settings.cascadeMieruPortLabel">Mieru exit port</label>
-                <input type="number" id="s-cascade-mieru-port" min="1" max="65535" value="1080" />
+                <label data-i18n="settings.cascadeMieruPortStartLabel">Mieru exit port (start)</label>
+                <input type="number" id="s-cascade-mieru-port-start" min="1" max="65535" value="2012" />
+              </div>
+              <div class="form-group">
+                <label data-i18n="settings.cascadeMieruPortEndLabel">Mieru exit port (end)</label>
+                <input type="number" id="s-cascade-mieru-port-end" min="1" max="65535" value="2022" />
               </div>
             </div>
             <div class="form-row">
               <div class="form-group">
-                <label data-i18n="settings.cascadeMieruUserLabel">SOCKS5 username</label>
+                <label data-i18n="settings.cascadeMieruUserLabel">Mieru exit username</label>
                 <input type="text" id="s-cascade-mieru-user" placeholder="user" />
               </div>
               <div class="form-group">
-                <label data-i18n="settings.cascadeMieruPassLabel">SOCKS5 password</label>
-                <input type="password" id="s-cascade-mieru-pass" placeholder="password" />
+                <label data-i18n="settings.cascadeMieruPassLabel">Mieru exit password</label>
+                <input type="password" id="s-cascade-mieru-pass" placeholder="••••••• (оставьте пустым, чтобы не менять)" />
               </div>
             </div>
             <div class="alert alert-warning">
-              <strong>⚠</strong> <span data-i18n="settings.cascadeNote">При включении каскада оба сервиса будут перезагружены.</span>
+              <strong>⚠</strong> <span data-i18n="settings.cascadeNote">При включении каскада relay будет настроен и запущен (mieru-client + redsocks + iptables) — на это уйдёт до минуты при первой установке.</span>
             </div>
-            <button class="btn btn-primary mt-2" data-action="change-cascade" data-i18n="settings.applyCascade">Применить каскад</button>
+            <div style="display:flex;gap:8px;flex-wrap:wrap">
+              <button class="btn btn-primary mt-2" data-action="change-cascade" data-i18n="settings.applyCascade">Применить каскад</button>
+              <button class="btn btn-secondary mt-2" data-action="cascade-status" data-i18n="settings.cascadeStatusBtn">Проверить статус</button>
+            </div>
+            <pre id="cascade-status" class="hidden" style="margin-top:12px;padding:10px;background:var(--bg-2,#111);border-radius:8px;overflow:auto;font-size:12px;white-space:pre-wrap"></pre>
             <div id="cascade-msg" class="msg-inline hidden"></div>
           </div>
         </div>

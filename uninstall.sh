@@ -58,6 +58,47 @@ fi
 systemctl stop mita 2>/dev/null || true
 log_info "mita stopped ✓"
 
+# ── v1.2.6: Cascade (Variant B) cleanup ───────────────────────────────────────
+# Mirror `cascade_mieru.sh teardown` so an uninstall leaves no relay artifacts:
+# mieru-client service, redsocks, iptables REDSOCKS chain, watchdog, cron, drop-in.
+log_step "Removing cascade (relay) artifacts"
+
+# 1) iptables REDSOCKS chain + OUTPUT owner-match jump (mita uid).
+MITA_UID="$(id -u mita 2>/dev/null || true)"
+if [[ -n "$MITA_UID" ]]; then
+  while iptables -t nat -C OUTPUT -p tcp -m owner --uid-owner "$MITA_UID" -j REDSOCKS 2>/dev/null; do
+    iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner "$MITA_UID" -j REDSOCKS 2>/dev/null || break
+  done
+fi
+iptables -t nat -F REDSOCKS 2>/dev/null || true
+iptables -t nat -X REDSOCKS 2>/dev/null || true
+command -v netfilter-persistent &>/dev/null && netfilter-persistent save 2>/dev/null || true
+
+# 2) mieru-client relay service.
+systemctl stop    mieru 2>/dev/null || true
+systemctl disable mieru 2>/dev/null || true
+rm -f /etc/systemd/system/mieru.service
+
+# 3) redsocks service + drop-in.
+systemctl stop    redsocks 2>/dev/null || true
+systemctl disable redsocks 2>/dev/null || true
+rm -f /etc/systemd/system/redsocks.service.d/cascade.conf
+rmdir /etc/systemd/system/redsocks.service.d 2>/dev/null || true
+rm -f /etc/redsocks.conf
+
+# 4) Watchdog + cron.
+rm -f /usr/local/bin/mieru-watchdog.sh
+rm -f /etc/cron.d/mieru-cascade-watchdog
+
+# 5) Cascade state + client config (contains exit credentials → shred).
+[[ -f /var/lib/rixxx-panel/mieru-client-config.json ]] && \
+  { shred -u /var/lib/rixxx-panel/mieru-client-config.json 2>/dev/null || \
+    rm -f /var/lib/rixxx-panel/mieru-client-config.json; }
+rm -f /var/lib/rixxx-panel/cascade-mieru.state
+
+systemctl daemon-reload
+log_info "Cascade artifacts removed ✓"
+
 # ── Remove systemd unit files ─────────────────────────────────────────────────
 log_step "Removing systemd unit files"
 rm -f /etc/systemd/system/caddy-naive.service   # v1.2.3
@@ -176,6 +217,18 @@ if [[ "${REMOVE_MITA^^}" == "Y" ]]; then
   log_info "mita package removed ✓"
 fi
 
+# ── Optional: remove redsocks package (lazy-installed for cascade Variant B) ──
+if dpkg -l redsocks 2>/dev/null | grep -q '^ii'; then
+  echo ""
+  read -rp "Also remove the redsocks package (used by cascade relay)? [y/N]: " REMOVE_REDSOCKS
+  if [[ "${REMOVE_REDSOCKS^^}" == "Y" ]]; then
+    log_step "Removing redsocks package"
+    apt-get remove -y redsocks 2>/dev/null || true
+    apt-get autoremove -y      2>/dev/null || true
+    log_info "redsocks package removed ✓"
+  fi
+fi
+
 # ── Final summary ─────────────────────────────────────────────────────────────
 echo ""
 echo -e "${GREEN}${BOLD}╔══════════════════════════════════════════════════════════╗${NC}"
@@ -189,6 +242,7 @@ echo -e "    • Panel files (/opt/panel-naive-mieru)"
 echo -e "    • Configuration (/etc/rixxx-panel, /etc/caddy-naive)"
 echo -e "    • Fake site (/var/www/fake-site)"
 echo -e "    • Database (/var/lib/rixxx-panel/db.sqlite)"
+echo -e "    • Cascade relay (mieru-client svc, redsocks.conf, iptables REDSOCKS, watchdog/cron)"
 echo -e "    • Logs (/var/log/caddy-naive, /var/log/panel-naive-mieru.log)"
 echo ""
 echo -e "  ${BOLD}Still installed:${NC}"

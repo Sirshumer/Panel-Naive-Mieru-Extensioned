@@ -492,6 +492,62 @@ assert "ARM error: install.sh references v1.2.6 (not older)" \
 assert "uninstall.sh removes /var/lib/caddy" \
   "grep -q 'rm -rf /var/lib/caddy' '$REPO_ROOT/uninstall.sh'"
 
+# ── Cascade Variant B (static) checks ─────────────────────────────────────────
+log_step "Step 9c: Cascade Variant B (redsocks + iptables + mieru-client)"
+
+CASC="$REPO_ROOT/panel/scripts/cascade_mieru.sh"
+assert "cascade_mieru.sh exists"             "[[ -f '$CASC' ]]"
+assert "cascade_mieru.sh is executable"      "[[ -x '$CASC' ]]"
+assert "cascade_mieru.sh passes bash -n"     "bash -n '$CASC'"
+assert "cascade_mieru.sh has setup/teardown/status" \
+  "grep -q 'do_setup'  '$CASC' && grep -q 'do_teardown' '$CASC' && grep -q 'do_status' '$CASC'"
+assert "cascade uses 'profiles' (plural, not bare 'profile')" \
+  "grep -q '\"profiles\"' '$CASC'"
+assert "cascade client config has NO mtu JSON key" \
+  "! grep -qE '\"mtu\"[[:space:]]*:' '$CASC'"
+assert "cascade mieru.service uses Type=forking" \
+  "grep -q 'Type=forking' '$CASC'"
+assert "cascade restarts redsocks via ExecStartPost" \
+  "grep -q 'ExecStartPost=/bin/systemctl restart redsocks' '$CASC'"
+assert "cascade has anti-loop RETURN for exit IP" \
+  "grep -q 'exit_ip.*-j RETURN' '$CASC'"
+assert "cascade iptables owner-match mita uid" \
+  "grep -q 'uid-owner' '$CASC'"
+assert "cascade watchdog uses 3 consecutive failures" \
+  "grep -q 'FAILS.*-eq 3' '$CASC'"
+assert "cascade lazy-installs redsocks" \
+  "grep -q 'ensure_packages' '$CASC'"
+
+# Server wiring
+assert "index.js invokes cascade_mieru.sh" \
+  "grep -q 'cascade_mieru.sh' '$REPO_ROOT/panel/server/index.js'"
+assert "index.js has runCascadeMieru (execFileSync, no shell)" \
+  "grep -q 'function runCascadeMieru' '$REPO_ROOT/panel/server/index.js' && grep -q 'execFileSync' '$REPO_ROOT/panel/server/index.js'"
+assert "index.js exposes cascade status endpoint" \
+  "grep -q \"/api/settings/cascade/status\" '$REPO_ROOT/panel/server/index.js'"
+assert "index.js masks cascade exit password in /api/config" \
+  "grep -q 'cascadeMieru' '$REPO_ROOT/panel/server/index.js'"
+assert "default cfg has cascadeMieru object" \
+  "grep -q 'cascadeMieru:' '$REPO_ROOT/panel/server/index.js'"
+
+# Install / Uninstall wiring
+assert "install.sh calls sysctl_tune.sh (BBR)" \
+  "grep -q 'sysctl_tune.sh' '$REPO_ROOT/install.sh' && grep -q 'tune_network' '$REPO_ROOT/install.sh'"
+assert "uninstall.sh removes iptables REDSOCKS chain" \
+  "grep -q 'iptables -t nat -X REDSOCKS' '$REPO_ROOT/uninstall.sh'"
+assert "uninstall.sh removes mieru.service" \
+  "grep -q '/etc/systemd/system/mieru.service' '$REPO_ROOT/uninstall.sh'"
+assert "uninstall.sh removes redsocks.conf" \
+  "grep -q '/etc/redsocks.conf' '$REPO_ROOT/uninstall.sh'"
+assert "uninstall.sh removes watchdog cron" \
+  "grep -q 'mieru-cascade-watchdog' '$REPO_ROOT/uninstall.sh'"
+
+# UI wiring
+assert "index.html has exit port-range inputs" \
+  "grep -q 's-cascade-mieru-port-start' '$REPO_ROOT/panel/public/index.html' && grep -q 's-cascade-mieru-port-end' '$REPO_ROOT/panel/public/index.html'"
+assert "app.js posts cascadeMieru (host/portStart/portEnd/user/pass)" \
+  "grep -q 'cascadeMieru' '$REPO_ROOT/panel/public/app.js' && grep -q 'portStart' '$REPO_ROOT/panel/public/app.js'"
+
 # ══════════════════════════════════════════════════════════════════════════════
 # Summary
 # ══════════════════════════════════════════════════════════════════════════════
