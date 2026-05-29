@@ -352,6 +352,8 @@ rebuild_caddyfile_direct() {
       return 1
     fi
   fi
+  # Bug 79: ensure the caddy user can actually read the freshly-written file
+  fix_caddy_perms
   log_info "Caddyfile rebuilt ✓"
 }
 
@@ -448,6 +450,29 @@ SVCCADDY
     rm -f /etc/systemd/system/naive.service
     log_info "Legacy naive.service removed (replaced by caddy-naive.service)"
   fi
+}
+
+# ── Bug 79: fix caddy-naive config permissions ───────────────────────────────
+#   caddy-naive runs as User=caddy and fails to start with
+#     "reading config from file: open /etc/caddy-naive/Caddyfile: permission denied"
+#   when the config dir lacks group-execute (traverse) for the caddy group.
+#   The Caddyfile is written by root (mode 640, owner root:root); the caddy user
+#   then cannot enter the dir / read the file. Own dir as root:caddy, set dirs
+#   750 (group can traverse) and files 640 (group can read).
+fix_caddy_perms() {
+  id caddy &>/dev/null || return 0
+  [[ -d "$CADDY_CONFIG_DIR" ]] || return 0
+  chown -R root:caddy "$CADDY_CONFIG_DIR" 2>/dev/null || true
+  # Order matters: make the top dir traversable FIRST, otherwise `find` cannot
+  # descend into a 640 dir to chmod the files inside it.
+  chmod 750 "$CADDY_CONFIG_DIR" 2>/dev/null || true
+  find "$CADDY_CONFIG_DIR" -type d -exec chmod 750 {} + 2>/dev/null || true
+  find "$CADDY_CONFIG_DIR" -type f -exec chmod 640 {} + 2>/dev/null || true
+  [[ -f "$CADDY_FILE" ]] && chmod 640 "$CADDY_FILE" 2>/dev/null || true
+  # caddy also needs its data/log dirs owned correctly
+  mkdir -p /var/log/caddy-naive /var/lib/caddy 2>/dev/null || true
+  chown -R caddy:caddy /var/log/caddy-naive /var/lib/caddy 2>/dev/null || true
+  log_info "caddy-naive config permissions fixed (dir 750, files 640, owner root:caddy) ✓"
 }
 
 # ── v1.2.3: Update caddy-forwardproxy-naive (amd64 only) ─────────────────────
@@ -868,6 +893,8 @@ FAKEHTML
 
   # Step 5: reload/restart services
   systemctl daemon-reload
+  # Bug 79: make sure the caddy user can read its config before (re)starting
+  fix_caddy_perms
   systemctl reload caddy-naive 2>/dev/null || \
     systemctl restart caddy-naive 2>/dev/null && \
     log_info "caddy-naive reloaded ✓" || \
@@ -918,6 +945,13 @@ do_update() {
   ensure_caddy_service
 
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
+
+  # Bug 79: fix caddy-naive config permissions and (re)start it. Older installs
+  # left /etc/caddy-naive at 640 (no group-execute), so caddy-naive failed with
+  # "Caddyfile: permission denied". Fix perms then restart so the fix takes hold.
+  fix_caddy_perms
+  systemctl restart caddy-naive 2>/dev/null && log_info "caddy-naive restarted ✓" || \
+    log_warn "caddy-naive restart failed — journalctl -u caddy-naive -n 20"
 
   # Update version file
   if [[ -f "$VERSION_FILE" ]]; then
