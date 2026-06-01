@@ -7,7 +7,94 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [v1.2.6] — 2026-05-29
+## [v1.2.6] — 2026-06-01
+
+### Bug 88 (`install.sh`) — install aborted with `line 665: port: No such file or directory`
+
+Many testers hit this on the final stage of a fresh install. The inline
+Caddyfile fallback assigns a multi-line **double-quoted** shell string
+(`caddyfile_content="…"`), and one comment line inside it contained an
+**unescaped** double quote plus angle brackets:
+```
+# Bug 83: match the known-good reference server (":<port>, <domain>" listener +
+```
+Inside a `"…"` assignment the stray `"` *closed* the string, so bash then parsed
+`:<port>` as a redirection from a file named `port` →
+`line 665: port: No such file or directory`, and the generated Caddyfile was
+truncated. (The users' workaround — deleting the `# Bug 83` line and removing the
+comma — worked only because it deleted the poisoned comment, not because of the
+comma.)
+
+Fix: rewrite the comment with no double-quote / `<` / `>` characters. The
+site-address line `:${NAIVE_PORT}, ${DOMAIN} {` (the catch-all `:443` **plus** the
+domain, Bug 83 layout) is kept intact — it is valid Caddy and not the cause.
+
+### Bug 90 (`panel`, `install.sh`) — Caddyfile written `root:root` is unreadable by `User=caddy`
+
+`caddy-naive.service` runs as `User=caddy/Group=caddy`, but the panel wrote
+`/etc/caddy-naive/Caddyfile` as `root:root 640`. The caddy user cannot read it →
+`open …/Caddyfile: permission denied` → crash loop → systemd blocks it with
+*"Start request repeated too quickly"*.
+
+Fix: every Caddyfile write now hands ownership to **root:caddy** and keeps the
+config dir traversable by the group:
+- `panel/server/index.js` `writeCaddyfileAtomic()` calls a new `fixCaddyPerms()`
+  (dir `root:caddy 750`, Caddyfile + `probe_secret` `root:caddy 640`).
+- `install.sh` `write_caddyfile()` adds `chown root:caddy` after the `chmod 640`
+  (in addition to `start_services()`'s existing Bug 79 dir fixup).
+
+### Bug 91 (`panel`, `update.sh`) — `reload` silently kept the OLD config and masked failures
+
+The panel applied config via `systemctl reload` (kill -USR1). A graceful reload
+**silently keeps the in-memory config loaded at start** when the new config can't
+be read (e.g. Bug 90). Everything *looked* healthy — `caddy validate` Valid,
+`systemctl status` active, logs *"Reloaded"*, even a direct
+`curl -x https://u:p@exit:443` returned the exit IP — yet the running process
+never loaded the new `upstream`, so the client egressed from the **Entry** node.
+It only surfaced on a full `restart` (which then failed with the Bug 90 perms
+error).
+
+Fix: after writing the Caddyfile, always do a **full `systemctl restart`**, then
+verify `systemctl is-active`; on failure surface the real `journalctl` error.
+- `panel/server/index.js`: new `applyCaddyConfig()` (restart + is-active +
+  `collectCaddyError()`); `reloadCaddy()`/`restartCaddy()` now delegate to it.
+  `applyAllConfigs()` and the cascade POST return `caddyError` to the UI.
+- `update.sh`: the `reload || restart` block replaced with `reset-failed` +
+  `restart` + `is-active` check.
+
+### Bug 89 (`panel`) — new naive key didn't activate until `update.sh --force`
+
+Creating a naive key in the panel didn't work in Karing until the operator ran
+`sudo bash update.sh --force -y`. Root cause was the combination of Bug 90
+(file written `root:root`) and Bug 91 (`reload` silently failing); `update.sh`
+"fixed" it only because it ran `fix_caddy_perms` (root:caddy) + restart. With the
+Bug 90 chown and the Bug 91 restart+verify now in the per-CRUD `applyAllConfigs()`
+path, a new key activates immediately — no `--force` needed.
+
+### Bug 92 (`panel`) — `upstream naive+https://…` rejected by `forward_proxy`
+
+Users paste the subscription-format exit key as-is
+(`naive+https://user:pass@host:443`). The panel wrote it verbatim, and
+`caddy validate` failed:
+> forward_proxy: insecure schemes are only allowed to localhost upstreams
+
+`forward_proxy upstream` only accepts a clean `https://` URL. Fix: a shared
+`normalizeUpstream()` strips a leading `naive+` (any `<scheme>+` wrapper), upgrades
+`http://`→`https://`, and assumes `https://` when no scheme is given. Applied in
+`panel/server/index.js` (store + both build paths) and in
+`panel/server/caddyTemplate.js` `render()` (single source of truth, so
+install.sh/update.sh inherit it).
+
+### Bug 93 (`panel`, UX) — "Проверить статус" didn't diagnose the Naive cascade
+
+The status button only ran the Mieru (Variant B) diagnostics, so a Naive-only
+cascade always showed `configured: 0 / inactive` — misleading. Fix: a new
+`naiveCascadeStatusText()` block reports, with credentials redacted:
+`upstream` present in the live Caddyfile, `caddy-naive validate`,
+`systemctl is-active caddy-naive`, and the **egress IP measured through the naive
+upstream** (`curl -x https://u:p@exit:443 https://api.ipify.org`). The
+`/api/settings/cascade/status` response now contains both the **NAIVE CASCADE**
+and **MIERU CASCADE** sections (no UI change needed — it renders the text).
 
 ### Bug 87 (`panel`) — subscription JSON used `type:"http"` for naive (should be `type:"naive"`)
 

@@ -252,6 +252,25 @@ function saveConfig() {
 // Bug 38 (P2): log rotation uses roll_keep_for 720h (30 days) not roll_keep 5.
 //
 // Bug 21: no site-level log block — global block covers all traffic.
+// ── normalizeUpstream() — Bug 92 ─────────────────────────────────────────────
+// Caddy's forward_proxy `upstream` directive only accepts a clean https:// URL.
+// Users paste the subscription-format key as-is (e.g. "naive+https://u:p@h:443"),
+// which makes caddy validate fail with:
+//   "forward_proxy: insecure schemes are only allowed to localhost upstreams".
+// Strip a leading "naive+" (and any other "<scheme>+" wrapper) so we end up with
+// a bare https:// URL. If the input has no scheme at all, assume https://.
+function normalizeUpstream(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  // Drop a leading "xxx+" wrapper such as "naive+https://..." → "https://..."
+  s = s.replace(/^[a-z][a-z0-9.+-]*\+(?=https?:\/\/)/i, '');
+  // If a non-https scheme slipped through (e.g. "http://"), upgrade to https.
+  s = s.replace(/^http:\/\//i, 'https://');
+  // No scheme at all → assume https.
+  if (!/^https:\/\//i.test(s)) s = 'https://' + s;
+  return s;
+}
+
 function buildCaddyfile(config, users) {
   // Filter to naive-protocol users only
   // Bug 44: skip users without a plaintext password — caddy-forwardproxy-naive
@@ -293,7 +312,8 @@ function buildCaddyfile(config, users) {
       probeSecret,
       probeMode,
       logFile:     LOG_CADDY,
-      upstream:    (config.cascadeEnabled && config.cascadeNaiveUpstream) ? config.cascadeNaiveUpstream : '',
+      // Bug 92: normalize (strip "naive+" etc.) before it reaches the template.
+      upstream:    (config.cascadeEnabled && config.cascadeNaiveUpstream) ? normalizeUpstream(config.cascadeNaiveUpstream) : '',
     }, naiveUsers);
   }
 
@@ -325,7 +345,8 @@ function buildCaddyfile(config, users) {
   }
 
   // v1.2.6: cascade — upstream proxy support (inline fallback)
-  const upstreamUrl = (config.cascadeEnabled && config.cascadeNaiveUpstream) ? config.cascadeNaiveUpstream : '';
+  // Bug 92: normalize the upstream so forward_proxy gets a clean https:// URL.
+  const upstreamUrl = (config.cascadeEnabled && config.cascadeNaiveUpstream) ? normalizeUpstream(config.cascadeNaiveUpstream) : '';
   const upstreamLine = upstreamUrl ? `\n    upstream ${upstreamUrl}` : '';
 
   // Bug 28: no "tls <email>" inside site block
@@ -376,30 +397,106 @@ ${authLines}
 }
 
 // ── writeCaddyfileAtomic() ────────────────────────────────────────────────────
+// Bug 90: caddy-naive.service runs as User=caddy/Group=caddy. If the Caddyfile
+// (and its parent dir) are root:root 640, the caddy user cannot read it and the
+// service crash-loops with "permission denied" → "Start request repeated too
+// quickly". Every write MUST leave the file as root:caddy 640 and the config dir
+// as root:caddy 750 (the group needs the dir's execute/traverse bit to open the
+// file inside it). chown is best-effort: it only works when the panel runs as
+// root, which it does in production.
+function fixCaddyPerms() {
+  try {
+    // Dir: root:caddy 750 so the caddy group can traverse + list.
+    execSync(`chown root:caddy '${resolvedCaddyCfgDir}' 2>/dev/null || true`, { timeout: 5000 });
+    execSync(`chmod 750 '${resolvedCaddyCfgDir}' 2>/dev/null || true`, { timeout: 5000 });
+    // Caddyfile: root:caddy 640 so the caddy group can read it.
+    if (fs.existsSync(resolvedCaddyFile)) {
+      execSync(`chown root:caddy '${resolvedCaddyFile}' 2>/dev/null || true`, { timeout: 5000 });
+      execSync(`chmod 640 '${resolvedCaddyFile}' 2>/dev/null || true`, { timeout: 5000 });
+    }
+    // probe_secret: root:caddy 640 so caddy can read it for probe_resistance.
+    const probeFile = path.join(resolvedCaddyCfgDir, 'probe_secret');
+    if (fs.existsSync(probeFile)) {
+      execSync(`chown root:caddy '${probeFile}' 2>/dev/null || true`, { timeout: 5000 });
+      execSync(`chmod 640 '${probeFile}' 2>/dev/null || true`, { timeout: 5000 });
+    }
+  } catch (e) {
+    console.warn('[CADDY] fixCaddyPerms (non-fatal):', e.message);
+  }
+}
+
 function writeCaddyfileAtomic(content) {
   fs.mkdirSync(resolvedCaddyCfgDir, { recursive: true });
   const tmp = resolvedCaddyFile + '.new';
   fs.writeFileSync(tmp, content, { mode: 0o640 });
   fs.renameSync(tmp, resolvedCaddyFile);   // atomic replace
+  // Bug 90: hand ownership to root:caddy so the service can read it.
+  fixCaddyPerms();
 }
 
-// ── reloadCaddy() — graceful reload (zero downtime) ──────────────────────────
-// Bug 50: use only systemctl reload — the old pgrep fallback was unreliable
-//         because 'pgrep -x caddy-naive' matches on exact comm-name which may
-//         differ from the binary name, causing SIGUSR1 to miss the process.
-function reloadCaddy() {
+// Bug 91: last caddy apply error, surfaced to the UI when an apply fails.
+let lastCaddyError = '';
+function getLastCaddyError() { return lastCaddyError; }
+
+// ── applyCaddyConfig() — Bug 91 ──────────────────────────────────────────────
+// Previously the panel applied config via `systemctl reload` (kill -USR1). A
+// graceful reload SILENTLY KEEPS the old in-memory config when the new config
+// cannot be read (e.g. Bug 90 permission error): `validate` says Valid, status
+// is active, logs say "Reloaded", a direct curl works — yet the running process
+// never loaded the new upstream, so the client exits from the Entry node and the
+// cascade is effectively NOT applied. The failure only surfaced on a full
+// restart. Therefore we now ALWAYS do a full `systemctl restart` and then verify
+// `systemctl is-active`; on failure we capture the real journal error so the UI
+// can show it instead of a misleading "success".
+function applyCaddyConfig() {
+  lastCaddyError = '';
   try {
-    execSync('systemctl reload caddy-naive', { timeout: 10000 });
-    return true;
-  } catch { return false; }
+    // Clear any prior failure storm so the restart isn't blocked by
+    // "Start request repeated too quickly".
+    try { execSync('systemctl reset-failed caddy-naive 2>/dev/null || true', { timeout: 5000 }); } catch {}
+    execSync('systemctl restart caddy-naive', { timeout: 20000 });
+  } catch (e) {
+    lastCaddyError = collectCaddyError(e);
+    return { ok: false, error: lastCaddyError };
+  }
+  // Verify the service actually came up and stayed up.
+  let active = '';
+  try { active = execSync('systemctl is-active caddy-naive 2>/dev/null', { timeout: 5000 }).toString().trim(); }
+  catch (e) { active = (e.stdout ? e.stdout.toString().trim() : '') || 'inactive'; }
+  if (active !== 'active') {
+    lastCaddyError = collectCaddyError(null) || `caddy-naive is ${active || 'inactive'}`;
+    return { ok: false, error: lastCaddyError };
+  }
+  return { ok: true, error: '' };
+}
+
+// Pull the real reason a (re)start failed: prefer the most recent journal lines,
+// fall back to the exception's stderr/stdout.
+function collectCaddyError(err) {
+  let msg = '';
+  try {
+    const j = execSync('journalctl -u caddy-naive -n 20 --no-pager 2>/dev/null', { timeout: 5000 }).toString();
+    // Surface the lines that actually explain the failure.
+    const hot = j.split('\n').filter(l =>
+      /permission denied|error|insecure schemes|repeated too quickly|invalid|adapt|loading/i.test(l));
+    msg = (hot.length ? hot.slice(-6) : j.trim().split('\n').slice(-6)).join('\n').trim();
+  } catch {}
+  if (!msg && err) {
+    msg = ((err.stderr && err.stderr.toString()) || (err.stdout && err.stdout.toString()) || err.message || '').trim();
+  }
+  return msg;
+}
+
+// ── reloadCaddy() — Bug 91: now a FULL restart + verify (no more silent reload).
+// Kept as a thin boolean wrapper so existing callers don't change behaviour.
+function reloadCaddy() {
+  const r = applyCaddyConfig();
+  return r.ok;
 }
 
 // ── restartCaddy() — full restart (needed for port/domain changes) ───────────
 function restartCaddy() {
-  try {
-    execSync('systemctl restart caddy-naive 2>/dev/null', { timeout: 15000 });
-    return true;
-  } catch { return false; }
+  return applyCaddyConfig().ok;
 }
 
 // ── Bug 7: UFW single-port helper ────────────────────────────────────────────
@@ -548,19 +645,102 @@ function shredFile(fp) {
   catch { try { fs.unlinkSync(fp); } catch {} }
 }
 
+// ── naiveCascadeStatusText() — Bug 93 ────────────────────────────────────────
+// The "Проверить статус" button used to only diagnose the Mieru cascade (Variant
+// B), so a Naive-only cascade always showed "configured: 0 / inactive" — wildly
+// misleading. This block diagnoses the Naive leg:
+//   • whether an `upstream` line is present in the live Caddyfile
+//   • `caddy-naive validate` result
+//   • `systemctl is-active caddy-naive`
+//   • egress IP measured THROUGH the naive upstream (curl -x https://u:p@exit:443)
+// Credentials are redacted in the printed output.
+function naiveCascadeStatusText() {
+  const lines = [];
+  lines.push('=== NAIVE CASCADE ===');
+
+  const enabled = !!cfg.cascadeEnabled;
+  const upstreamRaw = (cfg.cascadeNaiveUpstream || '').trim();
+  const upstream = upstreamRaw ? normalizeUpstream(upstreamRaw) : '';
+  const redact = (u) => u.replace(/\/\/([^:@/]+):([^@/]+)@/, '//$1:***@');
+
+  lines.push(`cascadeEnabled : ${enabled}`);
+  lines.push(`upstream (cfg) : ${upstream ? redact(upstream) : '(none)'}`);
+
+  // 1) upstream present in the live Caddyfile?
+  let inFile = false;
+  try {
+    if (fs.existsSync(resolvedCaddyFile)) {
+      const c = fs.readFileSync(resolvedCaddyFile, 'utf8');
+      inFile = /^\s*upstream\s+https:\/\//mi.test(c);
+    }
+  } catch {}
+  lines.push(`upstream in Caddyfile : ${inFile ? 'yes' : 'no'}`);
+
+  // 2) caddy-naive validate
+  let validate = 'unknown';
+  try {
+    execSync(`${CADDY_BIN} validate --config '${resolvedCaddyFile}' --adapter caddyfile 2>&1`, { timeout: 15000 });
+    validate = 'Valid';
+  } catch (e) {
+    const out = ((e.stdout && e.stdout.toString()) || (e.stderr && e.stderr.toString()) || e.message || '').trim();
+    validate = 'INVALID: ' + out.split('\n').slice(-3).join(' ');
+  }
+  lines.push(`caddy validate : ${validate}`);
+
+  // 3) systemctl is-active caddy-naive
+  let active = 'unknown';
+  try { active = execSync('systemctl is-active caddy-naive 2>/dev/null', { timeout: 5000 }).toString().trim(); }
+  catch (e) { active = (e.stdout ? e.stdout.toString().trim() : '') || 'inactive'; }
+  lines.push(`caddy-naive    : ${active}`);
+  if (active !== 'active') {
+    const err = collectCaddyError(null);
+    if (err) lines.push('  ↳ ' + err.split('\n').join('\n  ↳ '));
+  }
+
+  // 4) egress IP through the naive upstream itself.
+  if (enabled && upstream) {
+    let egress = '';
+    try {
+      // -x routes through the exit's forward proxy; api.ipify.org returns the
+      // public IP the request egressed from (= exit node IP when cascade works).
+      egress = execSync(
+        `curl -fsS --max-time 12 -x '${upstream}' https://api.ipify.org 2>/dev/null`,
+        { timeout: 15000 }
+      ).toString().trim();
+    } catch (e) {
+      egress = 'FAILED (' + ((e.stderr && e.stderr.toString().trim()) || e.message || 'no response') + ')';
+    }
+    lines.push(`egress via upstream : ${egress || '(empty)'}`);
+  } else {
+    lines.push('egress via upstream : (cascade not enabled / no upstream)');
+  }
+
+  return lines.join('\n');
+}
+
 // ── applyAllConfigs() — unified pipeline ─────────────────────────────────────
-// Rebuilds Caddyfile, reloads Caddy, rebuilds mita state, applies mita config.
+// Rebuilds Caddyfile, (re)starts Caddy, rebuilds mita state, applies mita config.
 // Called after every user CRUD operation.
+// Bug 89: creating a naive key used to "not work" until `update.sh --force`,
+// because writeCaddyfileAtomic left the file root:root (Bug 90) and reloadCaddy
+// silently failed/kept the old config (Bug 91). With the chown in
+// writeCaddyfileAtomic and the full restart+verify in applyCaddyConfig, a new
+// key now activates immediately. We also surface the real caddy error.
 function applyAllConfigs() {
-  let caddyOk = false, mitaOk = false;
+  let caddyOk = false, mitaOk = false, caddyError = '';
   try {
     const content = buildCaddyfile(cfg, getAllUsers());
-    writeCaddyfileAtomic(content);
-    caddyOk = reloadCaddy();
-  } catch (e) { console.error('[CADDY]', e.message); }
+    writeCaddyfileAtomic(content);          // Bug 90: chown root:caddy inside
+    const r = applyCaddyConfig();           // Bug 91: full restart + verify
+    caddyOk = r.ok;
+    if (!r.ok) {
+      caddyError = r.error;
+      console.error('[CADDY] apply failed:', r.error);
+    }
+  } catch (e) { caddyError = e.message; console.error('[CADDY]', e.message); }
   try { mitaOk = applyMitaConfig(); }
   catch (e) { console.error('[MITA]', e.message); }
-  return { caddyOk, mitaOk, servicesReloaded: caddyOk && mitaOk };
+  return { caddyOk, mitaOk, caddyError, servicesReloaded: caddyOk && mitaOk };
 }
 
 // ── Express app ───────────────────────────────────────────────────────────────
@@ -1043,10 +1223,17 @@ app.get('/api/settings/cascade', requireAuth, (req, res) => {
   });
 });
 
-// Live cascade status (calls cascade_mieru.sh status).
+// Live cascade status — Bug 93: diagnose BOTH legs (Naive + Mieru).
 app.get('/api/settings/cascade/status', requireAuth, (req, res) => {
-  const r = runCascadeMieru('status');
-  res.json({ ok: r.ok, output: r.output });
+  let naiveOut = '';
+  try { naiveOut = naiveCascadeStatusText(); }
+  catch (e) { naiveOut = '=== NAIVE CASCADE ===\n(error: ' + e.message + ')'; }
+
+  const m = runCascadeMieru('status');
+  const mieruOut = '=== MIERU CASCADE (Variant B) ===\n' + (m.output || '(no output)');
+
+  const output = naiveOut + '\n\n' + mieruOut;
+  res.json({ ok: m.ok, output });
 });
 
 app.post('/api/settings/cascade', requireAuth, (req, res) => {
@@ -1054,7 +1241,10 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
   const enabled = !!cascadeEnabled;
   cfg.cascadeEnabled = enabled;
   if (cascadeNaiveUpstream !== undefined) {
-    cfg.cascadeNaiveUpstream = String(cascadeNaiveUpstream || '').trim();
+    // Bug 92: normalize on store too (defense in depth) — strip "naive+" etc. so
+    // the saved config and the generated Caddyfile both carry a clean https:// URL.
+    const raw = String(cascadeNaiveUpstream || '').trim();
+    cfg.cascadeNaiveUpstream = raw ? normalizeUpstream(raw) : '';
   }
 
   // Merge Mieru exit settings. A blank password means "keep existing".
@@ -1075,9 +1265,13 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
 
   try {
     // 1) Naive leg — rebuild Caddyfile (upstream applied when enabled).
+    // Bug 90: writeCaddyfileAtomic chowns root:caddy.
+    // Bug 91: applyCaddyConfig does a full restart + is-active verify and
+    //         returns the real error (no more silent reload masking failures).
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);
-    const caddyOk = reloadCaddy();
+    const caddyRes = applyCaddyConfig();
+    const caddyOk = caddyRes.ok;
 
     // 2) Mieru leg — Variant B orchestration.
     let cascadeOk = true, cascadeOut = '';
@@ -1101,6 +1295,8 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
     res.json({
       ok: caddyOk && cascadeOk,
       caddyOk, mitaOk, cascadeOk,
+      // Bug 91: surface the real caddy-naive error to the UI on failure.
+      caddyError: caddyOk ? '' : (caddyRes.error || ''),
       cascadeOutput: cascadeOut,
       message: enabled
         ? (hasMieruExit

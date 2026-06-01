@@ -989,10 +989,18 @@ FAKEHTML
   systemctl daemon-reload
   # Bug 79: make sure the caddy user can read its config before (re)starting
   fix_caddy_perms
-  systemctl reload caddy-naive 2>/dev/null || \
-    systemctl restart caddy-naive 2>/dev/null && \
-    log_info "caddy-naive reloaded ✓" || \
-    log_warn "caddy-naive reload failed — journalctl -u caddy-naive -n 20"
+  # Bug 91: a graceful `reload` silently keeps the OLD in-memory config when the
+  # new config can't be read (e.g. a permission error) — validate/status/logs all
+  # look healthy while the cascade is NOT actually loaded. Always do a full
+  # restart and verify is-active so a real failure surfaces.
+  systemctl reset-failed caddy-naive 2>/dev/null || true
+  systemctl restart caddy-naive 2>/dev/null || true
+  if [[ "$(systemctl is-active caddy-naive 2>/dev/null)" == "active" ]]; then
+    log_info "caddy-naive restarted ✓"
+  else
+    log_warn "caddy-naive restart failed — journalctl -u caddy-naive -n 20:"
+    journalctl -u caddy-naive -n 20 --no-pager 2>/dev/null || true
+  fi
   systemctl restart mita 2>/dev/null && log_info "mita restarted ✓" || \
     log_warn "mita restart failed — journalctl -u mita -n 20"
   pm2 restart panel-naive-mieru 2>/dev/null || true
