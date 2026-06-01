@@ -662,8 +662,12 @@ write_caddyfile() {
 }
 
 :${NAIVE_PORT}, ${DOMAIN} {
-  # Bug 83: match the known-good reference server (":<port>, <domain>" listener +
-  # explicit tls + no route{} wrapper).
+  # Bug 83 / Bug 88: known-good reference server. Listener is the catch-all
+  # port plus domain on one site-address line, explicit tls, no route wrapper.
+  # NOTE: keep this comment free of double-quote and angle-bracket chars -
+  # caddyfile_content is a double-quoted shell assignment, so a stray quote
+  # would close the string and a colon-redirect would be parsed as a file
+  # ('line 665: port: No such file or directory' was Bug 88).
   tls ${ADMIN_EMAIL}
 
   forward_proxy {
@@ -686,6 +690,13 @@ ${probe_line}"
   printf '%s\n' "$caddyfile_content" > "$tmp_file"
   mv "$tmp_file" "$CADDY_FILE"
   chmod 640 "$CADDY_FILE"
+  # Bug 90: the service runs as User=caddy/Group=caddy. A root:root 640 Caddyfile
+  # is unreadable by the caddy group -> "permission denied" crash loop. Own it as
+  # root:caddy so the group can read. (start_services() re-asserts this for the
+  # whole config dir, but set it here too in case write_caddyfile() is re-run.)
+  if id caddy &>/dev/null; then
+    chown root:caddy "$CADDY_FILE" 2>/dev/null || true
+  fi
 
   # Bug 60: format Caddyfile with caddy fmt --overwrite to ensure canonical style
   # (silences caddy fmt warnings during service start; non-fatal if caddy fmt fails)

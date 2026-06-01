@@ -36,6 +36,20 @@
 
 const crypto = require('crypto');
 
+// ── normalizeUpstream() — Bug 92 ─────────────────────────────────────────────
+// Caddy forward_proxy `upstream` only accepts a clean https:// URL. The panel
+// already normalizes, but render() is also called directly from install.sh /
+// update.sh, so we normalize here too (single source of truth). Strips a leading
+// "naive+" (or any "<scheme>+") wrapper and upgrades a bare/http upstream to https.
+function normalizeUpstream(raw) {
+  let s = String(raw || '').trim();
+  if (!s) return '';
+  s = s.replace(/^[a-z][a-z0-9.+-]*\+(?=https?:\/\/)/i, '');
+  s = s.replace(/^http:\/\//i, 'https://');
+  if (!/^https:\/\//i.test(s)) s = 'https://' + s;
+  return s;
+}
+
 /**
  * render(cfg, naiveUsers) → string
  *
@@ -105,7 +119,8 @@ function render(cfg, naiveUsers) {
   }
 
   // ── v1.2.6: cascade — upstream proxy support ──────────────────────────────
-  const upstreamUrl = (cfg.upstream || '').trim();
+  // Bug 92: normalize (strip "naive+" etc.) so forward_proxy gets clean https://.
+  const upstreamUrl = normalizeUpstream(cfg.upstream || '');
   const upstreamLine = upstreamUrl
     ? `\n    upstream ${upstreamUrl}`
     : '';
