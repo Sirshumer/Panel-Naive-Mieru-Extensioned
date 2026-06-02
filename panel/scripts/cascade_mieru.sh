@@ -16,7 +16,11 @@
 #
 # Design notes (mirrors the field-tested manual guide; avoids its pitfalls):
 #   • mieru-client config uses "profiles" (plural). "profile" → unknown field.
-#   • Client config MUST NOT contain "mtu" (unsupported → unknown field).
+#   • Bug 95: "mtu" and "multiplexing" live INSIDE each profile (not top-level).
+#     mtu "must be the same as proxy server" (default 1400, valid 1280-1400).
+#     The key is derived from username+password+system time, so those must match
+#     the exit user EXACTLY and both clocks must be NTP-synced (else the server
+#     can't decrypt → NewSession/NewSessionDecrypted stay 0 and traffic is dropped).
 #   • mieru.service uses Type=forking + "mieru start" ("mieru run" does NOT exist).
 #   • redsocks is restarted together with mieru via ExecStartPost (else traffic
 #     stops flowing through the cascade after a mieru restart).
@@ -55,6 +59,8 @@ EXIT_PORT_START="2012"
 EXIT_PORT_END="2022"
 EXIT_USER=""
 EXIT_PASS=""
+EXIT_MTU="1400"          # Bug 95: must match the exit (mita) mtu; default 1400.
+EXIT_MUX="MULTIPLEXING_LOW"   # Bug 95: mieru client default; explicit for clarity.
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -63,6 +69,8 @@ while [[ $# -gt 0 ]]; do
     --exit-port-end)    EXIT_PORT_END="${2:-}";    shift 2 ;;
     --exit-user)        EXIT_USER="${2:-}";        shift 2 ;;
     --exit-pass)        EXIT_PASS="${2:-}";        shift 2 ;;
+    --exit-mtu)         EXIT_MTU="${2:-1400}";     shift 2 ;;
+    --exit-mux)         EXIT_MUX="${2:-MULTIPLEXING_LOW}"; shift 2 ;;
     *) shift ;;
   esac
 done
@@ -130,7 +138,17 @@ ensure_packages() {
   log "packages ready ✓"
 }
 
-# ── Write mieru-client config (profiles plural, NO mtu) ───────────────────────
+# ── Write mieru-client config ─────────────────────────────────────────────────
+# Schema reference: https://github.com/enfein/mieru/blob/main/docs/client-install.md
+#
+# Bug 95 (handshake parity): the mieru key is derived from username + password +
+# system time, so those MUST byte-match the exit (mita) user; and `mtu`
+# "must be the same as proxy server" (default 1400). Earlier this generator
+# claimed `mtu` was an "unsupported / unknown field" and omitted it — that was
+# WRONG: `mtu` belongs inside each profile (the *profiles* array), not at the top
+# level. We now emit `mtu` and `multiplexing` per profile so the client matches
+# the exit. (Traffic pattern need NOT match per the official docs, so we don't
+# inject one — that keeps the implicit pattern free on each side.)
 write_mieru_client_config() {
   mkdir -p "$(dirname "$MIERU_CLIENT_CONFIG")"
 
@@ -143,11 +161,21 @@ print(json.dumps([{"port": p, "protocol": "TCP"} for p in range(s, e + 1)]))
 PYEOF
 )
 
-  # NOTE: mtu is intentionally omitted (unsupported in client config).
-  python3 - "$EXIT_HOST" "$EXIT_USER" "$EXIT_PASS" "$port_bindings" "$RPC_PORT" "$SOCKS5_PORT" \
+  python3 - "$EXIT_HOST" "$EXIT_USER" "$EXIT_PASS" "$port_bindings" "$RPC_PORT" "$SOCKS5_PORT" "$EXIT_MTU" "$EXIT_MUX" \
     > "$MIERU_CLIENT_CONFIG" <<'PYEOF'
 import json, sys
-host, user, pw, pb_json, rpc, socks5 = sys.argv[1:7]
+host, user, pw, pb_json, rpc, socks5, mtu, mux = sys.argv[1:9]
+try:
+    mtu_i = int(mtu)
+except (TypeError, ValueError):
+    mtu_i = 1400
+# mieru accepts mtu between 1280 and 1400.
+if mtu_i < 1280 or mtu_i > 1400:
+    mtu_i = 1400
+mux = (mux or "MULTIPLEXING_LOW").strip()
+if mux not in ("MULTIPLEXING_OFF", "MULTIPLEXING_LOW",
+               "MULTIPLEXING_MIDDLE", "MULTIPLEXING_HIGH"):
+    mux = "MULTIPLEXING_LOW"
 cfg = {
     "profiles": [
         {
@@ -160,6 +188,10 @@ cfg = {
                     "portBindings": json.loads(pb_json),
                 }
             ],
+            # Bug 95: mtu + multiplexing live INSIDE the profile (per official schema).
+            "mtu": mtu_i,
+            "multiplexing": {"level": mux},
+            "handshakeMode": "HANDSHAKE_STANDARD",
         }
     ],
     "activeProfile": "cascade",
@@ -171,7 +203,7 @@ cfg = {
 print(json.dumps(cfg, indent=2))
 PYEOF
   chmod 600 "$MIERU_CLIENT_CONFIG"
-  log "mieru-client config written → $MIERU_CLIENT_CONFIG ✓"
+  log "mieru-client config written → $MIERU_CLIENT_CONFIG (mtu=$EXIT_MTU, mux=$EXIT_MUX) ✓"
 }
 
 # ── Write mieru.service (Type=forking + mieru start; restart redsocks after) ──
@@ -190,7 +222,9 @@ ExecStop=${MIERU_CLIENT_BIN} stop
 # Reload the client config on (re)start so panel changes take effect.
 ExecStartPre=${MIERU_CLIENT_BIN} apply config ${MIERU_CLIENT_CONFIG}
 # Keep redsocks bound to mieru lifecycle — else traffic stops after a restart.
-ExecStartPost=/bin/systemctl restart redsocks
+# Bug 94: '-' makes a non-zero exit non-fatal; '--no-block' returns immediately so
+# this ExecStartPost can never time out / deadlock against redsocks' ordering.
+ExecStartPost=-/bin/systemctl --no-block restart redsocks
 Restart=on-failure
 RestartSec=5s
 
@@ -304,12 +338,21 @@ remove_watchdog() {
 }
 
 # ── redsocks ↔ mieru systemd binding (drop-in) ────────────────────────────────
+# Bug 94 (deadlock): the old drop-in had  Requires=mieru.service  while
+# mieru.service has  ExecStartPost=systemctl restart redsocks. That is a circular
+# start dependency: starting mieru triggers a redsocks (re)start, but redsocks
+# Requires mieru to be fully up first → start-post timeout → both units flap in a
+# restart loop and the relay never stabilises (client handshake never completes).
+# Fix: keep only the soft ordering (After= + Wants=, NOT Requires=) so redsocks
+# prefers to start after mieru but does not hard-block on it. The mieru
+# ExecStartPost is also made non-blocking (see write_mieru_service).
 write_redsocks_dropin() {
   mkdir -p /etc/systemd/system/redsocks.service.d
   cat > /etc/systemd/system/redsocks.service.d/cascade.conf <<DROPEOF
 [Unit]
+# Soft dependency only — order without a hard Requires (Bug 94: no restart loop).
 After=mieru.service
-Requires=mieru.service
+Wants=mieru.service
 
 [Service]
 Restart=on-failure
@@ -337,6 +380,13 @@ do_setup() {
   [[ -z "$exit_ip" ]] && die "could not resolve exit host '$EXIT_HOST' to an IPv4 address"
   log "exit host $EXIT_HOST → $exit_ip"
 
+  # Bug 95: the mieru key is derived from username+password+system time, so the
+  # entry and exit clocks must agree. Ensure NTP is on (best-effort, non-fatal).
+  timedatectl set-ntp true 2>/dev/null || true
+  if [[ "$(timedatectl show -p NTPSynchronized --value 2>/dev/null)" != "yes" ]]; then
+    log "⚠ NTP not yet synced on this (entry) node — make sure the EXIT node is also NTP-synced, else the handshake will fail (NewSessionDecrypted stays 0)."
+  fi
+
   ensure_packages
   write_mieru_client_config
   write_mieru_service
@@ -348,9 +398,14 @@ do_setup() {
   systemctl enable redsocks 2>/dev/null || true
   systemctl enable mieru    2>/dev/null || true
 
-  # Apply client config + start the relay.
-  "$MIERU_CLIENT_BIN" apply config "$MIERU_CLIENT_CONFIG" 2>/dev/null || \
-    log "mieru apply returned non-zero — service start will retry"
+  # Apply client config + start the relay. Bug 95: do NOT swallow apply errors —
+  # an invalid field (or unknown field) is exactly what we need to see here.
+  local apply_out
+  if ! apply_out=$("$MIERU_CLIENT_BIN" apply config "$MIERU_CLIENT_CONFIG" 2>&1); then
+    err "mieru apply config rejected the client config:"
+    echo "$apply_out" | sed 's/\(password[^ ]*\)/***/Ig' >&2
+    die "fix the client config and retry (see error above)"
+  fi
   systemctl restart mieru   || die "mieru client failed to start (journalctl -u mieru)"
   sleep 2
   systemctl restart redsocks || die "redsocks failed to start (journalctl -u redsocks)"
@@ -412,6 +467,46 @@ do_status() {
   local egress_ip
   egress_ip=$(curl -s --socks5 127.0.0.1:${SOCKS5_PORT} --max-time 8 https://api.ipify.org 2>/dev/null || echo "")
   echo "  egress IP (socks5):${egress_ip:+ $egress_ip}${egress_ip:-' (unreachable)'}"
+
+  # ── Bug 95: handshake-level diagnostics ─────────────────────────────────────
+  # The mieru key = f(username, password, system clock). If the client can reach
+  # the exit (TCP open) but the egress IP is empty, the handshake failed — almost
+  # always a username/password mismatch or a client↔exit clock skew. Surface the
+  # signals that actually explain it.
+  echo "  ── handshake checks ──"
+  # 1) mieru client connection test (talks the real protocol to the exit).
+  if [[ -x "$MIERU_CLIENT_BIN" ]]; then
+    local test_out
+    test_out=$("$MIERU_CLIENT_BIN" test https://api.ipify.org 2>&1 | tail -3 || true)
+    echo "  mieru test:        ${test_out:-'(no output)'}" | sed 's/\(password[^ ]*\)/***/Ig'
+  fi
+  # 2) profile sanity from the generated client config (no secrets printed).
+  if [[ -f "$MIERU_CLIENT_CONFIG" ]] && command -v python3 &>/dev/null; then
+    python3 - "$MIERU_CLIENT_CONFIG" <<'PYEOF' 2>/dev/null || true
+import json, sys
+try:
+    c = json.load(open(sys.argv[1]))
+    p = (c.get("profiles") or [{}])[0]
+    u = (p.get("user") or {}).get("name", "")
+    srv = (p.get("servers") or [{}])[0]
+    nports = len(srv.get("portBindings") or [])
+    print("  client profile:    user=%s host=%s ports=%d mtu=%s mux=%s"
+          % (u or "(empty!)", srv.get("ipAddress", "(empty!)"), nports,
+             p.get("mtu", "(default)"),
+             (p.get("multiplexing") or {}).get("level", "(default)")))
+except Exception as e:
+    print("  client profile:    (parse error: %s)" % e)
+PYEOF
+  fi
+  # 3) clock sync — a >~1s skew between entry and exit breaks key derivation.
+  local nowutc synced
+  nowutc=$(date -u '+%Y-%m-%d %H:%M:%S UTC')
+  synced=$(timedatectl show -p NTPSynchronized --value 2>/dev/null || echo "unknown")
+  echo "  entry clock (UTC): $nowutc  (NTP synced: $synced)"
+  if [[ "$synced" != "yes" ]]; then
+    echo "  ⚠ NTP not synced — key derivation depends on the system clock;"
+    echo "    enable it:  timedatectl set-ntp true   (entry AND exit must match)"
+  fi
   echo "─────────────────────────────────────────────────────"
   # Exit non-zero if requested-enabled but relay is down (useful for callers).
   if [[ "${enabled:-0}" == "1" ]]; then
