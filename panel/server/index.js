@@ -77,7 +77,7 @@ try {
     // Cascade (relay): Naive uses Caddyfile upstream; Mieru uses Variant B
     // (redsocks+iptables+mieru-client) orchestrated by scripts/cascade_mieru.sh.
     cascadeEnabled: false, cascadeNaiveUpstream: '',
-    cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '' },
+    cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
     language: 'ru', version: '1.2.6'
   };
@@ -629,7 +629,11 @@ function runCascadeMieru(action, opts = {}) {
         '--exit-port-start', String(opts.portStart || ''),
         '--exit-port-end',   String(opts.portEnd || ''),
         '--exit-user',       String(opts.user || ''),
-        '--exit-pass',       String(opts.pass || '')
+        '--exit-pass',       String(opts.pass || ''),
+        // Bug 95: mtu MUST match the exit (mita) mtu. Operators normally keep the
+        // panel default (1400) on both nodes; allow an override via cascadeMieru.mtu.
+        '--exit-mtu',        String(opts.mtu || cfg.mtu || 1400),
+        '--exit-mux',        String(opts.mux || 'MULTIPLEXING_LOW')
       );
     }
     const out = execFileSync('bash', args, { timeout: 120000 }).toString();
@@ -1217,6 +1221,7 @@ app.get('/api/settings/cascade', requireAuth, (req, res) => {
       portStart: m.portStart || 2012,
       portEnd:   m.portEnd   || 2022,
       user:      m.user || '',
+      mtu:       m.mtu || 1400,
       // never return the stored exit password; UI shows a placeholder
       hasPass:   !!m.pass
     }
@@ -1258,7 +1263,12 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
       user:      String(m.user ?? prev.user ?? '').trim(),
       pass:      (m.pass !== undefined && String(m.pass).length > 0)
                    ? String(m.pass)
-                   : (prev.pass || '')
+                   : (prev.pass || ''),
+      // Bug 95: mtu must match the exit (mita). Default 1400, clamp 1280-1400.
+      mtu:       (() => {
+                   const v = parseInt(m.mtu ?? prev.mtu ?? cfg.mtu ?? 1400, 10) || 1400;
+                   return (v < 1280 || v > 1400) ? 1400 : v;
+                 })()
     };
   }
   saveConfig();
@@ -1280,7 +1290,7 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
     if (hasMieruExit) {
       const r = runCascadeMieru('setup', {
         host: m.host, portStart: m.portStart, portEnd: m.portEnd,
-        user: m.user, pass: m.pass
+        user: m.user, pass: m.pass, mtu: m.mtu
       });
       cascadeOk = r.ok; cascadeOut = r.output;
     } else {

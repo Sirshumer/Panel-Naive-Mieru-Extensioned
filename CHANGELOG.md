@@ -7,7 +7,75 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [v1.2.6] — 2026-06-01
+## [v1.2.6] — 2026-06-02
+
+### Bug 94 (`cascade_mieru.sh`) — systemd restart-loop deadlock (mieru ↔ redsocks)
+
+`redsocks.service.d/cascade.conf` had `Requires=mieru.service` while
+`mieru.service` had `ExecStartPost=systemctl restart redsocks`. That is a
+**circular start dependency**: starting mieru triggers a redsocks (re)start, but
+redsocks hard-requires mieru to be fully up → `ExecStartPost` times out and both
+units flap in a restart loop, so the relay never reaches a stable state and the
+client handshake never completes. (Operators worked around it by deleting
+`cascade.conf`.)
+
+Fix:
+- drop-in now uses a **soft** ordering: `After=mieru.service` + `Wants=mieru.service`
+  (no hard `Requires=`).
+- `ExecStartPost=-/bin/systemctl --no-block restart redsocks` — `-` makes a
+  non-zero exit non-fatal and `--no-block` returns immediately, so the post-start
+  hook can never time out or deadlock.
+
+### Bug 95 (`cascade_mieru.sh`, `panel`) — Mieru cascade handshake failed (config parity)
+
+**Symptom (RIXXX, 2-node stand DE entry → FI exit, both 3.33.0):** Mieru *direct*
+works and Naive *cascade* works, but the **Mieru cascade** times out (curl
+EXIT=97). On the exit (mita) `NewSession=0` / `NewSessionDecrypted=0` — bytes
+arrive but no session is recognised. Crucially, a **localhost self-test on the
+exit itself** (mieru-client → 127.0.0.1 → its own mita) *also* failed, which
+rules out network/firewall/routing and pins the fault to the client↔server
+config/handshake.
+
+Diagnosis (checked against the official mieru 3.33 docs):
+- The mieru session key is derived from **username + password + system time**
+  (`docs/server-install.md`: *"The server can decrypt and respond only if the
+  client and server have the same key… the system time of the client and the
+  server must be in sync."*). A username/password mismatch **or** a clock skew →
+  the server can't decrypt → `NewSession`/`NewSessionDecrypted` stay 0 and traffic
+  is silently dropped. This matches the symptom exactly.
+- The cascade client-config generator (`write_mieru_client_config`) carried a
+  **wrong** comment ("client config MUST NOT contain mtu") and omitted `mtu` and
+  `multiplexing`. Per `docs/client-install.md`, `mtu`, `multiplexing` and
+  `handshakeMode` are valid fields that live **inside each `profile`**, and `mtu`
+  *"must be the same as proxy server"* (default 1400, valid 1280–1400).
+- Two of RIXXX's three hypotheses were **refuted by the docs** (recorded so we
+  don't chase them again):
+  - **Traffic pattern need NOT match.** `docs/traffic-pattern.md`: *"Traffic
+    patterns can be configured independently on the client and server. The client
+    and server do not need to use the same traffic pattern settings."* The
+    `NONCE_TYPE_PRINTABLE_SUBSET 12/12` the exit reported is just the server's
+    *implicit* pattern; the client does not need to replicate it. (So we do **not**
+    inject a traffic pattern into the client config.)
+  - **MTU is a UDP-only payload bound** (`docs/server-install.md` point 5); the
+    cascade is TCP-only, and both ends already defaulted to 1400 — so MTU alone
+    was not the breaker. We still emit `mtu` explicitly for guaranteed parity.
+  - **Password/hash:** `mita reload` *does* pick up `users`/password changes
+    (one of the two reload-safe fields), so a hash that "didn't change" just means
+    the password was already correct — not a bug.
+
+Fix (make the cascade correct + diagnosable out of the box):
+- `write_mieru_client_config` now emits `mtu`, `multiplexing.level` and
+  `handshakeMode` **inside the profile** (schema-correct), with `mtu` matching the
+  exit (new `--exit-mtu`, panel passes `cascadeMieru.mtu` / `cfg.mtu`, clamped
+  1280–1400) and `multiplexing` defaulting to `MULTIPLEXING_LOW` (`--exit-mux`).
+- `do_setup` enables NTP (`timedatectl set-ntp true`) and warns if the entry clock
+  isn't synced; it no longer swallows `mieru apply config` errors (an invalid/
+  unknown field is now printed, passwords redacted).
+- `do_status` gained **handshake diagnostics**: `mieru test`, a client-profile
+  sanity line (user/host/ports/mtu/mux, no secrets), and an entry-clock / NTP
+  check with remediation hint.
+- Panel: `cascadeMieru.mtu` added to the config schema, the `GET`/`POST`
+  `/api/settings/cascade` payloads, and the `runCascadeMieru('setup')` argv.
 
 ### Bug 88 (`install.sh`) — install aborted with `line 665: port: No such file or directory`
 
