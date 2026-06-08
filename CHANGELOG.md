@@ -7,6 +7,89 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [Unreleased] — Audit 2026-06-08 (Priority 1 bugs + fake-site)
+
+Safe, backwards-compatible fixes. **No DB schema change**, existing keys and
+cascades keep working. Server update commands are at the bottom of this entry.
+
+### Bug 96 (`index.js`) — mita stuck `failed` / "no user found" after first user or manual restart
+
+`applyMitaConfig()` and `restartMieru()` never cleared a lingering systemd
+`failed` state, so after the **first** user (or a manual `systemctl restart
+mita`) the unit could stay `failed`/`auto-restart` and `start`/`restart` became
+a no-op → the proxy stayed down with "no user found". **Fix:**
+- New `resetMitaFailed()` runs `systemctl reset-failed mita` before every
+  (re)start, including the manual `/api/service/mita/{start,restart}` path.
+- New `clearMitaPersistedState()` removes a stale
+  `~/.config/mita/server.conf.pb` on the **cold-start** path only, then
+  re-applies config so mita rebuilds clean state.
+- `applyMitaConfig()` now verifies `systemctl is-active mita` and forces one
+  clean restart if it did not come up.
+
+### Bug 34 (`install.sh`, `update.sh`) — install fails with Non-UTF-8
+
+A POSIX/C or broken inherited locale on clean VMs (e.g. Yandex Cloud) made
+bash/read/jq/python choke on the script's Cyrillic content. **Fix:** pin
+`LANG=C.UTF-8`, `LC_ALL=C.UTF-8`, `LANGUAGE=C.UTF-8`, `PYTHONUTF8=1`,
+`PYTHONIOENCODING=utf-8` at the very top of both scripts, and pass
+`LANG/LC_ALL=C.UTF-8` into the PM2-managed panel process so its own
+spawned helpers stay UTF-8 after a reboot/`pm2 resurrect`.
+
+### Bug 35 + feature — special characters in password break Karing
+
+NaiveProxy clients (Karing/NekoBox) can mishandle URL-encoded special
+characters in the password. **Fix:** a backend safe-password generator
+(`GET /api/password/generate?length=16`) producing `[a-zA-Z0-9]` only
+(unbiased `crypto.randomInt`, default 16, floor 8, cap 64). A **"🎲 Random
+password"** button + **"📋 Copy"** button were added to the key-issuance form
+(auto-reveals + copies to clipboard). An alphanumeric password is byte-identical
+whether parsed from the naive link or from JSON, so it works everywhere with no
+encoding ambiguity. The backend user-creation flow is **unchanged** — admins may
+still type their own password; the generator only suggests a safe one.
+
+### Bug 97 (`index.js`) — Naive user traffic showed 0.0
+
+Traffic was accounted only from `mita get users` (Mieru); NaiveProxy traffic
+was never counted, so naive-only users always showed 0.0. **Fix:** new
+`parseCaddyTraffic()` reads the Caddy JSON access log
+(`/var/log/caddy-naive/access.log`), summing `bytes_read` (upload) +
+`size`/`bytes_written` (download) per `request.user_id` (best-effort, capped at
+a 32 MiB tail). `/api/stats/users` and the 60s snapshot cron now **sum** Mieru +
+Naive figures and expose `naiveMB`/`mieruMB` breakdowns and a combined
+`lastSeen`.
+
+### Bug 98 (`caddyTemplate.js`, `index.js`, `install.sh`, `update.sh`) — fake site `fakeSiteUrl` never applied
+
+`fakeSiteUrl` was collected/stored but ignored — all generators served a static
+`file_server`. **Fix:** when `fakeSiteUrl` is a real absolute http(s) URL (and
+not the `www.example.com` placeholder), the masquerade now uses `reverse_proxy`
+to that site (with `header_up Host` + TLS-SNI for https upstreams). The static
+`file_server` remains the default, so existing installs are unaffected. Applied
+consistently across all four Caddyfile generators.
+
+### Server update commands (for installs already on `c1955dd`)
+
+```bash
+cd /opt/panel-naive-mieru \
+  && sudo git fetch origin \
+  && sudo git checkout main \
+  && sudo git pull origin main \
+  && sudo bash update.sh -y
+# update.sh rebuilds the Caddyfile via the shared template, restarts caddy-naive
+# + mita with reset-failed, and restarts the PM2 panel.
+# If you do NOT use git on the server, re-run the installer (idempotent):
+#   sudo bash install.sh --force
+```
+
+After updating, verify:
+```bash
+systemctl is-active caddy-naive mita        # both: active
+pm2 restart panel-naive-mieru               # pick up new server/index.js
+mita status                                  # RUNNING
+```
+
+---
+
 ## [v1.2.6] — 2026-06-02
 
 ### Bug 94 (`cascade_mieru.sh`) — systemd restart-loop deadlock (mieru ↔ redsocks)

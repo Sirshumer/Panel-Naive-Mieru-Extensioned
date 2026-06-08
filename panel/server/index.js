@@ -309,6 +309,8 @@ function buildCaddyfile(config, users) {
       domain:      config.domain      || 'localhost',
       naivePort:   config.naivePort   || 443,
       fakeSiteDir: resolvedFakeSiteDir,
+      // Bug 98: pass fakeSiteUrl so the template can reverse_proxy a real site.
+      fakeSiteUrl: config.fakeSiteUrl || '',
       probeSecret,
       probeMode,
       logFile:     LOG_CADDY,
@@ -348,6 +350,22 @@ function buildCaddyfile(config, users) {
   // Bug 92: normalize the upstream so forward_proxy gets a clean https:// URL.
   const upstreamUrl = (config.cascadeEnabled && config.cascadeNaiveUpstream) ? normalizeUpstream(config.cascadeNaiveUpstream) : '';
   const upstreamLine = upstreamUrl ? `\n    upstream ${upstreamUrl}` : '';
+
+  // Bug 98: masquerade — file_server (default) or reverse_proxy (real site).
+  let masqueradeBlock;
+  {
+    const fu = String(config.fakeSiteUrl || '').trim();
+    const isPlaceholder = /^https?:\/\/(www\.)?example\.com\/?$/i.test(fu);
+    const m = (!isPlaceholder && fu) ? fu.match(/^(https?):\/\/([^\/\s]+)/i) : null;
+    if (m) {
+      const scheme = m[1].toLowerCase(), host = m[2];
+      masqueradeBlock = scheme === 'https'
+        ? `  reverse_proxy https://${host} {\n    header_up Host ${host}\n    transport http {\n      tls\n      tls_server_name ${host}\n    }\n  }`
+        : `  reverse_proxy http://${host} {\n    header_up Host ${host}\n  }`;
+    } else {
+      masqueradeBlock = `  file_server {\n    root ${resolvedFakeSiteDir}\n  }`;
+    }
+  }
 
   // Bug 28: no "tls <email>" inside site block
   // Bug 30: order directive in global block
@@ -389,9 +407,7 @@ ${authLines}
     hide_via${probeLine}${upstreamLine}
   }
 
-  file_server {
-    root ${resolvedFakeSiteDir}
-  }
+${masqueradeBlock}
 }
 `;
 }
@@ -575,9 +591,39 @@ function buildMitaStateFile() {
   return resolvedMitaFile;
 }
 
+// Bug 96: clear systemd "failed" state for mita before any (re)start.
+//   After the FIRST user is added, or after a manual `systemctl restart mita`
+//   that hit Restart=on-failure exhaustion, the unit can be stuck in
+//   `failed` / `auto-restart`. In that state `systemctl start/restart` is a
+//   no-op or refuses to act, leaving the proxy down with "no user found" /
+//   mita=failed. `reset-failed` clears the failure counter so the next
+//   start actually takes effect.
+function resetMitaFailed() {
+  try { execSync('systemctl reset-failed mita 2>/dev/null || true', { timeout: 5000 }); } catch {}
+}
+
+// Bug 96: the mieru server persists its applied state to
+//   ~/.config/mita/server.conf.pb (root's HOME, since mita.service runs as
+//   root). A stale/corrupt server.conf.pb can make a freshly-(re)started mita
+//   come up in a broken "no user found" state even though mita-state.json is
+//   correct. `mita apply config` rebuilds it, so removing the stale copy
+//   before a cold start forces a clean rebuild. We only do this on a COLD
+//   start path (not on a live reload) to avoid disturbing a healthy server.
+function clearMitaPersistedState() {
+  for (const p of ['/root/.config/mita/server.conf.pb',
+                   process.env.HOME ? path.join(process.env.HOME, '.config/mita/server.conf.pb') : null]) {
+    if (!p) continue;
+    try { if (fs.existsSync(p)) fs.unlinkSync(p); } catch {}
+  }
+}
+
 function applyMitaConfig() {
   const file = buildMitaStateFile();
   try {
+    // Bug 96: always clear a lingering failed state first so subsequent
+    //   start/restart commands are honoured by systemd.
+    resetMitaFailed();
+
     execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 15000 });
 
     // Bug 75: a fresh mita install sits in state IDLE (the installer does NOT
@@ -592,10 +638,28 @@ function applyMitaConfig() {
     if (/RUNNING/i.test(status)) {
       execSync('mita reload 2>/dev/null', { timeout: 15000 });
     } else {
-      // IDLE (or unknown): start the service so it binds the configured ports.
-      // Fall back to systemctl restart if `mita start` is unavailable.
-      try { execSync('mita start 2>/dev/null', { timeout: 15000 }); }
-      catch { execSync('systemctl restart mita 2>/dev/null || true', { timeout: 15000 }); }
+      // IDLE / FAILED / unknown: start the service so it binds the configured
+      // ports. Bug 96: clear stale persisted state then re-apply so the cold
+      // start rebuilds server.conf.pb cleanly; reset-failed again right before
+      // the systemctl fallback so it is not blocked by an exhausted restart
+      // counter, and verify is-active afterwards.
+      clearMitaPersistedState();
+      try { execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 15000 }); } catch {}
+      let started = false;
+      try { execSync('mita start 2>/dev/null', { timeout: 15000 }); started = true; }
+      catch { started = false; }
+      if (!started) {
+        resetMitaFailed();
+        try { execSync('systemctl restart mita 2>/dev/null || true', { timeout: 15000 }); } catch {}
+      }
+      // Verify; if still not active, force one clean restart via systemd.
+      let active = '';
+      try { active = execSync('systemctl is-active mita 2>/dev/null', { timeout: 5000 }).toString().trim(); }
+      catch { active = ''; }
+      if (active !== 'active') {
+        resetMitaFailed();
+        try { execSync('systemctl restart mita 2>/dev/null || true', { timeout: 15000 }); } catch {}
+      }
     }
 
     shredFile(file + '.last');
@@ -606,9 +670,17 @@ function applyMitaConfig() {
 function restartMieru() {
   try {
     execSync('mita stop 2>/dev/null || true', { timeout: 10000 });
+    // Bug 96: clear failed state + stale persisted config so the cold restart
+    //   below comes up clean instead of getting stuck in "no user found".
+    resetMitaFailed();
+    clearMitaPersistedState();
     const file = buildMitaStateFile();
     execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 10000 });
-    execSync('mita start 2>/dev/null || systemctl start mita 2>/dev/null', { timeout: 15000 });
+    try { execSync('mita start 2>/dev/null', { timeout: 15000 }); }
+    catch {
+      resetMitaFailed();
+      execSync('systemctl restart mita 2>/dev/null || systemctl start mita 2>/dev/null || true', { timeout: 15000 });
+    }
     shredFile(file + '.last');
     return true;
   } catch { return false; }
@@ -889,6 +961,26 @@ const VALID_PROTOCOLS = ['naive', 'mieru'];
 const USERNAME_RE     = /^[a-zA-Z0-9_.-]{1,64}$/;
 const EMAIL_RE        = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
+// Bug 35: generate a password from a SAFE alphabet only ([a-zA-Z0-9]).
+//   Special characters (and Cyrillic) in a password break NaiveProxy clients
+//   such as Karing/NekoBox: the naive link encodes the password with
+//   encodeURIComponent, but some clients do not URL-decode it back before
+//   handing it to the proxy, so "@ : / # % +" etc. corrupt the credential.
+//   A pure alphanumeric password is byte-identical whether parsed from the
+//   link or from JSON, so it works everywhere with no encoding ambiguity.
+//   Uses crypto.randomInt for unbiased selection.
+const SAFE_PW_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
+function generateSafePassword(len) {
+  let n = parseInt(len, 10);
+  if (isNaN(n) || n < 8)  n = 16;   // sensible default / floor
+  if (n > 64)             n = 64;   // matches USERNAME_RE-style sanity cap
+  let out = '';
+  for (let i = 0; i < n; i++) {
+    out += SAFE_PW_ALPHABET[crypto.randomInt(0, SAFE_PW_ALPHABET.length)];
+  }
+  return out;
+}
+
 /**
  * Bug 8: normalise quota — accept quotaMB or quotaGb (gb * 1024 → MB).
  * Bug 9: validate all user input fields.
@@ -943,6 +1035,16 @@ function parseUserRow(u) {
       : (u.protocols || []),
   };
 }
+
+// ── Password generator (Bug 35) ───────────────────────────────────────────────
+// Returns a fresh safe ([a-zA-Z0-9]) password for the "Random password" button
+// in the key-issuance UI. Default length 16. The backend user-creation flow is
+// untouched — the admin still submits whatever password they choose; this
+// endpoint only suggests a safe one.
+app.get('/api/password/generate', requireAuth, (req, res) => {
+  const length = req.query.length || 16;
+  res.json({ password: generateSafePassword(length) });
+});
 
 // ── Users API ─────────────────────────────────────────────────────────────────
 app.get('/api/users', requireAuth, (req, res) => {
@@ -1534,19 +1636,41 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
   //   Output is a table: User  LastActive  1DayDownload  1DayUpload  30DaysDownload  30DaysUpload
   const raw   = exec_('mita get users 2>/dev/null');
   const live  = parseMitaUsers(raw);
+  // Bug 97: also account NaiveProxy traffic from the Caddy access log so
+  //   naive-only users no longer show 0.0. Mieru + Naive figures are summed.
+  const naive = parseCaddyTraffic(LOG_CADDY);
   const users = getAllUsers().map(u => {
     const s = live.find(x => x.username === u.username) || {};
+    const n = naive[u.username] || {};
+    const mieruUp   = s.uploadMB   || 0;
+    const mieruDown = s.downloadMB || 0;
+    const naiveUp   = n.uploadMB   || 0;
+    const naiveDown = n.downloadMB || 0;
+    const uploadMB   = mieruUp   + naiveUp;
+    const downloadMB = mieruDown + naiveDown;
+    // Combined used: prefer live mita "usedMB" when present, plus naive bytes;
+    //   fall back to the stored cumulative value when neither source reports.
+    const liveUsed = (s.usedMB != null ? s.usedMB : 0) + (n.usedMB || 0);
+    const usedMB   = (s.usedMB != null || n.usedMB != null)
+      ? liveUsed
+      : (u.usedMB || 0);
+    // Most recent activity across both protocols.
+    const seenCandidates = [s.lastSeen, n.lastSeen, u.lastSeen].filter(Boolean);
+    const lastSeen = seenCandidates.length
+      ? seenCandidates.sort().slice(-1)[0]
+      : null;
     return {
       username:   u.username,
       email:      u.email,
       expiry:     u.expiry,
       protocols:  JSON.parse(u.protocols || '[]'),
       quotaMB:    u.quotaMB,
-      usedMB:     (s.usedMB != null ? s.usedMB : (u.usedMB || 0)),
-      uploadMB:   s.uploadMB   || 0,
-      downloadMB: s.downloadMB || 0,
-      // Prefer the live LastActive reported by mita; fall back to stored value.
-      lastSeen:   s.lastSeen || u.lastSeen
+      usedMB,
+      uploadMB,
+      downloadMB,
+      naiveMB:    naiveUp + naiveDown,
+      mieruMB:    mieruUp + mieruDown,
+      lastSeen
     };
   });
   res.json(users);
@@ -1601,6 +1725,75 @@ function toMB(v, unit) {
     case 'TB': case 'TIB':   return v * 1048576;
     default:                 return v; // MB / MiB
   }
+}
+
+// ── Bug 97: Naive (Caddy) per-user traffic accounting ────────────────────────
+// Mieru traffic comes from `mita get users`, but NaiveProxy traffic was never
+// accounted, so naive-only users always showed 0.0. caddy-forwardproxy-naive
+// writes a JSON access log (the global `log { format json }` block). Each
+// handled CONNECT request carries the authenticated basic_auth username under
+// request.user_id and byte counters (bytes_read = client→server upload,
+// size/bytes_written = server→client download). We sum per user over the
+// current (un-rolled) log file. This is a best-effort "since last log roll"
+// figure — the same character as mita's 30-day window — and is additive with
+// the Mieru figure for users that have both protocols.
+//
+// Returns: { username: { uploadMB, downloadMB, usedMB, lastSeen } }
+function parseCaddyTraffic(logPath) {
+  const out = {};
+  const file = logPath || LOG_CADDY;
+  let raw;
+  try {
+    if (!fs.existsSync(file)) return out;
+    // Cap how much we read so a large log never blocks the event loop /
+    // exhausts memory. 32 MiB tail is plenty for a 50mb-rolled file.
+    const stat = fs.statSync(file);
+    const MAX = 32 * 1024 * 1024;
+    if (stat.size > MAX) {
+      const fd = fs.openSync(file, 'r');
+      const buf = Buffer.alloc(MAX);
+      fs.readSync(fd, buf, 0, MAX, stat.size - MAX);
+      fs.closeSync(fd);
+      raw = buf.toString('utf8');
+      // Drop the first (likely partial) line.
+      const nl = raw.indexOf('\n');
+      if (nl >= 0) raw = raw.slice(nl + 1);
+    } else {
+      raw = fs.readFileSync(file, 'utf8');
+    }
+  } catch { return out; }
+
+  for (const line of raw.split('\n')) {
+    const s = line.trim();
+    if (!s || s[0] !== '{') continue;
+    let e;
+    try { e = JSON.parse(s); } catch { continue; }
+    const req = e.request || {};
+    // user_id is the basic_auth username for authenticated forward_proxy reqs.
+    const user = req.user_id || e.user_id || '';
+    if (!user) continue;
+    const up   = Number(e.bytes_read)    || 0;                     // client → server
+    const down = Number(e.size != null ? e.size : e.bytes_written) || 0; // server → client
+    const ts   = e.ts;
+    if (!out[user]) out[user] = { uploadB: 0, downloadB: 0, lastTs: 0 };
+    out[user].uploadB   += up;
+    out[user].downloadB += down;
+    if (typeof ts === 'number' && ts > out[user].lastTs) out[user].lastTs = ts;
+  }
+
+  const result = {};
+  for (const [user, v] of Object.entries(out)) {
+    const uploadMB   = v.uploadB   / 1048576;
+    const downloadMB = v.downloadB / 1048576;
+    result[user] = {
+      uploadMB,
+      downloadMB,
+      usedMB:   uploadMB + downloadMB,
+      // Caddy ts is float seconds since epoch.
+      lastSeen: v.lastTs ? new Date(v.lastTs * 1000).toISOString() : null
+    };
+  }
+  return result;
 }
 
 // ── Logs API ──────────────────────────────────────────────────────────────────
@@ -1685,6 +1878,12 @@ app.post('/api/service/:name/:action', requireAuth, (req, res) => {
   if (!['start','stop','restart','reload'].includes(action))
     return res.status(400).json({ error: 'Unknown action' });
   try {
+    // Bug 96: before a manual start/restart, clear any lingering systemd
+    //   "failed" state so the command is actually honoured (otherwise the
+    //   unit can stay failed → "no user found" / mita=failed).
+    if (['start','restart'].includes(action)) {
+      try { execSync(`systemctl reset-failed ${svcName} 2>/dev/null || true`, { timeout: 5000 }); } catch {}
+    }
     execSync(`systemctl ${action} ${svcName} 2>&1`, { timeout: 15000 });
     res.json({ ok: true, service: svcName, action });
   } catch (e) { res.status(500).json({ error: e.stdout?.toString() || e.message }); }
@@ -1744,14 +1943,39 @@ cron.schedule('* * * * *', () => {
   try {
     // Bug 78: use `mita get users` (the real command); `mita describe users`
     //   does not exist and always produced empty output.
-    const raw  = execSync('mita get users 2>/dev/null', { timeout: 5000 }).toString();
+    let raw = '';
+    try { raw = execSync('mita get users 2>/dev/null', { timeout: 5000 }).toString(); } catch {}
     const live = parseMitaUsers(raw);
-    if (!live.length) return;
+    // Bug 97: also fold in NaiveProxy traffic from the Caddy access log so
+    //   naive-only users are persisted with non-zero usage.
+    const naive = parseCaddyTraffic(LOG_CADDY);
+
+    // Build a combined per-username map.
+    const combined = {};
+    live.forEach(s => {
+      combined[s.username] = {
+        uploadMB:   s.uploadMB   || 0,
+        downloadMB: s.downloadMB || 0,
+        usedMB:     s.usedMB     || 0,
+        lastSeen:   s.lastSeen   || null
+      };
+    });
+    for (const [user, n] of Object.entries(naive)) {
+      const c = combined[user] || { uploadMB: 0, downloadMB: 0, usedMB: 0, lastSeen: null };
+      c.uploadMB   += n.uploadMB   || 0;
+      c.downloadMB += n.downloadMB || 0;
+      c.usedMB     += n.usedMB     || 0;
+      if (n.lastSeen && (!c.lastSeen || n.lastSeen > c.lastSeen)) c.lastSeen = n.lastSeen;
+      combined[user] = c;
+    }
+
+    const entries = Object.entries(combined);
+    if (!entries.length) return;
     const ts   = new Date().toISOString();
     const ins  = db.prepare('INSERT INTO traffic_snapshots (username,uploadMB,downloadMB,ts) VALUES (?,?,?,?)');
-    live.forEach(s => ins.run(s.username, s.uploadMB, s.downloadMB, ts));
-    live.forEach(s => {
-      const u = getUserByUsername(s.username);
+    entries.forEach(([username, s]) => ins.run(username, s.uploadMB, s.downloadMB, ts));
+    entries.forEach(([username, s]) => {
+      const u = getUserByUsername(username);
       if (u) upsertUser({ ...u, usedMB: s.usedMB, lastSeen: s.lastSeen || ts, updatedAt: ts });
     });
   } catch {}

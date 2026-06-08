@@ -652,6 +652,7 @@ select option { background: var(--bg-card); color: var(--text); }
 
 .input-pw-wrap { position: relative; }
 .input-pw-wrap input { padding-right: 38px; }
+.pw-actions { display: flex; gap: 8px; margin-top: 6px; flex-wrap: wrap; }
 .btn-eye {
   position: absolute; right: 8px; top: 50%; transform: translateY(-50%);
   color: var(--text-muted); padding: 2px;

@@ -1,7 +1,6 @@
 {
   "lang": "ru",
   "langName": "Русский",
-
   "login": {
     "title": "RIXXX Панель",
     "sessionExpired": "Сессия истекла — войдите снова",
@@ -16,7 +15,6 @@
     "telegramSupport": "Поддержка Telegram",
     "github": "GitHub"
   },
-
   "nav": {
     "dashboard": "Дашборд",
     "users": "Пользователи",
@@ -26,11 +24,9 @@
     "diagnostics": "Диагностика",
     "administrator": "Администратор"
   },
-
   "topbar": {
     "realtime": "Соединение реального времени"
   },
-
   "dashboard": {
     "title": "Дашборд",
     "naiveProxy": "NaiveProxy",
@@ -59,7 +55,6 @@
     "active": "Активен",
     "inactive": "Неактивен"
   },
-
   "users": {
     "title": "Пользователи",
     "addUser": "Добавить пользователя",
@@ -103,9 +98,13 @@
     "usernameRequired": "Имя пользователя и email обязательны",
     "passwordRequired": "Пароль обязателен для нового пользователя",
     "passwordTooShort": "Пароль должен содержать минимум 8 символов",
-    "protocolRequired": "Выберите хотя бы один протокол"
+    "protocolRequired": "Выберите хотя бы один протокол",
+    "genPassword": "🎲 Случайный пароль",
+    "copyPassword": "📋 Копировать",
+    "passwordGenerated": "Случайный пароль сгенерирован и скопирован",
+    "passwordCopied": "Пароль скопирован",
+    "passwordEmpty": "Поле пароля пустое"
   },
-
   "config": {
     "downloadTitle": "Скачать клиентский конфиг",
     "downloadNote": "Пароль пользователя подставляется автоматически. Скопируйте ссылку или скачайте файл конфига.",
@@ -126,7 +125,6 @@
     "qrCode": "QR-код",
     "qrNote": "Отсканируйте QR-код клиентом (iOS: ShadowRocket, Karing)"
   },
-
   "settings": {
     "title": "Настройки сервера",
     "probeSecretTitle": "Секрет защиты от зондирования",
@@ -211,7 +209,6 @@
     "cascadeMieruUserRequired": "Укажите Mieru exit username",
     "cascadeMieruPassRequired": "Укажите Mieru exit password"
   },
-
   "monitoring": {
     "title": "Мониторинг",
     "refresh": "Обновить",
@@ -234,7 +231,6 @@
     "active": "Активен",
     "inactive": "Неактивен"
   },
-
   "logs": {
     "title": "Логи",
     "caddy": "Naive",
@@ -250,7 +246,6 @@
     "selectLog": "Выберите лог выше…",
     "error": "Ошибка: {{msg}}"
   },
-
   "diagnostics": {
     "title": "Диагностика",
     "runChecks": "Запустить проверку",
@@ -270,12 +265,10 @@
     "naivePort": "Порт NaiveProxy {{port}}",
     "mieruPort": "Порт Mieru {{port}}"
   },
-
   "service": {
     "actionOk": "{{service}}: {{action}} — OK",
     "actionFail": "{{service}} {{action}} ошибка: {{msg}}"
   },
-
   "toast": {
     "naivePortUpdated": "Порт NaiveProxy обновлён — клиентам нужны новые конфиги",
     "mieruPortsUpdated": "Порты Mieru обновлены — сервис перезапущен, клиентам нужны новые конфиги",
@@ -284,7 +277,6 @@
     "error": "Ошибка",
     "info": "Информация"
   },
-
   "theme": {
     "dark": "Тёмная тема",
     "light": "Светлая тема"
