@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.2.6
+ * Panel Naive + Mieru — Frontend Application v1.3.2
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  * v1.2.5: probe-secret setting, disabled-button+spinner on all submit handlers,
@@ -307,10 +307,29 @@ function enterApp() {
   document.getElementById('sidebar-uname').textContent = uname;
   document.getElementById('sidebar-avatar').textContent = uname[0].toUpperCase();
 
+  // Bug A (v1.3.2): pull the real version once on login and write it to all
+  // three displays (sidebar / topbar / settings), so it's correct even if the
+  // user never opens the dashboard tab.
+  syncVersionDisplay();
+
   loadConfig().then(() => {
     navigateTo('dashboard');
     connectWebSocket();
   });
+}
+
+// Bug A (v1.3.2): single helper that fetches the panel version and updates all
+// three places where it is shown (sidebar label, topbar badge, settings about).
+// Falls back silently on error (keeps the hardcoded default in index.html).
+async function syncVersionDisplay() {
+  try {
+    const status = await api('GET', '/api/status');
+    const verStr = `v${status?.panel?.version || '1.2.4'}`;
+    ['about-version', 'sidebar-version', 'topbar-version'].forEach(id => {
+      const el = document.getElementById(id);
+      if (el) el.textContent = verStr;
+    });
+  } catch (_) { /* keep hardcoded fallback shown in index.html */ }
 }
 
 async function logout() {
@@ -377,7 +396,14 @@ function toggleSidebar() {
 async function loadConfig() {
   try {
     state.config = await api('GET', '/api/config');
-    document.getElementById('topbar-version').textContent = `v${state.config.version || '1.2.4'}`;
+    // Bug A (v1.3.2): update all three version displays, not just the topbar.
+    {
+      const verStr = `v${state.config.version || '1.2.4'}`;
+      ['about-version', 'sidebar-version', 'topbar-version'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = verStr;
+      });
+    }
   } catch {}
 }
 
@@ -423,7 +449,14 @@ async function loadDashboard() {
       [t('dashboard.mieruVersion'), status.services.mieru.version || '—'],
     ]);
 
-    document.getElementById('about-version').textContent = `v${status.panel.version || '1.2.4'}`;
+    // Bug A (v1.3.2): keep all three version displays in sync from the dashboard.
+    {
+      const verStr = `v${status.panel.version || '1.2.4'}`;
+      ['about-version', 'sidebar-version', 'topbar-version'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = verStr;
+      });
+    }
   } catch (err) {
     console.error('Dashboard error:', err);
   }
@@ -768,7 +801,14 @@ async function loadSettings() {
         ? '••••••• (set — leave blank to keep)'
         : (cascadeMieruPassEl.placeholder || 'password');
     }
-    document.getElementById('about-version').textContent = `v${cfg.version || '1.2.4'}`;
+    // Bug A (v1.3.2): keep all three version displays in sync.
+    {
+      const verStr = `v${cfg.version || '1.2.4'}`;
+      ['about-version', 'sidebar-version', 'topbar-version'].forEach(id => {
+        const el = document.getElementById(id);
+        if (el) el.textContent = verStr;
+      });
+    }
   } catch {}
 }
 
