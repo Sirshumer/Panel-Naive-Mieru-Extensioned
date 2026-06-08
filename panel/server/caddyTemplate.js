@@ -68,11 +68,33 @@ function normalizeUpstream(raw) {
  *   password (caddy-forwardproxy-naive hashes it internally).
  * @returns {string}  Full Caddyfile content ready to write.
  */
+// ── normalizeFakeUpstream() — Bug 98 ─────────────────────────────────────────
+// The masquerade site can be served two ways:
+//   • file_server  — static files from fakeSiteDir (default, always safe)
+//   • reverse_proxy — proxy a real website (fakeSiteUrl) so the camouflage is
+//     a live page instead of a single static file.
+// We only switch to reverse_proxy when fakeSiteUrl is a real, absolute http(s)
+// URL that is NOT the historical placeholder default ("https://www.example.com").
+// Returns { host, scheme, useProxy } or { useProxy:false }.
+function parseFakeUpstream(rawUrl) {
+  const s = String(rawUrl || '').trim();
+  if (!s) return { useProxy: false };
+  // Ignore the placeholder default so existing installs keep file_server.
+  if (/^https?:\/\/(www\.)?example\.com\/?$/i.test(s)) return { useProxy: false };
+  let m = s.match(/^(https?):\/\/([^\/\s]+)/i);
+  if (!m) return { useProxy: false };
+  const scheme = m[1].toLowerCase();
+  const host   = m[2];                 // host[:port]
+  if (!host) return { useProxy: false };
+  return { useProxy: true, scheme, host };
+}
+
 function render(cfg, naiveUsers) {
   const email      = (cfg.adminEmail  || '').trim();
   const domain     = (cfg.domain      || 'localhost').trim();
   const port       = cfg.naivePort   || 443;
   const fakeSite   = (cfg.fakeSiteDir || '/var/www/fake-site').trim();
+  const fakeSiteUrl = (cfg.fakeSiteUrl || '').trim();
   const probeSecret = (cfg.probeSecret || '').trim();
   const logFile    = (cfg.logFile     || '/var/log/caddy-naive/access.log').trim();
 
@@ -125,6 +147,36 @@ function render(cfg, naiveUsers) {
     ? `\n    upstream ${upstreamUrl}`
     : '';
 
+  // ── Bug 98: masquerade handler — file_server OR reverse_proxy ─────────────
+  // When fakeSiteUrl points at a real site we reverse_proxy to it so the cover
+  // page is a live website. Otherwise we serve the local static fake-site.
+  // For HTTPS upstreams we rewrite the Host header to the upstream host and
+  // enable TLS-SNI so the upstream serves the right vhost/cert.
+  const fake = parseFakeUpstream(fakeSiteUrl);
+  let masqueradeBlock;
+  if (fake.useProxy) {
+    if (fake.scheme === 'https') {
+      masqueradeBlock =
+`  reverse_proxy https://${fake.host} {
+    header_up Host ${fake.host}
+    transport http {
+      tls
+      tls_server_name ${fake.host}
+    }
+  }`;
+    } else {
+      masqueradeBlock =
+`  reverse_proxy http://${fake.host} {
+    header_up Host ${fake.host}
+  }`;
+    }
+  } else {
+    masqueradeBlock =
+`  file_server {
+    root ${fakeSite}
+  }`;
+  }
+
   // ── Bug 28: no redundant  tls <email>  inside the site block  ────────────
   // Caddy's automatic HTTPS handles TLS for domains that resolve to this
   // server's IP.  The global  email  directive supplies the ACME account.
@@ -172,9 +224,7 @@ ${authLines}
     hide_via${probeLine}${upstreamLine}
   }
 
-  file_server {
-    root ${fakeSite}
-  }
+${masqueradeBlock}
 }
 `;
 }

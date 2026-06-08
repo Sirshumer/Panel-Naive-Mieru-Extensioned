@@ -216,6 +216,8 @@ function handleDelegatedClick(e) {
     case 'open-add-user':    openAddUser(); break;
     case 'close-user-modal': closeUserModal(); break;
     case 'save-user':        saveUser(); break;
+    case 'gen-password':     generatePassword(); break;
+    case 'copy-password':    copyPasswordField(); break;
     case 'edit-user':        openEditUser(btn.dataset.id); break;
     case 'delete-user':      deleteUser(btn.dataset.id, btn.dataset.username); break;
     case 'open-config':      openConfigDownload(btn.dataset.id); break;
@@ -1362,6 +1364,32 @@ function togglePw(inputId) {
   const input = document.getElementById(inputId);
   if (!input) return;
   input.type = input.type === 'password' ? 'text' : 'password';
+}
+
+// Bug 35 / feature: fetch a safe random password and fill the user form field.
+async function generatePassword() {
+  const input = document.getElementById('u-password');
+  if (!input) return;
+  try {
+    const data = await api('GET', '/api/password/generate?length=16');
+    if (data && data.password) {
+      input.value = data.password;
+      input.type = 'text';            // reveal so the admin can see/copy it
+      copyToClipboard(data.password); // also place it on the clipboard
+      toast(t('users.passwordGenerated') || 'Random password generated & copied', 'success');
+    }
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+// Copy the current value of the user-password field to the clipboard.
+function copyPasswordField() {
+  const input = document.getElementById('u-password');
+  if (!input || !input.value) {
+    toast(t('users.passwordEmpty') || 'Password field is empty', 'error');
+    return;
+  }
+  copyToClipboard(input.value);
+  toast(t('users.passwordCopied') || 'Password copied', 'success');
 }
 
 function copyToClipboard(text) {

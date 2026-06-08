@@ -16,6 +16,15 @@
 # ==============================================================================
 set -euo pipefail
 
+# ── Bug 34: force a UTF-8 locale (same rationale as install.sh) ──────────────
+# A POSIX/C or broken inherited locale on a clean VM makes bash/read/jq/python
+# fail on the script's Cyrillic content with "Non-UTF-8" errors. Pin C.UTF-8.
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export LANGUAGE=C.UTF-8
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
 CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
 
@@ -341,6 +350,7 @@ if (fs.existsSync(TEMPLATE_JS)) {
     domain:      cfg.domain      || 'localhost',
     naivePort:   cfg.naivePort   || 443,
     fakeSiteDir: cfg.fakeSiteDir || FAKE_SITE,
+    fakeSiteUrl: cfg.fakeSiteUrl || '',
     probeSecret,
     probeMode,
     logFile:     '/var/log/caddy-naive/access.log',

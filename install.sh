@@ -6,6 +6,19 @@
 # ==============================================================================
 set -euo pipefail
 
+# ── Bug 34: force a UTF-8 locale ──────────────────────────────────────────────
+# The installer prints bilingual (Cyrillic) prompts and writes Cyrillic into
+# heredocs (fake-site HTML, etc.). On a clean VM (e.g. Yandex Cloud images) the
+# inherited locale can be POSIX/C or an unset/broken value, which makes bash,
+# read, jq and python choke on multibyte input with "Non-UTF-8" / invalid byte
+# errors. Pin a guaranteed-present UTF-8 locale before anything else runs.
+# C.UTF-8 is built into glibc on all supported Ubuntu/Debian releases.
+export LANG=C.UTF-8
+export LC_ALL=C.UTF-8
+export LANGUAGE=C.UTF-8
+export PYTHONUTF8=1
+export PYTHONIOENCODING=utf-8
+
 # ── Capture all installer output to a log file ────────────────────────────────
 INSTALL_LOG="/var/log/rixxx-panel-install.log"
 mkdir -p "$(dirname "$INSTALL_LOG")"
@@ -595,6 +608,7 @@ write_caddyfile() {
         domain:      '${DOMAIN}',
         naivePort:   ${NAIVE_PORT},
         fakeSiteDir: '${FAKE_SITE_DIR}',
+        fakeSiteUrl: '${FAKE_SITE_URL:-}',
         probeSecret: '${PROBE_SECRET}',
         probeMode:   '${PROBE_MODE:-bare}',
         logFile:     '/var/log/caddy-naive/access.log'
@@ -1117,12 +1131,15 @@ except Exception:
   local panel_host="127.0.0.1"
   [[ "${EXPOSE_PANEL^^}" =~ ^(Y|Д)$ ]] && panel_host="0.0.0.0"
   pm2 delete panel-naive-mieru 2>/dev/null || true
-  PANEL_HOST="$panel_host" PANEL_PORT=3000 \
+  # Bug 34: pass an explicit UTF-8 locale into the PM2-managed node process so
+  #   the panel's own spawned helpers (python3/jq/mita via execSync) never trip
+  #   over Cyrillic with a Non-UTF-8 locale after a reboot/pm2 resurrect.
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 PANEL_HOST="$panel_host" PANEL_PORT=3000 \
     pm2 start server/index.js \
       --name panel-naive-mieru \
       --log /var/log/panel-naive-mieru.log \
       --time 2>/dev/null || \
-  NODE_ENV=production PANEL_HOST="$panel_host" PANEL_PORT=3000 \
+  LANG=C.UTF-8 LC_ALL=C.UTF-8 NODE_ENV=production PANEL_HOST="$panel_host" PANEL_PORT=3000 \
     pm2 start server/index.js --name panel-naive-mieru --time
   pm2 save
   pm2 startup systemd -u root --hp /root 2>/dev/null | tail -1 | bash 2>/dev/null || true
