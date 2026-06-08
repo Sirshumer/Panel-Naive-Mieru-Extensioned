@@ -7,6 +7,41 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.3.2] — Audit 2026-06-08 (post-deploy hotfix #2: version display fully fixed in the UI)
+
+After v1.3.1 the password crash was gone, but the panel **still** showed the old
+version in the header — the sidebar label (left) and the topbar badge (right)
+kept reading `v1.2.6`.
+
+**Root cause:** the version is rendered in **three** places in `index.html`
+(sidebar label, topbar badge, settings → about), but only `#about-version` was
+ever updated from the API. The sidebar label and topbar badge were plain
+hardcoded `v1.2.6` text, so the backend `config.json` sync from v1.3.1 never
+reached them.
+
+**Fixes (frontend):**
+- Gave the sidebar label and topbar badge stable ids (`#sidebar-version`,
+  `#topbar-version`) and bumped their hardcoded defaults to the current version.
+- Added `syncVersionDisplay()` called from `enterApp()` right after login: it
+  fetches `/api/status` once and writes the real version to **all three** spots,
+  so the version is correct even if the user never opens the Dashboard tab.
+- `loadConfig()`, `loadDashboard()` and the settings loader now also update all
+  three (kept in sync).
+
+Combined with the v1.3.1 backend fix (`do_update()` syncs `config.json`'s
+`version`), the displayed version is now correct everywhere after an update.
+
+**No DB schema change**, existing keys and cascades keep working.
+Server update command is at the bottom of this entry.
+
+### Server update (one command)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+---
+
 ## [v1.3.1] — Audit 2026-06-08 (post-deploy hotfix: random password crash + stale version display)
 
 Two regressions surfaced after the first server update to v1.3.0. Both are

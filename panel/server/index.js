@@ -80,7 +80,7 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.3.1'
+    language: 'ru', version: '1.3.2'
   };
 }
 
