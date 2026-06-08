@@ -7,6 +7,57 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.3.1] — Audit 2026-06-08 (post-deploy hotfix: random password crash + stale version display)
+
+Two regressions surfaced after the first server update to v1.3.0. Both are
+fixed here. **No DB schema change**, existing keys and cascades keep working.
+Server update command is at the bottom of this entry.
+
+### Bug 100 — "🎲 Случайный пароль" crashed: `crypto.randomInt is not a function`
+
+Clicking **Random password** in the Add-User form threw on the server:
+
+```
+TypeError: crypto.randomInt is not a function
+    at generateSafePassword (/opt/panel-naive-mieru/server/index.js:979:36)
+```
+
+**Root cause:** `crypto.randomInt()` only exists in Node ≥ v14.10.0. The
+production box runs an older Node, and there was no module-level
+`require('crypto')` — so the bare `crypto` reference resolved to the global
+Web-Crypto object, which has no `randomInt`.
+
+**Fixes:**
+- Added a **module-level `const crypto = require('crypto')`** so the real Node
+  `crypto` is always in scope (and removed the now-redundant local require in
+  `buildCaddyfile`).
+- Rewrote `generateSafePassword()` to use **`crypto.randomBytes()` + rejection
+  sampling** instead of `crypto.randomInt()`. This is unbiased (bytes ≥ 248 are
+  rejected before `% 62`) and works on **every** Node version that ships
+  `crypto` — i.e. all of them. Output is still pure-alphanumeric `[A-Za-z0-9]`,
+  length floored at 8 / defaulted to 16 / capped at 64.
+
+### Bug A — panel kept displaying the old version (e.g. 1.2.6) after an update
+
+After `update.sh` ran, the UI still showed the previous version.
+
+**Root cause:** the panel UI reads its version from **`config.json`**
+(`/api/status` → `panel.version` = `cfg.version`), but `do_update()` only wrote
+`/etc/rixxx-panel/version` (`panel_version=`). `config.json`'s `version` field
+was never touched, so the API kept returning the stale value.
+
+**Fix:** `do_update()` now also syncs `config.json`'s `version` field to
+`TARGET_VERSION` (via `jq`, with a `sed` fallback), preserving the original file
+content/permissions. The displayed version now matches after every update.
+
+### Server update (one command)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+---
+
 ## [v1.3.0] — Audit 2026-06-08 (Priority 1 bugs + fake-site + update/version mechanism)
 
 Safe, backwards-compatible fixes. **No DB schema change**, existing keys and

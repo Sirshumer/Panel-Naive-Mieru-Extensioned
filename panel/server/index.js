@@ -36,6 +36,7 @@ const fs             = require('fs');
 const path           = require('path');
 const { execSync, execFileSync } = require('child_process');
 const si             = require('systeminformation');
+const crypto         = require('crypto');   // Bug 100: module-level require so generateSafePassword() has a real Node crypto (not Web-Crypto globalThis.crypto, which lacks randomInt)
 
 // ── Paths ─────────────────────────────────────────────────────────────────────
 const PANEL_CONFIG    = '/etc/rixxx-panel/config.json';
@@ -79,7 +80,7 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.2.6'
+    language: 'ru', version: '1.3.1'
   };
 }
 
@@ -322,7 +323,7 @@ function buildCaddyfile(config, users) {
   // ── Inline fallback (identical rules to caddyTemplate.js) ─────────────────
   // Used only when caddyTemplate.js is not yet on disk (e.g. very first boot
   // before install_panel() has run).  Kept in sync with the template manually.
-  const crypto = require('crypto');
+  // (crypto is required at module level — Bug 100)
   let authLines;
   if (naiveUsers.length > 0) {
     // Bug 23: each credential line is "basic_auth <user> <pass>" — no bare keyword
@@ -968,15 +969,30 @@ const EMAIL_RE        = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 //   handing it to the proxy, so "@ : / # % +" etc. corrupt the credential.
 //   A pure alphanumeric password is byte-identical whether parsed from the
 //   link or from JSON, so it works everywhere with no encoding ambiguity.
-//   Uses crypto.randomInt for unbiased selection.
+//   Bug 100: previously used crypto.randomInt() — that was only added in Node
+//   v14.10.0, and on the production box (older Node) the call threw
+//   "TypeError: crypto.randomInt is not a function".  We now do unbiased
+//   selection with crypto.randomBytes() + rejection sampling, which works on
+//   every Node version that ships crypto (i.e. all of them).
 const SAFE_PW_ALPHABET = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 function generateSafePassword(len) {
   let n = parseInt(len, 10);
   if (isNaN(n) || n < 8)  n = 16;   // sensible default / floor
   if (n > 64)             n = 64;   // matches USERNAME_RE-style sanity cap
+
+  const alphabetLen = SAFE_PW_ALPHABET.length;          // 62
+  // Largest multiple of alphabetLen that fits in a byte; bytes >= this are
+  // rejected so every character is equally likely (no modulo bias).
+  const limit = 256 - (256 % alphabetLen);              // 248 for len 62
   let out = '';
-  for (let i = 0; i < n; i++) {
-    out += SAFE_PW_ALPHABET[crypto.randomInt(0, SAFE_PW_ALPHABET.length)];
+  while (out.length < n) {
+    // Over-allocate a bit to reduce the number of randomBytes() calls.
+    const buf = crypto.randomBytes(n - out.length + 8);
+    for (let i = 0; i < buf.length && out.length < n; i++) {
+      const b = buf[i];
+      if (b >= limit) continue;                         // reject to avoid bias
+      out += SAFE_PW_ALPHABET[b % alphabetLen];
+    }
   }
   return out;
 }

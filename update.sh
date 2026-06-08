@@ -75,7 +75,7 @@ _local_version_file() {
   else echo ""; fi
 }
 TARGET_VERSION="$(_local_version_file)"
-[[ -z "$TARGET_VERSION" ]] && TARGET_VERSION="1.3.0"   # fallback if VERSION missing
+[[ -z "$TARGET_VERSION" ]] && TARGET_VERSION="1.3.1"   # fallback if VERSION missing
 
 # v1.2.3: Caddy-forwardproxy-naive paths (replaces standalone naive binary)
 CADDY_BIN="/usr/local/bin/caddy-naive"
@@ -1164,6 +1164,35 @@ do_update() {
     echo "panel_version=${TARGET_VERSION}" > "$VERSION_FILE"
   fi
   log_info "Version file updated to $TARGET_VERSION ✓"
+
+  # Bug A (v1.3.1): the panel UI shows cfg.version read from config.json
+  # (/api/status → panel.version), NOT /etc/rixxx-panel/version. Older do_update
+  # only bumped the version file, so the UI kept displaying the stale version
+  # (e.g. 1.2.6) after an update. Sync config.json's "version" field too.
+  if [[ -f "$PANEL_CONFIG" ]]; then
+    if command -v jq >/dev/null 2>&1; then
+      local _tmp_cfg
+      _tmp_cfg="$(mktemp)"
+      if jq --arg v "$TARGET_VERSION" '.version = $v' "$PANEL_CONFIG" > "$_tmp_cfg" 2>/dev/null \
+           && [[ -s "$_tmp_cfg" ]]; then
+        cat "$_tmp_cfg" > "$PANEL_CONFIG"   # preserve owner/perms of original file
+        log_info "config.json version synced to $TARGET_VERSION ✓"
+      else
+        log_warn "Could not update config.json version with jq — UI may show stale version"
+      fi
+      rm -f "$_tmp_cfg"
+    else
+      # jq missing (shouldn't happen — it's a hard dep): best-effort sed fallback.
+      if grep -q '"version"' "$PANEL_CONFIG"; then
+        sed -i "s|\"version\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"version\": \"${TARGET_VERSION}\"|" \
+          "$PANEL_CONFIG" 2>/dev/null \
+          && log_info "config.json version synced to $TARGET_VERSION (sed) ✓" \
+          || log_warn "Could not update config.json version — UI may show stale version"
+      else
+        log_warn "config.json has no \"version\" field — UI may show stale version"
+      fi
+    fi
+  fi
 
   # Remove legacy naive paths if present (migration cleanup)
   if [[ -f "$LEGACY_NAIVE_BIN" ]]; then
