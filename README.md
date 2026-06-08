@@ -253,12 +253,38 @@ sudo bash uninstall.sh     # Полное удаление
 
 ---
 
+## 🔄 Обновление одной командой
+
+На сервере **не нужен** ни git, ни заранее скачанный `update.sh` — команда сама
+скачивает свежий установщик обновления из `main` и запускает его. БД с ключами
+(`/var/lib/rixxx-panel/db.sqlite`) и конфиг (`/etc/rixxx-panel/config.json`) при
+обновлении **не трогаются**, плюс автоматически снимается бэкап (включая БД).
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+Начиная с v1.3.0 установщик кладёт `update.sh` и `VERSION` прямо в
+`/opt/panel-naive-mieru`, поэтому в дальнейшем можно обновляться и так:
+
+```bash
+sudo bash /opt/panel-naive-mieru/update.sh -y
+```
+
+> **Как работает версия.** Источник истины — файл `VERSION` в корне репозитория.
+> При релизе достаточно поднять номер в `VERSION` и запушить в `main`. `update.sh`
+> сам сравнивает установленную версию с версией в `main` и обновляется, если
+> `main` новее. Принудительно (без сверки версий): добавьте `--force`.
+
 ## 🔄 Справочник update.sh
 
 ```bash
+# Обновиться одной командой (на проде, без git):
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+
 bash update.sh                    # Интерактивное обновление
 bash update.sh --dry-run          # Предпросмотр изменений (без записи)
-bash update.sh --force -y         # Принудительное обновление, без вопросов
+bash update.sh --force -y         # Принудительное обновление, без сверки версий
 bash update.sh --status           # Полный отчёт о состоянии
 bash update.sh --repair           # Восстановление сломанных конфигов
 bash update.sh --expose <домен>   # Публичный режим панели

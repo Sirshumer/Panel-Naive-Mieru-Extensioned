@@ -48,13 +48,34 @@ on_error() {
 trap 'on_error $LINENO' ERR
 
 # ── Constants ─────────────────────────────────────────────────────────────────
-TARGET_VERSION="1.2.6"
 PANEL_DIR="/opt/panel-naive-mieru"
 PANEL_CONFIG="/etc/rixxx-panel/config.json"
 VERSION_FILE="/etc/rixxx-panel/version"
 BACKUP_DIR="/etc/rixxx-panel/backups"
 DB_PATH="/var/lib/rixxx-panel/db.sqlite"
 MITA_STATE_FILE="/var/lib/rixxx-panel/mita-state.json"
+
+REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
+# Bug 99: raw base for fetching single files (VERSION, update.sh) without git.
+REPO_RAW="https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main"
+
+# Bug 99: single source of truth for the target version. Priority:
+#   1) the VERSION file shipped next to this script (set by install/update);
+#   2) the VERSION file in $PANEL_DIR (deployed copy on prod);
+#   3) the remote VERSION on main (so a curl-piped update knows the target even
+#      when this very script is older than main);
+#   4) a hardcoded fallback.
+# We resolve (1)/(2) synchronously here; (3) is folded in lazily by
+# resolve_target_version() right before the update gate so we don't make a
+# network call on every invocation (e.g. --help/--status).
+_local_version_file() {
+  local d; d="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo '')"
+  if   [[ -n "$d" && -f "$d/VERSION" ]]; then head -n1 "$d/VERSION"          | tr -d '[:space:]'
+  elif [[ -f "$PANEL_DIR/VERSION" ]];    then head -n1 "$PANEL_DIR/VERSION"  | tr -d '[:space:]'
+  else echo ""; fi
+}
+TARGET_VERSION="$(_local_version_file)"
+[[ -z "$TARGET_VERSION" ]] && TARGET_VERSION="1.3.0"   # fallback if VERSION missing
 
 # v1.2.3: Caddy-forwardproxy-naive paths (replaces standalone naive binary)
 CADDY_BIN="/usr/local/bin/caddy-naive"
@@ -69,7 +90,6 @@ LEGACY_NAIVE_CONFIG_DIR="/etc/naive"
 CADDY_NAIVE_RELEASES="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
 CADDY_NAIVE_FALLBACK_URL="https://github.com/klzgrad/forwardproxy/releases/download/v2.10.0-naive/caddy-forwardproxy-naive.tar.xz"
 MIERU_RELEASES="https://api.github.com/repos/enfein/mieru/releases/latest"
-REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
 
 # ── Flags ─────────────────────────────────────────────────────────────────────
 DRY_RUN=false
@@ -201,6 +221,16 @@ auto_backup() {
   [[ -f "$CADDY_FILE"      ]] && cp "$CADDY_FILE"       "$bdir/Caddyfile"      || true
   [[ -f "$MITA_STATE_FILE" ]] && cp "$MITA_STATE_FILE"  "$bdir/mita-state.json" || true
   [[ -f "$PANEL_CONFIG"    ]] && cp "$PANEL_CONFIG"     "$bdir/config.json"    || true
+  # Bug 99: back up the user DB too (it holds all issued keys). Use SQLite's
+  # online backup when available so a live/WAL DB is copied consistently; fall
+  # back to a plain cp otherwise.
+  if [[ -f "$DB_PATH" ]]; then
+    if command -v sqlite3 &>/dev/null; then
+      sqlite3 "$DB_PATH" ".backup '$bdir/db.sqlite'" 2>/dev/null || cp "$DB_PATH" "$bdir/db.sqlite" 2>/dev/null || true
+    else
+      cp "$DB_PATH" "$bdir/db.sqlite" 2>/dev/null || true
+    fi
+  fi
   [[ -f /etc/systemd/system/caddy-naive.service ]] && \
     cp /etc/systemd/system/caddy-naive.service "$bdir/" || true
   [[ -f /etc/systemd/system/mita.service ]] && \
@@ -230,6 +260,26 @@ detect_arch() {
 # ── Version comparison ────────────────────────────────────────────────────────
 version_gt() {
   [[ "$(printf '%s\n' "$1" "$2" | sort -V | tail -1)" == "$1" && "$1" != "$2" ]]
+}
+
+# Bug 99: fetch the VERSION published on main (best-effort, 8s timeout). Used so
+# a curl-piped or older local update.sh still learns the real target version.
+fetch_remote_version() {
+  local v
+  v=$(curl -fsSL --max-time 8 "$REPO_RAW/VERSION" 2>/dev/null | head -n1 | tr -d '[:space:]')
+  [[ -n "$v" ]] && echo "$v" || echo ""
+}
+
+# Bug 99: resolve the effective TARGET_VERSION = max(local VERSION, remote
+# VERSION). This guarantees the update gate triggers whenever main is ahead of
+# the installed version, regardless of which copy of update.sh is running.
+resolve_target_version() {
+  local remote; remote=$(fetch_remote_version)
+  if [[ -n "$remote" ]]; then
+    if version_gt "$remote" "$TARGET_VERSION"; then
+      TARGET_VERSION="$remote"
+    fi
+  fi
 }
 
 get_current_version() {
@@ -710,21 +760,40 @@ update_panel() {
   local src=""
   if git clone --depth 1 "${REPO_URL}.git" "$tmp" 2>/dev/null && [[ -d "$tmp/panel" ]]; then
     src="$tmp/panel"
-    log_info "Fetched latest panel from $REPO_URL"
+    log_info "Fetched latest panel from $REPO_URL (git)"
+  elif curl -fsSL --max-time 60 "${REPO_URL}/archive/refs/heads/main.tar.gz" -o "$tmp/main.tar.gz" 2>/dev/null \
+       && tar -xzf "$tmp/main.tar.gz" -C "$tmp" 2>/dev/null \
+       && [[ -n "$(find "$tmp" -maxdepth 2 -type d -name panel 2>/dev/null | head -1)" ]]; then
+    # Bug 99: tarball fallback — works even if git clone is unavailable/rate-limited.
+    src="$(find "$tmp" -maxdepth 2 -type d -name panel 2>/dev/null | head -1)"
+    log_info "Fetched latest panel from $REPO_URL (tarball)"
   elif [[ -d "$(pwd)/panel" ]]; then
     # Fallback: use the local checkout the operator already `git pull`-ed.
     src="$(pwd)/panel"
-    log_warn "git clone failed — using local checkout at $src"
+    log_warn "git/tarball fetch failed — using local checkout at $src"
   else
-    log_warn "No panel source available (clone failed, no local ./panel) — skipping"
+    log_warn "No panel source available (fetch failed, no local ./panel) — skipping"
     rm -rf "$tmp"; return
   fi
+
+  # repo_root is the dir that CONTAINS panel/ (holds VERSION + deploy scripts).
+  local repo_root; repo_root="$(dirname "$src")"
 
   pm2 stop panel-naive-mieru 2>/dev/null || true
 
   mkdir -p "$PANEL_DIR"
   # Copy everything including dotfiles; cp -a preserves structure.
+  # NOTE: this only touches $PANEL_DIR (/opt/...). The user DB
+  # (/var/lib/rixxx-panel/db.sqlite) and config (/etc/rixxx-panel/config.json)
+  # live OUTSIDE $PANEL_DIR and are never overwritten here → users are safe.
   cp -a "$src/." "$PANEL_DIR/"
+
+  # Bug 99: refresh the on-prod deploy scripts + VERSION so the NEXT update can
+  # run the latest update.sh straight from /opt/panel-naive-mieru.
+  for f in install.sh update.sh uninstall.sh VERSION CHANGELOG.md; do
+    [[ -f "$repo_root/$f" ]] && cp "$repo_root/$f" "$PANEL_DIR/$f" 2>/dev/null || true
+  done
+  chmod +x "$PANEL_DIR/update.sh" "$PANEL_DIR/install.sh" "$PANEL_DIR/uninstall.sh" 2>/dev/null || true
 
   # npm install must NOT be fatal — keep going even on a transient failure.
   ( cd "$PANEL_DIR" && npm install --omit=dev --silent ) \
@@ -734,11 +803,15 @@ update_panel() {
   pm2 restart panel-naive-mieru --update-env 2>/dev/null \
     || pm2 start "$PANEL_DIR/server/index.js" --name panel-naive-mieru --time
 
-  # Bug 76: verify the new code actually landed (sentinel added in v1.2.6 P3).
-  if grep -q "downloadNote" "$PANEL_DIR/public/index.html" 2>/dev/null; then
-    log_info "Panel updated ✓ (v1.2.6 markers present)"
+  # Bug 99: verify the new code actually landed by checking the version-agnostic
+  # sentinel — the password generator endpoint added in this release. (The old
+  # check hardcoded a v1.2.6 marker and would false-warn on every later build.)
+  if grep -q "/api/password/generate" "$PANEL_DIR/server/index.js" 2>/dev/null; then
+    log_info "Panel code updated ✓ (new server/index.js landed)"
+  elif grep -q "downloadNote" "$PANEL_DIR/public/index.html" 2>/dev/null; then
+    log_info "Panel updated ✓"
   else
-    log_warn "Panel files copied but v1.2.6 marker not found — check $PANEL_DIR"
+    log_warn "Panel files copied but expected marker not found — check $PANEL_DIR"
   fi
   rm -rf "$tmp"
 }
@@ -1021,8 +1094,14 @@ FAKEHTML
 
 # ── Main update flow ──────────────────────────────────────────────────────────
 do_update() {
-  log_step "Updating Panel Naive + Mieru to v${TARGET_VERSION}"
   detect_arch
+
+  # Bug 99: learn the real target from main (folds remote VERSION into
+  # TARGET_VERSION) so a release only needs a VERSION bump in main to trigger
+  # the update — no need to re-edit a hardcoded constant.
+  resolve_target_version
+
+  log_step "Updating Panel Naive + Mieru to v${TARGET_VERSION}"
 
   local current; current=$(get_current_version)
   log_info "Installed version: $current  |  Target: $TARGET_VERSION"
