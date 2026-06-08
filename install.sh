@@ -70,8 +70,21 @@ FAKE_SITE_DIR="/var/www/fake-site"
 NAIVE_BIN="/usr/local/bin/naive"        # may still exist from v1.2.x; will be removed
 NAIVE_CONFIG_DIR="/etc/naive"
 
-CURRENT_VERSION="1.2.6"
+# Bug 99: single source of truth for the version. The repo ships a top-level
+# VERSION file; both install.sh and update.sh read it so a release only needs
+# ONE bump (edit VERSION, commit to main). The hardcoded value is a fallback
+# for when install.sh is run without the VERSION file next to it.
+_read_version_file() {
+  local d; d="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" 2>/dev/null && pwd || echo '')"
+  if [[ -n "$d" && -f "$d/VERSION" ]]; then head -n1 "$d/VERSION" | tr -d '[:space:]'
+  elif [[ -f "$PWD/VERSION" ]]; then head -n1 "$PWD/VERSION" | tr -d '[:space:]'
+  else echo ""; fi
+}
+CURRENT_VERSION="$(_read_version_file)"
+[[ -z "$CURRENT_VERSION" ]] && CURRENT_VERSION="1.3.0"   # fallback if VERSION missing
 REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
+# Bug 99: raw base for fetching single files (VERSION, update.sh) without git.
+REPO_RAW="https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main"
 # Bug 1: direct download URL for caddy-forwardproxy-naive (amd64 only)
 CADDY_NAIVE_RELEASES="https://api.github.com/repos/klzgrad/forwardproxy/releases/latest"
 CADDY_NAIVE_FALLBACK_URL="https://github.com/klzgrad/forwardproxy/releases/download/v2.10.0-naive/caddy-forwardproxy-naive.tar.xz"
@@ -903,17 +916,36 @@ install_panel() {
     src="$PWD/panel"
   fi
 
+  # Bug 99: the repo root (one level above panel/) holds the deploy scripts +
+  # VERSION that must land on the server so update.sh can run on prod (where
+  # there is no .git). repo_root is the dir that CONTAINS the panel/ source.
+  local repo_root=""
   if [[ -n "$src" ]]; then
     cp -r "$src/"* "$PANEL_DIR/"
     log_info "$(t "Файлы панели скопированы из $src ✓" "Panel files copied from $src ✓")"
+    repo_root="$(dirname "$src")"
   else
     log_warn "$(t 'Локальные исходники не найдены — клонирование из репозитория...' \
                'Local panel source not found — cloning from repo...')"
     git clone --depth 1 "$REPO_URL" /tmp/panel-src 2>/dev/null || \
       die "$(t 'Не удалось клонировать репозиторий' 'Failed to clone panel source')"
     cp -r /tmp/panel-src/panel/* "$PANEL_DIR/"
-    rm -rf /tmp/panel-src
+    repo_root="/tmp/panel-src"
   fi
+
+  # Bug 99: copy the deploy scripts + VERSION into PANEL_DIR so the server can
+  # self-update with one command (no git checkout needed on prod). update.sh
+  # will run from /opt/panel-naive-mieru/update.sh.
+  for f in install.sh update.sh uninstall.sh VERSION CHANGELOG.md; do
+    if [[ -f "$repo_root/$f" ]]; then
+      cp "$repo_root/$f" "$PANEL_DIR/$f" 2>/dev/null || true
+    fi
+  done
+  chmod +x "$PANEL_DIR/update.sh" "$PANEL_DIR/install.sh" "$PANEL_DIR/uninstall.sh" 2>/dev/null || true
+  [[ -f "$PANEL_DIR/update.sh" ]] && \
+    log_info "$(t "Скрипты обновления установлены → $PANEL_DIR ✓" "Update scripts installed → $PANEL_DIR ✓")"
+  rm -rf /tmp/panel-src 2>/dev/null || true
+
   ( cd "$PANEL_DIR" && npm install --production --silent )
   log_info "$(t 'npm зависимости установлены ✓' 'npm dependencies installed ✓')"
 }

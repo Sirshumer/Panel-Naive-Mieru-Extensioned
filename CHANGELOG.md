@@ -7,10 +7,44 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
-## [Unreleased] — Audit 2026-06-08 (Priority 1 bugs + fake-site)
+## [v1.3.0] — Audit 2026-06-08 (Priority 1 bugs + fake-site + update/version mechanism)
 
 Safe, backwards-compatible fixes. **No DB schema change**, existing keys and
 cascades keep working. Server update commands are at the bottom of this entry.
+
+### Bug 99 — update/version/deploy mechanism was broken (could not update at all)
+
+The previous update flow could not run on a real server:
+
+- **No scripts on prod.** `install_panel()` copied only `panel/*` to
+  `/opt/panel-naive-mieru` — never `install.sh`, `update.sh`, or `.git`. So
+  `cd /opt/... && git fetch` and `bash update.sh` both failed (`not a git
+  repository` / `No such file or directory`).
+- **Version never moved.** `update.sh` hardcoded `TARGET_VERSION` and the server
+  reported the same version, so `version_gt` said "already latest" and (without
+  `--force`) did nothing — even when `main` had new code.
+
+**Fixes:**
+- **Single source of truth `VERSION`** at the repo root. Both `install.sh` and
+  `update.sh` read it (with a safe fallback when run standalone). A release now
+  needs only a `VERSION` bump committed to `main`.
+- **Remote-version-aware update.** `update.sh` fetches `VERSION` from `main`
+  (`resolve_target_version()`); the update gate triggers whenever `main` is
+  ahead of the installed version — no hardcoded constant to edit.
+- **Scripts deployed to prod.** `install_panel()` and `update_panel()` now copy
+  `install.sh`, `update.sh`, `uninstall.sh`, `VERSION`, `CHANGELOG.md` into
+  `/opt/panel-naive-mieru`, so the box can self-update.
+- **One-command bootstrap (no git on prod):**
+  ```bash
+  curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+  ```
+- **Tarball fetch fallback** in `update_panel()` (works even if `git clone`
+  fails/rate-limits) in addition to git clone and a local-checkout fallback.
+- **DB backup.** `auto_backup()` now also backs up `db.sqlite` (online
+  `.backup` when `sqlite3` is present). The update never touches the live DB or
+  `config.json` (both live outside `/opt`), so issued keys survive.
+- **Version-agnostic update sentinel** (checks the new
+  `/api/password/generate` endpoint instead of a hardcoded v1.2.6 marker).
 
 ### Bug 96 (`index.js`) — mita stuck `failed` / "no user found" after first user or manual restart
 
@@ -67,25 +101,26 @@ to that site (with `header_up Host` + TLS-SNI for https upstreams). The static
 `file_server` remains the default, so existing installs are unaffected. Applied
 consistently across all four Caddyfile generators.
 
-### Server update commands (for installs already on `c1955dd`)
+### Server update command (for installs already on `c1955dd` — no git/scripts on prod)
+
+ONE command. Downloads the latest `update.sh` from `main` and runs it; backs up
+DB+config first, never overwrites issued keys:
 
 ```bash
-cd /opt/panel-naive-mieru \
-  && sudo git fetch origin \
-  && sudo git checkout main \
-  && sudo git pull origin main \
-  && sudo bash update.sh -y
-# update.sh rebuilds the Caddyfile via the shared template, restarts caddy-naive
-# + mita with reset-failed, and restarts the PM2 panel.
-# If you do NOT use git on the server, re-run the installer (idempotent):
-#   sudo bash install.sh --force
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+From v1.3.0 onward the scripts are deployed to `/opt/panel-naive-mieru`, so
+later you can also just run:
+```bash
+sudo bash /opt/panel-naive-mieru/update.sh -y
 ```
 
 After updating, verify:
 ```bash
 systemctl is-active caddy-naive mita        # both: active
-pm2 restart panel-naive-mieru               # pick up new server/index.js
 mita status                                  # RUNNING
+grep -m1 panel_version /etc/rixxx-panel/version   # → 1.3.0
 ```
 
 ---
