@@ -81,7 +81,7 @@ _read_version_file() {
   else echo ""; fi
 }
 CURRENT_VERSION="$(_read_version_file)"
-[[ -z "$CURRENT_VERSION" ]] && CURRENT_VERSION="1.3.0"   # fallback if VERSION missing
+[[ -z "$CURRENT_VERSION" ]] && CURRENT_VERSION="1.3.1"   # fallback if VERSION missing
 REPO_URL="https://github.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX"
 # Bug 99: raw base for fetching single files (VERSION, update.sh) without git.
 REPO_RAW="https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main"
