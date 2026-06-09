@@ -7,6 +7,62 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.3.3] — Audit 2026-06-09 (REAL UTF-8 fix — install crash on config.json, Bug 101; reopens #34)
+
+**Reopens #34 — the previous "locale" fix (Bug 34) was the wrong diagnosis.**
+
+### Bug 101 — install crashed writing config.json: `SyntaxError: Non-UTF-8 code starting with '\xd1' … no encoding declared`
+
+On a clean Ubuntu 22.04 / 24.04 (Yandex Cloud) the installer failed at
+**“Запись /etc/rixxx-panel/config.json”** with:
+
+```
+SyntaxError: Non-UTF-8 code starting with '\xd1' in file ... on line N,
+but no encoding declared; see https://peps.python.org/pep-0263/
+```
+
+Decisive clue: **the error line number changed with the interface language**
+(RU → line 6, EN → line 14). That proves localized/user-supplied **Cyrillic
+strings were interpolated into the python source** of the heredoc that wrote
+config.json — and Python (PEP 263) refuses non-ASCII source bytes without a
+`# coding: utf-8` declaration. So it was **never a locale problem**:
+`LANG=C.UTF-8` / `PYTHONUTF8` (Bug 34) couldn’t fix it because the offending
+bytes were in the generated *code*, not the environment. The literal
+`"exposePanel": …("Y","Д")` comparison (a Cyrillic **Д** baked into the python
+source) was the EN “line 14”; a Cyrillic domain/email hit the RU “line 6”.
+
+**Fix — eliminate python from the install path; generate all JSON with Node:**
+- `write_config_json()` now writes config.json with **`node`** (UTF-8-native,
+  no source-encoding rules), and **every value is passed as an environment
+  variable (data), never interpolated into the script source**. Cyrillic
+  domains/emails, quotes, backslashes, etc. now produce valid JSON.
+- `write_mita_state()` likewise rewritten with Node + env-passed ports.
+- The Caddyfile render (`node -e`) and the inline `auth_lines` fallback now pass
+  the user list / domain / email / fake-site URL via **env vars**, not
+  interpolated source.
+- **All** remaining `python3 -c` calls in the installer (mita user count,
+  smoke-test JSON parsing/asserts, password URL-encoding, banner serverIp read)
+  were converted to **Node** — the installer no longer invokes python at all.
+- Locale exports kept as belt-and-braces; comment corrected to explain the real
+  root cause.
+
+**Verification:** config.json generation tested with a Cyrillic domain
+(`кириллица.рф`), Cyrillic email, a Cyrillic fake-site URL with an embedded
+`'` quote, and a bcrypt hash containing `\` — all yield valid, parseable JSON.
+**No DB schema change**, keys and cascades untouched.
+
+### Server update (one command)
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+> Note: this bug only affected **fresh installs** (`install.sh`); existing
+> servers that already have a valid config.json are unaffected by the crash, but
+> should still update to get the hardened installer for any future reinstall.
+
+---
+
 ## [v1.3.2] — Audit 2026-06-08 (post-deploy hotfix #2: version display fully fixed in the UI)
 
 After v1.3.1 the password crash was gone, but the panel **still** showed the old

@@ -75,7 +75,7 @@ _local_version_file() {
   else echo ""; fi
 }
 TARGET_VERSION="$(_local_version_file)"
-[[ -z "$TARGET_VERSION" ]] && TARGET_VERSION="1.3.2"   # fallback if VERSION missing
+[[ -z "$TARGET_VERSION" ]] && TARGET_VERSION="1.3.3"   # fallback if VERSION missing
 
 # v1.2.3: Caddy-forwardproxy-naive paths (replaces standalone naive binary)
 CADDY_BIN="/usr/local/bin/caddy-naive"
