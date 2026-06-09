@@ -80,7 +80,7 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.4.2'
+    language: 'ru', version: '1.4.3'
   };
 }
 
@@ -170,6 +170,21 @@ try {
     try { db.exec('ROLLBACK'); } catch {}
     console.error('[DB] email-nullable migration skipped:', e.message);
   }
+
+  // Bug 149 (CRITICAL): servers upgraded from v1.2 have `email TEXT UNIQUE`
+  // (already nullable, so the rebuild above is skipped) but v1.2 *stored* an
+  // empty string '' for users without an email. SQLite treats '' as a real,
+  // distinct value for UNIQUE — so the SECOND empty-email row already collides,
+  // and creating ANY new user fails with "UNIQUE constraint failed: users.email".
+  // Normalise every legacy '' email to NULL unconditionally (NULLs are exempt
+  // from UNIQUE in SQLite, so an unlimited number of users may have no email).
+  try {
+    const fixed = db.prepare(`UPDATE users SET email = NULL WHERE email = ''`).run();
+    if (fixed.changes > 0)
+      console.log(`[DB] Bug 149 fix: normalised ${fixed.changes} legacy empty-string email(s) -> NULL`);
+  } catch (e) {
+    console.error('[DB] empty-email normalisation failed:', e.message);
+  }
 } catch (err) {
   console.error('[DB] SQLite unavailable:', err.message, '— using in-memory store');
 }
@@ -190,8 +205,25 @@ function getUserById(id) {
   if (db) return db.prepare('SELECT * FROM users WHERE id = ?').get(id);
   return memUsers.get(id);
 }
+// Bug 149: map a raw better-sqlite3 error to a safe, user-facing message +
+// HTTP status. UNIQUE-constraint violations become friendly 409s; everything
+// else stays a generic 500 with NO internal path/stacktrace leaked to the UI.
+function describeDbError(e) {
+  const msg = String(e && e.message || '');
+  if (/UNIQUE constraint failed:\s*users\.email/i.test(msg))
+    return { status: 409, error: 'Email already in use' };
+  if (/UNIQUE constraint failed:\s*users\.username/i.test(msg))
+    return { status: 409, error: 'Username already exists' };
+  if (/UNIQUE constraint failed/i.test(msg))
+    return { status: 409, error: 'A user with these details already exists' };
+  return { status: 500, error: 'Could not save user (database error)' };
+}
+
 function upsertUser(u) {
   if (db) {
+    // Bug 149: never persist an empty-string email — UNIQUE treats '' as a real
+    // value and collides across email-less users. Always store NULL instead.
+    const email = (u.email && String(u.email).trim()) ? String(u.email).trim() : null;
     db.prepare(`
       INSERT INTO users
         (id,email,username,passHash,password,expiry,protocols,quotaMB,usedMB,createdAt,updatedAt,lastSeen)
@@ -203,10 +235,19 @@ function upsertUser(u) {
         expiry=excluded.expiry, protocols=excluded.protocols,
         quotaMB=excluded.quotaMB, usedMB=excluded.usedMB,
         updatedAt=excluded.updatedAt, lastSeen=excluded.lastSeen
-    `).run({ ...u, password: u.password || '' });
+    `).run({ ...u, email, password: u.password || '' });
   } else {
     memUsers.set(u.id, u);
   }
+}
+
+// Bug 149: cheap duplicate-email pre-check so we can return a clean 409 BEFORE
+// hitting the UNIQUE constraint (and as a guard for email-less users → no row).
+function getUserByEmail(email) {
+  const e = (email && String(email).trim()) ? String(email).trim() : null;
+  if (!e) return undefined;
+  if (db) return db.prepare('SELECT * FROM users WHERE email = ?').get(e);
+  return [...memUsers.values()].find(u => u.email === e);
 }
 function deleteUser(id) {
   if (db) db.prepare('DELETE FROM users WHERE id = ?').run(id);
@@ -1272,6 +1313,12 @@ app.post('/api/users', requireAuth, (req, res) => {
   if (getUserByUsername(username))
     return res.status(409).json({ error: 'Username already exists' });
 
+  // Bug 149: normalise email up-front and pre-check for duplicates so we return
+  // a clean 409 instead of letting the UNIQUE constraint throw a raw SqliteError.
+  const normEmail = (email && email.trim()) ? email.trim() : null;
+  if (normEmail && getUserByEmail(normEmail))
+    return res.status(409).json({ error: 'Email already in use' });
+
   if (expiry && isNaN(Date.parse(expiry)))
     return res.status(400).json({ error: 'expiry must be a valid ISO date string' });
 
@@ -1280,7 +1327,7 @@ app.post('/api/users', requireAuth, (req, res) => {
     id:        uuidv4(),
     // Email is optional: store NULL (not '') so the UNIQUE constraint allows
     // multiple users without an email.
-    email:     (email && email.trim()) ? email.trim() : null,
+    email:     normEmail,
     username,
     passHash:  bcrypt.hashSync(password, 12),
     password,
@@ -1290,7 +1337,15 @@ app.post('/api/users', requireAuth, (req, res) => {
     usedMB:    0,
     createdAt: now, updatedAt: now, lastSeen: null
   };
-  upsertUser(user);
+  // Bug 149: never leak a raw SqliteError / internal path to the UI. Map known
+  // constraint violations to friendly 4xx, anything else to a generic 500.
+  try {
+    upsertUser(user);
+  } catch (e) {
+    const d = describeDbError(e);
+    console.error('[USERS] create failed:', e.message);
+    return res.status(d.status).json({ error: d.error });
+  }
 
   // Bug 6: rebuild Caddyfile + reload Caddy; rebuild mita state; report status
   const svcStatus = applyAllConfigs();
@@ -1317,9 +1372,24 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
   if (expiry !== undefined && expiry !== null && isNaN(Date.parse(expiry)))
     return res.status(400).json({ error: 'expiry must be a valid ISO date string' });
 
+  const newEmail = email !== undefined
+    ? ((email && email.trim()) ? email.trim() : null)
+    : user.email;
+
+  // Bug 149: if the email is changing to a non-empty value already used by a
+  // DIFFERENT user, return a clean 409 rather than throwing a UNIQUE error.
+  if (newEmail) {
+    const clash = getUserByEmail(newEmail);
+    if (clash && clash.id !== user.id)
+      return res.status(409).json({ error: 'Email already in use' });
+  }
+  // Same guard for a username change.
+  if (username && username !== user.username && getUserByUsername(username))
+    return res.status(409).json({ error: 'Username already exists' });
+
   const updated = {
     ...user,
-    email:     email !== undefined ? ((email && email.trim()) ? email.trim() : null) : user.email,
+    email:     newEmail,
     username:  username  ?? user.username,
     expiry:    expiry    !== undefined ? (expiry || null) : user.expiry,
     protocols: protocols
@@ -1334,7 +1404,13 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
     updated.passHash = bcrypt.hashSync(password, 12);
     updated.password = password;
   }
-  upsertUser(updated);
+  try {
+    upsertUser(updated);
+  } catch (e) {
+    const d = describeDbError(e);
+    console.error('[USERS] update failed:', e.message);
+    return res.status(d.status).json({ error: d.error });
+  }
 
   const svcStatus = applyAllConfigs();
 
@@ -2190,6 +2266,22 @@ cron.schedule('* * * * *', () => {
 
 // ── SPA catch-all ─────────────────────────────────────────────────────────────
 app.get('*', (_req, res) => res.sendFile(path.join(__dirname, '../public/index.html')));
+
+// ── Global error handler (Bug 149) ───────────────────────────────────────────
+// Last-resort safety net: any error thrown synchronously inside a route (e.g. a
+// SqliteError from an unguarded DB call) must NOT reach the client as a raw
+// Express HTML stacktrace exposing internal file paths like
+// "/opt/panel-naive-mieru/server/index.js:206". Log the detail server-side and
+// return a clean JSON error. UNIQUE violations are mapped to a friendly 409.
+// (Express identifies error-handling middleware by its 4-arg signature.)
+app.use((err, req, res, next) => {     // eslint-disable-line no-unused-vars
+  if (res.headersSent) return next(err);
+  console.error('[ERR]', req && req.method, req && req.path, '-', err && err.message);
+  const d = (err && /SqliteError|UNIQUE constraint/i.test(String(err.message || err.code || '')))
+    ? describeDbError(err)
+    : { status: 500, error: 'Internal server error' };
+  res.status(d.status).json({ error: d.error });
+});
 
 // ── Start ─────────────────────────────────────────────────────────────────────
 const HOST = process.env.PANEL_HOST || cfg.panelHost || '127.0.0.1';
