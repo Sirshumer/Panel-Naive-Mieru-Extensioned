@@ -585,6 +585,7 @@ if (fs.existsSync(TEMPLATE_JS)) {
       let ba = '';
       if (baUser && baHash) ba = '    basic_auth {\n      ' + baUser + ' ' + baHash + '\n    }\n';
       panelBlock = '\n\n' + pDom + ' {\n  tls ' + (cfg.adminEmail || '') +
+        '\n\n  redir /' + wbp + ' /' + wbp + '/ 301' +
         '\n\n  handle_path /' + wbp + '/* {\n' + ba + '    reverse_proxy 127.0.0.1:' + pPort +
         '\n  }\n\n  handle {\n    root * ' + stubDir + '\n    file_server\n  }\n}\n';
     }

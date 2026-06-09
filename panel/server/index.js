@@ -80,7 +80,7 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.3.3'
+    language: 'ru', version: '1.4.1'
   };
 }
 
@@ -392,7 +392,7 @@ function buildCaddyfile(config, users) {
       let ba = '';
       if (baUser && baHash) ba = `    basic_auth {\n      ${baUser} ${baHash}\n    }\n`;
       panelBlock =
-`\n\n# ── v1.4.0: panel external access (TLS + basic_auth + webBasePath) ────────────\n${panelDomain} {\n  tls ${config.adminEmail || ''}\n\n  handle_path /${webBasePath}/* {\n${ba}    reverse_proxy 127.0.0.1:${panelPort}\n  }\n\n  # Root and any path outside the secret base path → static stub (not a redirect)\n  handle {\n    root * ${stubDir}\n    file_server\n  }\n}\n`;
+`\n\n# ── v1.4.0: panel external access (TLS + basic_auth + webBasePath) ────────────\n${panelDomain} {\n  tls ${config.adminEmail || ''}\n\n  # BUG-140: normalize bare base path to trailing slash (relative-asset resolve)\n  redir /${webBasePath} /${webBasePath}/ 301\n\n  handle_path /${webBasePath}/* {\n${ba}    reverse_proxy 127.0.0.1:${panelPort}\n  }\n\n  # Root and any path outside the secret base path → static stub (not a redirect)\n  handle {\n    root * ${stubDir}\n    file_server\n  }\n}\n`;
     }
   }
 
@@ -1105,6 +1105,45 @@ app.post('/api/panel/external-access', requireAuth, (req, res) => {
     }
   }
   res.json(result);
+});
+
+// ── BUG-141: custom panel-stub HTML editor ────────────────────────────────────
+// The panel-stub is the static page Caddy serves at the panel subdomain root and
+// for any path outside webBasePath. It is a SEPARATE entity from the naive
+// fake-site (probe-resistance). The operator can replace it with their own HTML.
+function panelStubFile() {
+  return String(cfg.panelStubPage || '/var/www/panel-stub/index.html').trim()
+    || '/var/www/panel-stub/index.html';
+}
+
+app.get('/api/panel/stub', requireAuth, (req, res) => {
+  const f = panelStubFile();
+  let html = '';
+  try { html = fs.readFileSync(f, 'utf8'); } catch (_) { html = ''; }
+  res.json({ path: f, html });
+});
+
+app.post('/api/panel/stub', requireAuth, (req, res) => {
+  const body = req.body || {};
+  let html = body.html != null ? String(body.html) : '';
+  // Strip a stray leading "Copy" token (clipboard artifact) and BOM.
+  html = html.replace(/^\uFEFF/, '').replace(/^Copy(?=\s*<)/, '');
+  if (!html.trim()) return res.status(400).json({ error: 'Stub HTML must not be empty' });
+  if (html.length > 256 * 1024) return res.status(400).json({ error: 'Stub HTML too large (max 256 KiB)' });
+
+  const f = panelStubFile();
+  const dir = path.dirname(f);
+  try {
+    fs.mkdirSync(dir, { recursive: true });
+    const tmp = f + '.new';
+    fs.writeFileSync(tmp, html, { mode: 0o644 });
+    fs.renameSync(tmp, f);           // atomic replace — no half-written stub
+    try { fs.chmodSync(f, 0o644); } catch (_) {}
+  } catch (e) {
+    return res.status(500).json({ error: 'Failed to write stub file: ' + e.message });
+  }
+  // file_server serves the file directly; no Caddy restart needed.
+  res.json({ ok: true, path: f, bytes: Buffer.byteLength(html) });
 });
 
 // ── Validation helpers ────────────────────────────────────────────────────────

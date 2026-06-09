@@ -222,7 +222,16 @@
     "cascadeNeedOne": "Укажите Naive upstream URL и/или Mieru exit host",
     "cascadePortRangeInvalid": "Конечный порт должен быть ≥ начального",
     "cascadeMieruUserRequired": "Укажите Mieru exit username",
-    "cascadeMieruPassRequired": "Укажите Mieru exit password"
+    "cascadeMieruPassRequired": "Укажите Mieru exit password",
+    "externalStubTitle": "Страница-заглушка (корень поддомена / вне webBasePath)",
+    "externalStubDesc": "Статичный HTML, который Caddy отдаёт на корне поддомена панели и на любом пути вне webBasePath. Отдельная сущность от naive fake-site. Отредактируйте и сохраните, чтобы заменить.",
+    "externalStubReload": "Загрузить текущую",
+    "externalStubSave": "Сохранить заглушку",
+    "externalStubLoaded": "Текущая заглушка загружена",
+    "externalStubSaved": "Заглушка сохранена ✓",
+    "externalStubEmpty": "HTML заглушки не может быть пустым",
+    "externalBaPassNew": "Пароль basic auth (обязательно при первом включении)",
+    "externalBaPassKeep": "Пароль basic auth (пусто — оставить прежний)"
   },
   "monitoring": {
     "title": "Мониторинг",

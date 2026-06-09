@@ -7,6 +7,39 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.1] — Audit 2026-06-09 (External access fixes: webBasePath base-path proxy, stub editor, version sync)
+
+Bugfix release for the v1.4.0 external-access feature, addressing field-test findings.
+
+### Fixed
+
+- **BUG-140 (blocker): webBasePath was not propagated to assets/API.** With external
+  access enabled, the panel rendered the login page but `locales/*.json`, `/api/me`,
+  `/api/login`, etc. returned 404 — login was impossible. Root cause: Caddy
+  `handle_path /<webBasePath>/*` strips the prefix, but the SPA built absolute paths
+  from the root (`/api/...`, `/locales/...`) and never re-added the prefix.
+  - Frontend now derives `BASE_PATH` from the running `app.js` script URL and prepends
+    it to every `fetch`/`api` call, the locale loader, and the WebSocket URL (`/ws`).
+  - Caddy now emits `redir /<webBasePath> /<webBasePath>/ 301` so the bare prefix
+    normalizes to a trailing slash and relative assets (`style.css`, `app.js`) resolve.
+  - Works identically with and without a prefix (SSH-tunnel mode unaffected).
+- **BUG-141 (high): custom panel-stub HTML could not be set.** Added a stub editor to
+  the External Access settings card with `GET`/`POST /api/panel/stub` (atomic write to
+  `panelStubPage`, no Caddy restart needed). A stray leading `Copy` clipboard artifact
+  is stripped automatically.
+- **BUG-143 (medium): UI showed stale 1.3.x version.** Hardcoded `v1.3.3` fallbacks in
+  `index.html`/server defaults are bumped; with BUG-140 fixed, `/api/status` now reaches
+  the panel so `cfg.version` (synced from VERSION on update) displays correctly.
+- **BUG-144 (low): basic-auth password label/validation mismatch.** The label/placeholder
+  and validation now depend on `panelBasicAuthSet`: password is **required on first
+  enable**, and **optional (blank = keep)** when a hash already exists.
+
+### Notes
+
+- No DB schema changes. Existing keys/cascades untouched.
+
+---
+
 ## [v1.4.0] — Audit 2026-06-09 (External panel access — domain + TLS + basic auth + webBasePath; removes bare port 8080)
 
 Major feature: secure **external access to the admin panel** via a dedicated

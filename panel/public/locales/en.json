@@ -222,7 +222,16 @@
     "cascadeNeedOne": "Provide a Naive upstream URL and/or a Mieru exit host",
     "cascadePortRangeInvalid": "End port must be ≥ start port",
     "cascadeMieruUserRequired": "Please provide Mieru exit username",
-    "cascadeMieruPassRequired": "Please provide Mieru exit password"
+    "cascadeMieruPassRequired": "Please provide Mieru exit password",
+    "externalStubTitle": "Stub page (shown at subdomain root / outside webBasePath)",
+    "externalStubDesc": "Static HTML served by Caddy at the panel subdomain root and any path outside webBasePath. Separate from the naive fake-site. Edit and save to replace it.",
+    "externalStubReload": "Reload current",
+    "externalStubSave": "Save stub",
+    "externalStubLoaded": "Loaded current stub",
+    "externalStubSaved": "Stub saved ✓",
+    "externalStubEmpty": "Stub HTML must not be empty",
+    "externalBaPassNew": "Basic-auth password (required on first enable)",
+    "externalBaPassKeep": "Basic-auth password (leave blank to keep current)"
   },
   "monitoring": {
     "title": "Monitoring",

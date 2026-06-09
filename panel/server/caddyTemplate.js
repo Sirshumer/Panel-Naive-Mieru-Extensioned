@@ -147,11 +147,20 @@ function renderPanelBlock(cfg) {
 
   // handle_path strips the /<webBasePath> prefix, so reverse_proxy sees "/".
   // Everything else (root + any non-matching path) falls through to file_server.
+  //
+  // BUG-140: the bare prefix (no trailing slash) MUST redirect to "/<wbp>/" so
+  // the SPA's relative assets (style.css, app.js) resolve under the prefix.
+  // Without it, https://d/<wbp> would load index.html but resolve app.js to
+  // https://d/app.js (404). The frontend then carries the prefix on every
+  // /api and /locales request via window-derived BASE_PATH.
   return `
 
 # ── v1.4.0: panel external access (TLS + basic_auth + webBasePath) ────────────
 ${panelDomain} {
   tls ${email}
+
+  # Normalize the bare base path to a trailing slash so relative assets resolve.
+  redir /${webBasePath} /${webBasePath}/ 301
 
   handle_path /${webBasePath}/* {
 ${basicAuthBlock}    reverse_proxy 127.0.0.1:${panelPort}
