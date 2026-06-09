@@ -317,6 +317,14 @@ function buildCaddyfile(config, users) {
       logFile:     LOG_CADDY,
       // Bug 92: normalize (strip "naive+" etc.) before it reaches the template.
       upstream:    (config.cascadeEnabled && config.cascadeNaiveUpstream) ? normalizeUpstream(config.cascadeNaiveUpstream) : '',
+      // v1.4.0: panel external-access subdomain block (TLS + basic_auth + webBasePath).
+      exposePanel:        !!config.exposePanel,
+      panelDomain:        config.panelDomain        || '',
+      panelBasicAuthUser: config.panelBasicAuthUser || '',
+      panelBasicAuthHash: config.panelBasicAuthHash || '',
+      webBasePath:        config.webBasePath        || '',
+      panelStubPage:      config.panelStubPage      || '/var/www/panel-stub/index.html',
+      panelPort:          config.panelPort          || 3000,
     }, naiveUsers);
   }
 
@@ -368,6 +376,26 @@ function buildCaddyfile(config, users) {
     }
   }
 
+  // v1.4.0: panel external-access subdomain block (inline fallback — mirrors
+  // caddyTemplate.renderPanelBlock). Emitted only when external access is on.
+  let panelBlock = '';
+  {
+    const expose      = !!config.exposePanel;
+    const panelDomain = String(config.panelDomain || '').trim();
+    const baUser      = String(config.panelBasicAuthUser || '').trim();
+    const baHash      = String(config.panelBasicAuthHash || '').trim();
+    const stubFile    = String(config.panelStubPage || '/var/www/panel-stub/index.html').trim();
+    let   webBasePath = String(config.webBasePath || '').trim().replace(/^\/+|\/+$/g, '').replace(/[^A-Za-z0-9._~-]/g, '');
+    const panelPort   = parseInt(config.panelPort, 10) || 3000;
+    if (expose && panelDomain && webBasePath) {
+      const stubDir = stubFile.replace(/\/[^/]*$/, '') || '/var/www/panel-stub';
+      let ba = '';
+      if (baUser && baHash) ba = `    basic_auth {\n      ${baUser} ${baHash}\n    }\n`;
+      panelBlock =
+`\n\n# ── v1.4.0: panel external access (TLS + basic_auth + webBasePath) ────────────\n${panelDomain} {\n  tls ${config.adminEmail || ''}\n\n  handle_path /${webBasePath}/* {\n${ba}    reverse_proxy 127.0.0.1:${panelPort}\n  }\n\n  # Root and any path outside the secret base path → static stub (not a redirect)\n  handle {\n    root * ${stubDir}\n    file_server\n  }\n}\n`;
+    }
+  }
+
   // Bug 28: no "tls <email>" inside site block
   // Bug 30: order directive in global block
   // Bug 38: roll_keep_for 720h
@@ -410,7 +438,7 @@ ${authLines}
 
 ${masqueradeBlock}
 }
-`;
+${panelBlock}`;
 }
 
 // ── writeCaddyfileAtomic() ────────────────────────────────────────────────────
@@ -868,7 +896,11 @@ app.use(session({
   secret: sessionSecret,
   resave: false,
   saveUninitialized: false,
-  cookie: { secure: false, httpOnly: true, maxAge: 86400000 }
+  // v1.4.0: cookie Path is explicitly '/'. Externally the panel is served behind
+  // Caddy's `handle_path /<webBasePath>/*`, which STRIPS the prefix before the
+  // request reaches the panel — so the app always sees paths at the root and the
+  // cookie scoped to '/' survives a webBasePath change (no forced re-login).
+  cookie: { path: '/', secure: false, httpOnly: true, maxAge: 86400000, sameSite: 'lax' }
 }));
 
 // Rate limits
@@ -913,7 +945,10 @@ app.get('/api/me', requireAuth, (req, res) => {
 
 // ── Config API ────────────────────────────────────────────────────────────────
 app.get('/api/config', requireAuth, (req, res) => {
-  const { adminPassHash, ...safe } = cfg;
+  // v1.4.0: never leak the panel basic-auth bcrypt hash to the browser — expose
+  // a boolean "set" flag instead so the UI can show whether a password exists.
+  const { adminPassHash, panelBasicAuthHash, ...safe } = cfg;
+  safe.panelBasicAuthSet = !!panelBasicAuthHash;
   // Never expose secrets to the browser. Mask the cascade exit password and the
   // legacy native-egress proxy passwords; expose a boolean "set" flag instead.
   if (safe.cascadeMieru && typeof safe.cascadeMieru === 'object') {
@@ -955,6 +990,121 @@ app.post('/api/config/password', requireAuth, (req, res) => {
   cfg.adminPassHash = bcrypt.hashSync(newPass, 12);
   saveConfig();
   res.json({ ok: true });
+});
+
+// ── v1.4.0: external panel access (domain + TLS + basic auth + webBasePath) ───
+// All changes regenerate the Caddyfile (which now contains the panel subdomain
+// block) and apply it ATOMICALLY (Bug 91): write → restart caddy-naive → verify
+// is-active. On failure we roll back config + Caddyfile and report a clear error
+// so the panel never stays in a broken state.
+
+// Generate a random 16-hex webBasePath (does NOT persist — UI persists via save).
+app.get('/api/panel/webbasepath/generate', requireAuth, (req, res) => {
+  res.json({ webBasePath: crypto.randomBytes(8).toString('hex') });
+});
+
+// Hash a basic-auth password with `caddy hash-password` (bcrypt). Falls back to
+// bcryptjs so the panel works even if the caddy binary lacks the subcommand.
+function caddyHashPassword(plain) {
+  try {
+    const out = execFileSync(resolvedCaddyBin, ['hash-password'],
+      { input: String(plain), timeout: 8000 }).toString().trim();
+    if (out) return out;
+  } catch (_) { /* fall through */ }
+  return bcrypt.hashSync(String(plain), 12);
+}
+
+const WEBBASE_RE = /^[A-Za-z0-9._~-]{1,64}$/;
+const HOSTNAME_RE = /^(?=.{1,253}$)([a-zA-Z0-9](?:[a-zA-Z0-9-]{0,61}[a-zA-Z0-9])?\.)+[a-zA-Z]{2,}$/;
+
+app.post('/api/panel/external-access', requireAuth, (req, res) => {
+  const body = req.body || {};
+  const enabled = !!body.enabled;
+
+  // Snapshot current state for rollback.
+  const prev = {
+    exposePanel:        cfg.exposePanel,
+    panelDomain:        cfg.panelDomain,
+    panelBasicAuthUser: cfg.panelBasicAuthUser,
+    panelBasicAuthHash: cfg.panelBasicAuthHash,
+    webBasePath:        cfg.webBasePath,
+  };
+  const oldWebBasePath = String(cfg.webBasePath || '');
+
+  if (enabled) {
+    const domain = String(body.panelDomain || cfg.panelDomain || '').trim();
+    if (!domain || !HOSTNAME_RE.test(domain))
+      return res.status(400).json({ error: 'Valid panel subdomain required (e.g. panel.example.com)' });
+
+    // webBasePath: explicit value (sanitized) or keep existing or generate.
+    let wbp = String(body.webBasePath || cfg.webBasePath || '').trim().replace(/^\/+|\/+$/g, '');
+    if (!wbp) wbp = crypto.randomBytes(8).toString('hex');
+    if (!WEBBASE_RE.test(wbp))
+      return res.status(400).json({ error: 'webBasePath must match [A-Za-z0-9._~-] (1–64 chars)' });
+
+    const baUser = String(body.basicAuthUser || cfg.panelBasicAuthUser || 'admin').trim();
+    if (!USERNAME_RE.test(baUser))
+      return res.status(400).json({ error: 'basic-auth login must match [a-zA-Z0-9_.-] (max 64)' });
+
+    // Password: only (re)hash when a new one is provided. Keep the old hash
+    // otherwise. Require a hash to exist when first enabling.
+    let baHash = cfg.panelBasicAuthHash || '';
+    const newPass = body.basicAuthPass != null ? String(body.basicAuthPass) : '';
+    if (newPass) {
+      if (newPass.length < 6) return res.status(400).json({ error: 'basic-auth password too short (min 6)' });
+      baHash = caddyHashPassword(newPass);
+    }
+    if (!baHash)
+      return res.status(400).json({ error: 'A basic-auth password is required to enable external access' });
+
+    cfg.exposePanel        = true;
+    cfg.panelDomain        = domain;
+    cfg.webBasePath        = wbp;
+    cfg.panelBasicAuthUser = baUser;
+    cfg.panelBasicAuthHash = baHash;
+    cfg.panelHost          = '127.0.0.1';   // never bind externally
+    cfg.panelPort          = cfg.panelPort || 3000;
+    if (!cfg.panelStubPage) cfg.panelStubPage = '/var/www/panel-stub/index.html';
+  } else {
+    // Disable: keep panelDomain/webBasePath/hash so it can be re-enabled later.
+    cfg.exposePanel = false;
+    cfg.panelHost   = '127.0.0.1';
+  }
+
+  // Persist, regenerate Caddyfile, and apply atomically (Bug 91).
+  const prevCaddy = (() => { try { return fs.readFileSync(resolvedCaddyFile, 'utf8'); } catch { return null; } })();
+  saveConfig();
+  try {
+    writeCaddyfileAtomic(buildCaddyfile(cfg, getAllUsers()));
+  } catch (e) {
+    Object.assign(cfg, prev); saveConfig();
+    return res.status(500).json({ error: 'Failed to write Caddyfile: ' + e.message });
+  }
+  const r = applyCaddyConfig();
+  if (!r.ok) {
+    // Roll back config + Caddyfile and re-apply the previous good state.
+    Object.assign(cfg, prev); saveConfig();
+    try {
+      if (prevCaddy != null) writeCaddyfileAtomic(prevCaddy);
+      else writeCaddyfileAtomic(buildCaddyfile(cfg, getAllUsers()));
+    } catch (_) {}
+    applyCaddyConfig();
+    return res.status(500).json({ error: 'Caddy failed to apply the change — rolled back. ' + (r.error || '') });
+  }
+
+  // Build the response: new full URL + whether webBasePath changed.
+  const result = { ok: true, exposePanel: cfg.exposePanel };
+  if (cfg.exposePanel) {
+    result.url = `https://${cfg.panelDomain}/${cfg.webBasePath}/`;
+    result.panelDomain = cfg.panelDomain;
+    result.webBasePath = cfg.webBasePath;
+    result.basicAuthUser = cfg.panelBasicAuthUser;
+    if (oldWebBasePath && oldWebBasePath !== cfg.webBasePath) {
+      result.webBasePathChanged = true;
+      result.warning = 'webBasePath changed — the old URL/tab now shows the stub. Open the new URL.';
+    }
+  }
+  res.json(result);
 });
 
 // ── Validation helpers ────────────────────────────────────────────────────────

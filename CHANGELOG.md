@@ -7,6 +7,74 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.0] — Audit 2026-06-09 (External panel access — domain + TLS + basic auth + webBasePath; removes bare port 8080)
+
+Major feature: secure **external access to the admin panel** via a dedicated
+TLS subdomain, plus a new **webBasePath** secret path segment. The bare HTTP
+port 8080 is **removed entirely** — the panel is never exposed directly.
+
+### Architecture
+
+```
+https://panel.<domain>/<webBasePath>/   → Caddy (TLS + basic_auth)
+                                          → handle_path strips prefix
+                                          → reverse_proxy 127.0.0.1:3000
+panel.<domain>/  and any path outside webBasePath
+                                          → static stub (file_server, local HTML)
+```
+
+* The panel **always** listens on `127.0.0.1:3000` (loopback). External reach is
+  served **only** by Caddy via reverse_proxy — there is no bare panel port.
+* `handle_path /<webBasePath>/*` strips the prefix, so the panel never needs to
+  know about it (most robust approach; a webBasePath change requires no app change).
+* `basic_auth` is a layer **over** the panel login, not a replacement.
+* The panel-stub (`/var/www/panel-stub/index.html`, the dark animated
+  “CONNECTION” page) is shown at the subdomain root and any non-webBasePath path —
+  **not** a redirect to login. It is a separate entity from the naive `fakeSiteUrl`.
+
+### Server (install.sh / update.sh)
+
+* `install.sh`: `--expose panel.<domain>` (+ `--panel-ba-user/--panel-ba-pass/--web-base-path`);
+  interactive prompt for external access (default = SSH-only); `setup_panel_stub`;
+  `caddy hash-password` for basic-auth; final credentials banner shows the panel URL,
+  webBasePath, basic-auth login (+ password only when auto-generated).
+* `update.sh --expose <panel-domain>` / `--ssh-only` rewritten for the subdomain
+  architecture (idempotent; atomic rebuild + restart + is-active check, Bug 91 style).
+* Interactive update on SSH-only asks **once** “Перевести панель в открытый доступ
+  по домену? [y/N]” (default N keeps local); `-y` keeps the current mode silently;
+  an already-exposed install regenerates the block from template without asking.
+* **8080 migration**: on update, any legacy `0.0.0.0:8080` binding / UFW rule is
+  detected, closed, and the panel is forced back to the safe loopback default —
+  without losing access.
+* UFW keeps only 80 (ACME + redirect), 443 (TLS), and the proxy ports; 8080 is
+  removed and a removal step is added.
+
+### config.json (backward-compatible)
+
+New fields: `panelDomain`, `panelBasicAuthUser`, `panelBasicAuthHash`,
+`webBasePath`, `panelStubPage`. `migrate_config()` adds safe defaults to old
+installs (SSH-only, loopback) and never silently exposes them.
+
+### Panel (backend + UI)
+
+* New endpoints: `POST /api/panel/external-access` (validate → persist →
+  regenerate Caddyfile → restart caddy-naive → verify is-active → **roll back**
+  config + Caddyfile on failure so the panel never stays broken) and
+  `GET /api/panel/webbasepath/generate` (random 16-hex).
+* `/api/config` masks the basic-auth bcrypt hash (exposes a boolean `panelBasicAuthSet`).
+* Session cookie `Path` is explicitly `/` so a webBasePath change does not force re-login.
+* New Settings card: enable/disable toggle, subdomain, webBasePath + “Generate new”,
+  basic-auth login/password; on save it shows the new full URL and warns when the
+  old path stops working (it now serves the stub) — no hard logout.
+
+### Caddyfile generators (all 4 in sync)
+
+`caddyTemplate.js` gains `renderPanelBlock()` (single source of truth); the inline
+fallbacks in `index.js`, `install.sh`, and `update.sh rebuild_caddyfile_direct`
+mirror it. All emit the panel block only when external access is enabled.
+
+---
+
 ## [v1.3.3] — Audit 2026-06-09 (REAL UTF-8 fix — install crash on config.json, Bug 101; reopens #34)
 
 **Reopens #34 — the previous "locale" fix (Bug 34) was the wrong diagnosis.**

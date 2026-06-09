@@ -89,6 +89,83 @@ function parseFakeUpstream(rawUrl) {
   return { useProxy: true, scheme, host };
 }
 
+// ── v1.4.0: panel external-access subdomain block ─────────────────────────────
+// External access to the admin panel is served ONLY through a dedicated TLS
+// subdomain (panel.<domain>), never via a bare HTTP port. The panel itself
+// always listens on loopback (127.0.0.1:3000); Caddy reverse_proxies to it.
+//
+// Architecture:
+//   https://panel.<domain>/<webBasePath>/*   →  basic_auth + handle_path → reverse_proxy 127.0.0.1:3000
+//   https://panel.<domain>/  and any other path → static stub (file_server, local HTML)
+//
+//   • handle_path strips the /<webBasePath> prefix before proxying, so the
+//     panel never sees (or needs to know) the prefix — the most robust approach.
+//     A change of webBasePath therefore does not require any panel-side change.
+//   • basic_auth is a layer OVER the panel login, never a replacement.
+//   • The stub (panelStubPage / its directory) is served by file_server for the
+//     subdomain root and every path outside webBasePath — NOT a redirect to login.
+//   • This is a SEPARATE site block keyed on the panel.<domain> host, so it does
+//     NOT collide with the naive ":<port>, <domain>" catch-all on :443.
+//
+// Returns '' (empty) when external access is disabled or misconfigured, so the
+// caller appends nothing and the panel stays loopback-only.
+function sanitizeWebBasePath(raw) {
+  // Strip leading/trailing slashes and any unsafe characters; keep it path-safe.
+  let s = String(raw || '').trim().replace(/^\/+|\/+$/g, '');
+  s = s.replace(/[^A-Za-z0-9._~-]/g, '');
+  return s;
+}
+
+function renderPanelBlock(cfg) {
+  const expose      = !!cfg.exposePanel;
+  const panelDomain = String(cfg.panelDomain || '').trim();
+  const email       = String(cfg.adminEmail || '').trim();
+  const baUser      = String(cfg.panelBasicAuthUser || '').trim();
+  const baHash      = String(cfg.panelBasicAuthHash || '').trim();
+  const stubFile    = String(cfg.panelStubPage || '/var/www/panel-stub/index.html').trim();
+  const webBasePath = sanitizeWebBasePath(cfg.webBasePath);
+  const panelPort   = parseInt(cfg.panelPort, 10) || 3000;
+
+  // External access requires, at minimum, a panel subdomain and a webBasePath.
+  if (!expose || !panelDomain || !webBasePath) return '';
+
+  // The stub root directory holds the local static "CONNECTION" page that is
+  // served for the subdomain root and any path outside webBasePath.
+  const stubDir = stubFile.replace(/\/[^/]*$/, '') || '/var/www/panel-stub';
+
+  // basic_auth block — only emitted when a username + bcrypt hash are present.
+  // Caddy v2 syntax: `basic_auth { <user> <bcrypt-hash> }`. The hash must be a
+  // bcrypt hash produced by `caddy hash-password`.
+  let basicAuthBlock = '';
+  if (baUser && baHash) {
+    basicAuthBlock =
+`    basic_auth {
+      ${baUser} ${baHash}
+    }
+`;
+  }
+
+  // handle_path strips the /<webBasePath> prefix, so reverse_proxy sees "/".
+  // Everything else (root + any non-matching path) falls through to file_server.
+  return `
+
+# ── v1.4.0: panel external access (TLS + basic_auth + webBasePath) ────────────
+${panelDomain} {
+  tls ${email}
+
+  handle_path /${webBasePath}/* {
+${basicAuthBlock}    reverse_proxy 127.0.0.1:${panelPort}
+  }
+
+  # Root and any path outside the secret base path → static stub (not a redirect)
+  handle {
+    root * ${stubDir}
+    file_server
+  }
+}
+`;
+}
+
 function render(cfg, naiveUsers) {
   const email      = (cfg.adminEmail  || '').trim();
   const domain     = (cfg.domain      || 'localhost').trim();
@@ -226,7 +303,7 @@ ${authLines}
 
 ${masqueradeBlock}
 }
-`;
+${renderPanelBlock(cfg)}`;
 }
 
-module.exports = { render };
+module.exports = { render, renderPanelBlock, sanitizeWebBasePath };

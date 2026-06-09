@@ -113,6 +113,11 @@ parse_install_args() {
       --fake-site-url)  INPUT_FAKE_SITE_URL="${2:-}";   shift ;;
       --probe-secret)   INPUT_PROBE_SECRET="${2:-}";    shift ;;
       --probe-mode)     INPUT_PROBE_MODE="${2:-}";      shift ;;
+      # v1.4.0: external panel access — domain + TLS + basic auth + webBasePath
+      --expose)         INPUT_PANEL_DOMAIN="${2:-}";    shift ;;
+      --panel-ba-user)  INPUT_PANEL_BA_USER="${2:-}";   shift ;;
+      --panel-ba-pass)  INPUT_PANEL_BA_PASS="${2:-}";   shift ;;
+      --web-base-path)  INPUT_WEB_BASE_PATH="${2:-}";   shift ;;
       --lang)
         case "${2:-ru}" in en) LANG_RU=false ;; *) LANG_RU=true ;; esac
         shift ;;
@@ -121,6 +126,8 @@ parse_install_args() {
         echo "                       [--admin-user USER] [--admin-pass PASS]"
         echo "                       [--naive-port PORT] [--mieru-start PORT] [--mieru-end PORT]"
         echo "                       [--fake-site-url URL] [--probe-secret SECRET]"
+        echo "                       [--expose panel.DOMAIN] [--panel-ba-user USER] [--panel-ba-pass PASS]"
+        echo "                       [--web-base-path HEX]"
         echo "                       [--lang ru|en]"
         exit 0 ;;
       *) log_warn "Unknown argument: $1 (ignored)" ;;
@@ -415,7 +422,9 @@ gather_config() {
     # Bug 81: default probe_resistance mode = bare (matches known-good reference).
     PROBE_MODE="${INPUT_PROBE_MODE:-bare}"
     USE_UFW="Y"
-    EXPOSE_PANEL="N"
+    # v1.4.0: external panel access. SSH-only by default; enabled only when
+    # --expose panel.DOMAIN is given (safe default for non-interactive installs).
+    resolve_panel_access_noninteractive
     log_info "$(t 'Конфигурация принята из аргументов ✓' 'Configuration loaded from arguments ✓')"
     return
   fi
@@ -501,15 +510,72 @@ gather_config() {
   read -rp "$(echo -e "${CYAN}$(t 'Настроить UFW (файрвол)?' 'Configure UFW firewall?')${NC} [$(t 'Д/н' 'Y/n')]: ")" INPUT_UFW
   USE_UFW="${INPUT_UFW:-Y}"
 
-  # Expose panel
+  # v1.4.0: external panel access (domain + TLS + basic auth + webBasePath).
+  # The panel always listens on loopback (127.0.0.1:3000). External access is
+  # served ONLY via a dedicated TLS subdomain reverse-proxied by Caddy — there
+  # is NO bare HTTP port. SSH-only is the safe default.
   echo ""
-  echo -e "${YELLOW}$(t 'Панель работает на 127.0.0.1:3000 (только через SSH-туннель, по умолчанию).' \
-                       'Panel runs on 127.0.0.1:3000 (SSH-only by default).')${NC}"
-  read -rp "$(echo -e "${CYAN}$(t 'Открыть панель публично на порту 8080?' 'Expose panel publicly on port 8080?')${NC} [$(t 'д/Н' 'y/N')]: ")" INPUT_EXPOSE
-  EXPOSE_PANEL="${INPUT_EXPOSE:-N}"
+  echo -e "${YELLOW}$(t 'Панель слушает только 127.0.0.1:3000 (через SSH-туннель, по умолчанию).' \
+                       'Panel listens on 127.0.0.1:3000 only (via SSH tunnel, by default).')${NC}"
+  echo -e "${YELLOW}$(t 'Внешний доступ — только через поддомен с TLS (panel.<домен>), без голого порта.' \
+                       'External access — only via a TLS subdomain (panel.<domain>), no bare port.')${NC}"
+  read -rp "$(echo -e "${CYAN}$(t 'Открыть внешний доступ по поддомену?' 'Enable external access via a subdomain?')${NC} [$(t 'д/Н' 'y/N')]: ")" INPUT_EXPOSE
+  if [[ "${INPUT_EXPOSE:-N}" =~ ^([yYдД])$ ]]; then
+    resolve_panel_access_interactive
+  else
+    EXPOSE_PANEL_BOOL=0; PANEL_DOMAIN=""; WEB_BASE_PATH=""
+    PANEL_BASIC_AUTH_USER=""; PANEL_BASIC_AUTH_PASS=""; PANEL_BASIC_AUTH_HASH=""
+    log_info "$(t 'Панель остаётся в SSH-only режиме ✓' 'Panel stays in SSH-only mode ✓')"
+  fi
 
   echo ""
   log_info "$(t 'Конфигурация собрана ✓' 'Configuration gathered ✓')"
+}
+
+# ── v1.4.0: resolve external-access variables (non-interactive) ───────────────
+# Reads INPUT_PANEL_DOMAIN (from --expose) etc. SSH-only unless --expose is set.
+resolve_panel_access_noninteractive() {
+  if [[ -n "${INPUT_PANEL_DOMAIN:-}" ]]; then
+    EXPOSE_PANEL_BOOL=1
+    PANEL_DOMAIN="${INPUT_PANEL_DOMAIN}"
+    WEB_BASE_PATH="${INPUT_WEB_BASE_PATH:-$(gen_web_base_path)}"
+    PANEL_BASIC_AUTH_USER="${INPUT_PANEL_BA_USER:-admin}"
+    PANEL_BASIC_AUTH_PASS="${INPUT_PANEL_BA_PASS:-$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)}"
+    if [[ -z "${INPUT_PANEL_BA_PASS:-}" ]]; then
+      PANEL_BA_PASS_GENERATED=1
+      log_info "$(t "Сгенерирован пароль basic auth: ${BOLD}$PANEL_BASIC_AUTH_PASS${NC}" \
+                   "Generated basic-auth password: ${BOLD}$PANEL_BASIC_AUTH_PASS${NC}")"
+    fi
+    PANEL_BASIC_AUTH_HASH="$(panel_hash_password "$PANEL_BASIC_AUTH_PASS")"
+  else
+    EXPOSE_PANEL_BOOL=0; PANEL_DOMAIN=""; WEB_BASE_PATH=""
+    PANEL_BASIC_AUTH_USER=""; PANEL_BASIC_AUTH_PASS=""; PANEL_BASIC_AUTH_HASH=""
+  fi
+}
+
+# ── v1.4.0: resolve external-access variables (interactive) ───────────────────
+resolve_panel_access_interactive() {
+  EXPOSE_PANEL_BOOL=1
+  local def_domain="panel.${DOMAIN}"
+  read -rp "$(echo -e "${CYAN}$(t 'Поддомен панели' 'Panel subdomain')${NC} [${def_domain}]: ")" _pd
+  PANEL_DOMAIN="${_pd:-$def_domain}"
+  # webBasePath: generated automatically; operator may change it later in the UI.
+  WEB_BASE_PATH="$(gen_web_base_path)"
+  log_info "$(t "webBasePath сгенерирован: ${BOLD}/${WEB_BASE_PATH}/${NC}" \
+               "webBasePath generated: ${BOLD}/${WEB_BASE_PATH}/${NC}")"
+  read -rp "$(echo -e "${CYAN}$(t 'Логин basic auth' 'Basic-auth login')${NC} [admin]: ")" _bu
+  PANEL_BASIC_AUTH_USER="${_bu:-admin}"
+  read -rsp "$(echo -e "${CYAN}$(t 'Пароль basic auth (Enter — сгенерировать)' 'Basic-auth password (Enter to generate)')${NC}: ")" _bp
+  echo ""
+  if [[ -z "$_bp" ]]; then
+    PANEL_BASIC_AUTH_PASS="$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)"
+    PANEL_BA_PASS_GENERATED=1
+    log_info "$(t "Сгенерирован пароль basic auth: ${BOLD}$PANEL_BASIC_AUTH_PASS${NC}" \
+                 "Generated basic-auth password: ${BOLD}$PANEL_BASIC_AUTH_PASS${NC}")"
+  else
+    PANEL_BASIC_AUTH_PASS="$_bp"
+  fi
+  PANEL_BASIC_AUTH_HASH="$(panel_hash_password "$PANEL_BASIC_AUTH_PASS")"
 }
 
 # ── Bug 1: Setup fake site ────────────────────────────────────────────────────
@@ -544,6 +610,52 @@ FAKEHTML
 
   chmod 644 "${FAKE_SITE_DIR}/index.html"
   log_info "$(t "Фейковый сайт создан → $FAKE_SITE_DIR ✓" "Fake site created → $FAKE_SITE_DIR ✓")"
+}
+
+# ── v1.4.0: panel-stub static page (panel subdomain root / non-webBasePath) ───
+# This is a SEPARATE entity from fake-site (which is the naive probe-resistance
+# masquerade). The panel-stub is shown at the ROOT of the panel subdomain and at
+# any path outside webBasePath when external access is enabled. Default content
+# is the dark animated "CONNECTION" page. The operator may replace the file.
+PANEL_STUB_DIR="/var/www/panel-stub"
+PANEL_STUB_PAGE="${PANEL_STUB_DIR}/index.html"
+setup_panel_stub() {
+  log_step "$(t 'Создание заглушки панели (panel-stub)' 'Setting up panel stub page (panel-stub)')"
+  mkdir -p "$PANEL_STUB_DIR"
+  local asset="${PANEL_DIR}/assets/panel-stub.html"
+  if [[ -f "$asset" ]]; then
+    cp "$asset" "$PANEL_STUB_PAGE"
+  else
+    # Inline fallback (identical to panel/assets/panel-stub.html).
+    cat > "$PANEL_STUB_PAGE" <<'STUBHTML'
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Syncing</title><style>body{background:#080808;height:100vh;margin:0;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:sans-serif}.grid{width:60px;height:60px;position:relative;margin-bottom:25px}.cube{width:18px;height:18px;background:#fff;position:absolute;animation:rotate 2s infinite ease-in-out}.cube:nth-child(1){top:0;left:0;animation-delay:0s}.cube:nth-child(2){top:0;right:0;animation-delay:0.2s}.cube:nth-child(3){bottom:0;right:0;animation-delay:0.4s}.cube:nth-child(4){bottom:0;left:0;animation-delay:0.6s}@keyframes rotate{0%,100%{transform:scale(1) rotate(0deg);opacity:1}50%{transform:scale(0.5) rotate(180deg);opacity:0.3}}.t{color:#555;font-size:13px;letter-spacing:3px;font-weight:600}</style></head><body><div class="grid"><div class="cube"></div><div class="cube"></div><div class="cube"></div><div class="cube"></div></div><div class="t">CONNECTION</div></body></html>
+STUBHTML
+  fi
+  chmod 644 "$PANEL_STUB_PAGE"
+  log_info "$(t "Заглушка панели создана → $PANEL_STUB_DIR ✓" "Panel stub created → $PANEL_STUB_DIR ✓")"
+}
+
+# ── v1.4.0: helpers for external panel access ─────────────────────────────────
+# Random 16-hex webBasePath (used by default on first enable). The operator can
+# change it later in the UI to a custom value.
+gen_web_base_path() { openssl rand -hex 8 2>/dev/null | tr -d '\n'; }
+
+# Hash a basic-auth password with `caddy hash-password` (bcrypt). The caddy-naive
+# binary ships the same subcommand. Falls back to htpasswd-style bcrypt if needed.
+panel_hash_password() {
+  local plain="$1" hash=""
+  if [[ -x "$CADDY_BIN" ]]; then
+    hash=$(printf '%s' "$plain" | "$CADDY_BIN" hash-password 2>/dev/null | tr -d '\n') || true
+  fi
+  if [[ -z "$hash" ]] && command -v caddy &>/dev/null; then
+    hash=$(printf '%s' "$plain" | caddy hash-password 2>/dev/null | tr -d '\n') || true
+  fi
+  if [[ -z "$hash" ]]; then
+    command -v htpasswd &>/dev/null || \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2-utils 2>/dev/null || true
+    hash=$(htpasswd -bnBC 12 "" "$plain" 2>/dev/null | tr -d ':\n' | sed 's/^[^$]*//')
+  fi
+  printf '%s' "$hash"
 }
 
 # ── Write Caddyfile (TLS-ALPN-01, forwardproxy, probe-resistance) ─────────────
@@ -632,6 +744,12 @@ write_caddyfile() {
       CADDY_FAKE_SITE_URL="${FAKE_SITE_URL:-}" \
       CADDY_PROBE_SECRET="$PROBE_SECRET" \
       CADDY_PROBE_MODE="${PROBE_MODE:-bare}" \
+      CADDY_EXPOSE_PANEL="${EXPOSE_PANEL_BOOL:-0}" \
+      CADDY_PANEL_DOMAIN="${PANEL_DOMAIN:-}" \
+      CADDY_PANEL_BA_USER="${PANEL_BASIC_AUTH_USER:-}" \
+      CADDY_PANEL_BA_HASH="${PANEL_BASIC_AUTH_HASH:-}" \
+      CADDY_WEB_BASE_PATH="${WEB_BASE_PATH:-}" \
+      CADDY_PANEL_STUB_PAGE="${PANEL_STUB_PAGE:-/var/www/panel-stub/index.html}" \
       node -e '
         const E = process.env;
         const t = require(E.CADDY_TEMPLATE_JS);
@@ -645,7 +763,15 @@ write_caddyfile() {
           fakeSiteUrl: E.CADDY_FAKE_SITE_URL || "",
           probeSecret: E.CADDY_PROBE_SECRET || "",
           probeMode:   E.CADDY_PROBE_MODE || "bare",
-          logFile:     "/var/log/caddy-naive/access.log"
+          logFile:     "/var/log/caddy-naive/access.log",
+          // v1.4.0: panel external-access subdomain block
+          exposePanel:        E.CADDY_EXPOSE_PANEL === "1",
+          panelDomain:        E.CADDY_PANEL_DOMAIN || "",
+          panelBasicAuthUser: E.CADDY_PANEL_BA_USER || "",
+          panelBasicAuthHash: E.CADDY_PANEL_BA_HASH || "",
+          webBasePath:        E.CADDY_WEB_BASE_PATH || "",
+          panelStubPage:      E.CADDY_PANEL_STUB_PAGE || "/var/www/panel-stub/index.html",
+          panelPort:          3000
         };
         process.stdout.write(t.render(cfg, users));
       ' 2>>"$INSTALL_LOG") || true
@@ -918,7 +1044,8 @@ setup_ufw() {
   # Bug 7: single-port safe helper
   _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" tcp "Mieru TCP"
   _ufw_mieru_rule "$MIERU_PORT_START" "$MIERU_PORT_END" udp "Mieru UDP"
-  [[ "${EXPOSE_PANEL^^}" =~ ^(Y|Д)$ ]] && ufw allow 8080/tcp comment "Panel Web UI"
+  # v1.4.0: NO bare panel port. External panel access is via the Caddy TLS
+  # subdomain on :443 only (already covered by 80/443 + naive port rules above).
   ufw --force enable || true
   log_info "$(t 'Правила UFW применены ✓' 'UFW rules applied ✓')"
 }
@@ -1017,7 +1144,7 @@ write_config_json() {
   # interpolated into the JS source. So Cyrillic, quotes, backslashes, etc. in
   # the domain / email / any field can no longer break the parser or the JSON.
   local _expose_panel_bool _use_ufw_bool
-  case "$(printf '%s' "$EXPOSE_PANEL" | tr '[:lower:]' '[:upper:]')" in Y|Д|ДА|YES) _expose_panel_bool=1 ;; *) _expose_panel_bool=0 ;; esac
+  _expose_panel_bool="${EXPOSE_PANEL_BOOL:-0}"
   case "$(printf '%s' "$USE_UFW"      | tr '[:lower:]' '[:upper:]')" in Y|Д|ДА|YES) _use_ufw_bool=1 ;;      *) _use_ufw_bool=0 ;; esac
 
   CFG_DOMAIN="$DOMAIN" \
@@ -1030,6 +1157,11 @@ write_config_json() {
   CFG_MIERU_PORT_END="$MIERU_PORT_END" \
   CFG_EXPOSE_PANEL="$_expose_panel_bool" \
   CFG_USE_UFW="$_use_ufw_bool" \
+  CFG_PANEL_DOMAIN="${PANEL_DOMAIN:-}" \
+  CFG_PANEL_BA_USER="${PANEL_BASIC_AUTH_USER:-}" \
+  CFG_PANEL_BA_HASH="${PANEL_BASIC_AUTH_HASH:-}" \
+  CFG_WEB_BASE_PATH="${WEB_BASE_PATH:-}" \
+  CFG_PANEL_STUB_PAGE="${PANEL_STUB_PAGE:-/var/www/panel-stub/index.html}" \
   CFG_DB_PATH="$DB_PATH" \
   CFG_CADDY_BIN="$CADDY_BIN" \
   CFG_CADDY_FILE="$CADDY_FILE" \
@@ -1059,6 +1191,11 @@ write_config_json() {
       panelHost:      "127.0.0.1",
       exposePanel:    E.CFG_EXPOSE_PANEL === "1",
       useUfw:         E.CFG_USE_UFW === "1",
+      panelDomain:        E.CFG_PANEL_DOMAIN   || "",
+      panelBasicAuthUser: E.CFG_PANEL_BA_USER  || "",
+      panelBasicAuthHash: E.CFG_PANEL_BA_HASH  || "",
+      webBasePath:        E.CFG_WEB_BASE_PATH  || "",
+      panelStubPage:      E.CFG_PANEL_STUB_PAGE || "/var/www/panel-stub/index.html",
       dbPath:         E.CFG_DB_PATH || "",
       caddyBin:       E.CFG_CADDY_BIN || "",
       caddyFile:      E.CFG_CADDY_FILE || "",
@@ -1223,8 +1360,9 @@ start_services() {
 
   # PM2 panel
   cd "$PANEL_DIR"
+  # v1.4.0: the panel ALWAYS binds loopback only. External access is served via
+  # the Caddy TLS subdomain (reverse_proxy → 127.0.0.1:3000), never a bare port.
   local panel_host="127.0.0.1"
-  [[ "${EXPOSE_PANEL^^}" =~ ^(Y|Д)$ ]] && panel_host="0.0.0.0"
   pm2 delete panel-naive-mieru 2>/dev/null || true
   # Bug 34: pass an explicit UTF-8 locale into the PM2-managed node process so
   #   the panel's own spawned helpers (python3/jq/mita via execSync) never trip
@@ -1421,8 +1559,11 @@ print_banner() {
   echo -e "  ${BOLD}$(t 'Fake site' 'Fake site'):${NC}          $FAKE_SITE_DIR"
   echo ""
   echo -e "  ${BOLD}$(t 'Доступ к панели' 'Panel access'):${NC}"
-  if [[ "${EXPOSE_PANEL^^}" =~ ^(Y|Д)$ ]]; then
-    echo -e "    $(t 'Публичный URL' 'Public URL'):  ${CYAN}http://$server_ip:8080/${NC}"
+  if [[ "${EXPOSE_PANEL_BOOL:-0}" == "1" && -n "${PANEL_DOMAIN:-}" ]]; then
+    echo -e "    $(t 'Публичный URL' 'Public URL'):  ${CYAN}https://${PANEL_DOMAIN}/${WEB_BASE_PATH}/${NC}"
+    echo -e "    Basic auth $(t 'логин' 'login'): ${CYAN}${PANEL_BASIC_AUTH_USER}${NC}"
+    [[ "${PANEL_BA_PASS_GENERATED:-0}" == "1" ]] && \
+      echo -e "    Basic auth $(t 'пароль' 'password'): ${CYAN}${PANEL_BASIC_AUTH_PASS}${NC}"
   else
     echo -e "    SSH: ${CYAN}ssh -L 3000:127.0.0.1:3000 root@$server_ip${NC}"
     echo -e "    $(t 'Затем откройте' 'Then open'):  ${CYAN}http://localhost:3000/${NC}"
@@ -1480,6 +1621,7 @@ main() {
   install_mieru
   gather_config
   setup_fake_site
+  setup_panel_stub
   write_mita_state
   write_caddyfile
   write_caddy_service

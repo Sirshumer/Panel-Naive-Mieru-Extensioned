@@ -397,6 +397,52 @@
       <div class="page-header"><h3 data-i18n="settings.title">Server Settings</h3></div>
       <div class="grid grid-2">
 
+        <!-- v1.4.0: External panel access card -->
+        <div class="card">
+          <div class="card-header" data-i18n="settings.externalTitle">External Panel Access</div>
+          <div class="card-body">
+            <p class="card-desc" data-i18n="settings.externalDesc">
+              Expose the panel via a TLS subdomain (https://panel.&lt;domain&gt;/&lt;webBasePath&gt;/),
+              protected by basic auth. The panel always stays on 127.0.0.1:3000; Caddy reverse-proxies to it.
+              The root and any path outside webBasePath show a static stub.
+            </p>
+            <div class="form-group">
+              <label>
+                <input type="checkbox" id="s-expose-enabled" data-action="toggle-external-fields">
+                <span data-i18n="settings.externalEnable">Enable external access</span>
+              </label>
+            </div>
+            <div id="external-fields">
+              <div class="form-group">
+                <label data-i18n="settings.externalDomain">Panel subdomain</label>
+                <input type="text" id="s-panel-domain" placeholder="panel.example.com" autocomplete="off">
+              </div>
+              <div class="form-group">
+                <label data-i18n="settings.externalWebBasePath">webBasePath (secret path segment)</label>
+                <div class="input-with-btn">
+                  <input type="text" id="s-web-base-path" placeholder="a1b2c3d4e5f60718" autocomplete="off">
+                  <button type="button" class="btn btn-secondary" data-action="gen-web-base-path"
+                          data-i18n="settings.externalGenerate">Generate new</button>
+                </div>
+              </div>
+              <div class="form-group">
+                <label data-i18n="settings.externalBaUser">Basic-auth login</label>
+                <input type="text" id="s-ba-user" placeholder="admin" autocomplete="off">
+              </div>
+              <div class="form-group">
+                <label data-i18n="settings.externalBaPass">Basic-auth password (leave blank to keep)</label>
+                <div class="input-group">
+                  <input type="password" id="s-ba-pass" placeholder="••••••••" autocomplete="new-password">
+                  <button type="button" class="btn-eye" data-action="toggle-pw" data-target="s-ba-pass" aria-label="Toggle visibility">👁</button>
+                </div>
+              </div>
+            </div>
+            <button class="btn btn-primary mt-2" data-action="save-external-access" data-i18n="settings.externalSave">Apply</button>
+            <div id="external-access-msg" class="msg-inline hidden"></div>
+            <div id="external-access-url" class="msg-inline hidden"></div>
+          </div>
+        </div>
+
         <!-- Probe Secret card -->
         <div class="card">
           <div class="card-header" data-i18n="settings.probeSecretTitle">Probe Resistance Secret</div>

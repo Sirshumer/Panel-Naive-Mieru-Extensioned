@@ -240,6 +240,10 @@ function handleDelegatedClick(e) {
     case 'apply-probe-mode':     applyProbeMode(); break;
     case 'change-cascade':       changeCascade(); break;
     case 'cascade-status':       checkCascadeStatus(); break;
+    // ── v1.4.0: external panel access
+    case 'gen-web-base-path':    generateWebBasePath(); break;
+    case 'save-external-access': saveExternalAccess(); break;
+    case 'toggle-external-fields': toggleExternalFields(); break;
 
     // ── Monitoring
     case 'refresh-stats':    refreshStats(); break;
@@ -801,6 +805,24 @@ async function loadSettings() {
         ? '••••••• (set — leave blank to keep)'
         : (cascadeMieruPassEl.placeholder || 'password');
     }
+    // v1.4.0: external panel access fields
+    const exposeBox = el('s-expose-enabled');
+    if (exposeBox) exposeBox.checked = cfg.exposePanel === true;
+    const pdEl = el('s-panel-domain');
+    if (pdEl) pdEl.value = cfg.panelDomain || '';
+    const wbpEl = el('s-web-base-path');
+    if (wbpEl) wbpEl.value = cfg.webBasePath || '';
+    const baUserEl = el('s-ba-user');
+    if (baUserEl) baUserEl.value = cfg.panelBasicAuthUser || 'admin';
+    const baPassEl = el('s-ba-pass');
+    if (baPassEl) {
+      baPassEl.value = '';
+      baPassEl.placeholder = cfg.panelBasicAuthSet
+        ? '••••••• (set — leave blank to keep)'
+        : (t('settings.externalBaPassPlaceholder') || 'Set a basic-auth password');
+    }
+    toggleExternalFields();
+
     // Bug A (v1.3.2): keep all three version displays in sync.
     {
       const verStr = `v${cfg.version || '1.2.4'}`;
@@ -810,6 +832,65 @@ async function loadSettings() {
       });
     }
   } catch {}
+}
+
+// ── v1.4.0: external panel access UI ──────────────────────────────────────────
+function toggleExternalFields() {
+  const on = el('s-expose-enabled') && el('s-expose-enabled').checked;
+  const box = el('external-fields');
+  if (box) box.style.opacity = on ? '1' : '0.5';
+  ['s-panel-domain', 's-web-base-path', 's-ba-user', 's-ba-pass'].forEach(id => {
+    const e = el(id); if (e) e.disabled = !on;
+  });
+}
+
+async function generateWebBasePath() {
+  try {
+    const r = await api('GET', '/api/panel/webbasepath/generate');
+    if (el('s-web-base-path')) el('s-web-base-path').value = r.webBasePath || '';
+    toast(t('settings.externalGenerated') || 'New webBasePath generated — click Apply to save', 'info');
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+async function saveExternalAccess() {
+  const enabled = !!(el('s-expose-enabled') && el('s-expose-enabled').checked);
+  const body = { enabled };
+  if (enabled) {
+    body.panelDomain   = (el('s-panel-domain') ? el('s-panel-domain').value : '').trim();
+    body.webBasePath   = (el('s-web-base-path') ? el('s-web-base-path').value : '').trim();
+    body.basicAuthUser = (el('s-ba-user') ? el('s-ba-user').value : '').trim();
+    const pass = el('s-ba-pass') ? el('s-ba-pass').value : '';
+    if (pass) body.basicAuthPass = pass;     // omit → keep existing hash
+    if (!body.panelDomain) return showMsg('external-access-msg', t('settings.externalNeedDomain') || 'Panel subdomain is required', false);
+  } else {
+    if (!confirm(t('settings.externalDisableConfirm') || 'Disable external access? The panel will be reachable only via SSH tunnel.')) return;
+  }
+  const btn = document.querySelector('[data-action="save-external-access"]');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await api('POST', '/api/panel/external-access', body);
+    if (res.exposePanel && res.url) {
+      showMsg('external-access-msg', t('settings.externalApplied') || 'External access applied ✓', true);
+      const urlEl = el('external-access-url');
+      if (urlEl) {
+        urlEl.classList.remove('hidden');
+        urlEl.innerHTML = `<strong>URL:</strong> <a href="${esc(res.url)}" target="_blank" rel="noopener">${esc(res.url)}</a>`
+          + (res.webBasePathChanged ? `<br><span style="color:var(--yellow)">⚠ ${esc(res.warning || 'webBasePath changed — open the new URL; the old path now shows the stub.')}</span>` : '');
+      }
+      if (el('s-ba-pass')) el('s-ba-pass').value = '';
+      toast(t('settings.externalApplied') || 'External access applied', 'success');
+    } else {
+      showMsg('external-access-msg', t('settings.externalDisabled') || 'External access disabled (SSH-only) ✓', true);
+      const urlEl = el('external-access-url'); if (urlEl) urlEl.classList.add('hidden');
+      toast(t('settings.externalDisabled') || 'External access disabled', 'info');
+    }
+    state.config = await api('GET', '/api/config');
+  } catch (err) {
+    showMsg('external-access-msg', err.message || 'Failed to apply', false);
+    toast(err.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
 }
 
 async function changeNaivePort() {
