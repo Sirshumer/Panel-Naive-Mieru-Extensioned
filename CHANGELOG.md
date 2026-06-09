@@ -7,6 +7,57 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.5] — Audit 2026-06-09 (user-create double-submit: definitive fix — false "Email already in use")
+
+Follow-up to v1.4.4. The v1.4.4 fix coalesced concurrent requests via an
+in-flight map, but two rapid HTTP POSTs (double-click / Enter+click) do **not**
+overlap at the JS level — Node drains microtasks between socket events, so
+request #1 fully completes (INSERT + in-flight cleanup) before request #2's
+handler even starts. The in-flight map therefore never caught them, and the
+**email pre-check ran first**, so the replay saw the row #1 just inserted and
+returned a false `Email already in use` (the user IS created — visible after F5).
+
+Update with one command:
+
+```
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+### Fixed
+
+- **BUG-149 (race — false "Email already in use" / "Username already exists" while the user IS created).**
+  - **Idempotent double-submit at the response level.** When the username already
+    exists, the route now compares the submitted password against the stored
+    `passHash`: a **match** means this is the same submit replayed (a double-click)
+    → return the existing user as **200 success** (`idempotent:true`), not an
+    error. A **mismatch** means a genuine clash with a different, pre-existing
+    user → real `409 Username already exists`. A double-submit always carries the
+    identical password the user just typed, so this reliably distinguishes the two
+    without masking real collisions.
+  - **In-flight coalesce check now runs BEFORE any duplicate gate** (username AND
+    email), so a truly-concurrent twin still coalesces onto the same promise.
+  - **Email is optional (business note only):** users can be created with no email
+    at all (`NULL`, exempt from `UNIQUE`); a non-empty email is rejected **only**
+    when it belongs to a *different* existing user — never against the row this
+    same submit just created.
+  - **Frontend (unchanged from v1.4.4, still in force):** `saveUser()` re-entrancy
+    guard + disabled Save button during the request; `await loadUsers()`
+    auto-refreshes the list so the new user appears with **no manual F5** and no
+    error toast on success.
+  - **Verified LIVE** against the real server (`tests/live-race-bug149.sh`):
+    A) email double-submit → 201 + 200(idempotent), 1 row, no false error;
+    B) no-email double-submit → 201 + 200, 1 row;
+    C) genuine duplicate email (other user) → 409;
+    D) genuine duplicate username, different password → 409.
+
+- **BUG-143 (UI version desync).** Carried forward from v1.4.4: `readPanelVersion()`
+  reads the live version (`/etc/rixxx-panel/version` → bundled `VERSION` →
+  config.json → fallback) and is served by `/api/status` and `/api/config`, so
+  every release the version in the UI (sidebar/topbar/about) updates automatically
+  after `update.sh` with no manual edits or re-login.
+
+---
+
 ## [v1.4.4] — Audit 2026-06-09 (user-create double-submit race + UI version desync)
 
 Follow-up to v1.4.3. Update with one command:
