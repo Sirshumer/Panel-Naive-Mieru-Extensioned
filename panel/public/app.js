@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.4.3
+ * Panel Naive + Mieru — Frontend Application v1.4.4
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  * v1.2.5: probe-secret setting, disabled-button+spinner on all submit handlers,
@@ -603,7 +603,12 @@ function openEditUser(id) {
 
 function closeUserModal() { el('user-modal').classList.add('hidden'); }
 
+let _savingUser = false;   // Bug 149 (race): re-entrancy guard against double-submit
 async function saveUser() {
+  // Bug 149: if a save is already in flight (double-click, Enter+click, etc.),
+  // ignore the extra invocation entirely so we never fire two POST /api/users.
+  if (_savingUser) return;
+
   const id       = el('user-id').value;
   const username = el('u-username').value.trim();
   const email    = el('u-email').value.trim();
@@ -624,6 +629,7 @@ async function saveUser() {
 
   // v1.2.5: disabled-button + spinner pattern
   const saveBtn = el('btn-save-user');
+  _savingUser = true;
   setBtnBusy(saveBtn, true);
 
   try {
@@ -641,10 +647,13 @@ async function saveUser() {
       }
     }
     closeUserModal();
-    loadUsers();
+    // Bug 149: refresh the list from the server so the new user appears without
+    // a manual F5 (await so any error here is surfaced, not swallowed).
+    await loadUsers();
   } catch (err) {
     showUserError(err.message);
   } finally {
+    _savingUser = false;
     setBtnBusy(saveBtn, false);
   }
 }

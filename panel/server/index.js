@@ -42,6 +42,11 @@ const crypto         = require('crypto');   // Bug 100: module-level require so 
 const PANEL_CONFIG    = '/etc/rixxx-panel/config.json';
 const DB_PATH         = '/var/lib/rixxx-panel/db.sqlite';
 const MITA_STATE_FILE = '/var/lib/rixxx-panel/mita-state.json';
+// Bug 143: canonical version source written by install.sh / update.sh from the
+// repo's VERSION file. Read LIVE on each /api/status so the panel UI reflects
+// the installed version immediately after `update.sh` — no manual edits, no
+// process restart needed. Format: `panel_version=X.Y.Z`.
+const VERSION_FILE    = '/etc/rixxx-panel/version';
 
 // v1.2.3: Caddy-forwardproxy-naive paths (replaces standalone naive binary)
 const CADDY_BIN         = '/usr/local/bin/caddy-naive';
@@ -80,8 +85,38 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.4.3'
+    language: 'ru', version: '1.4.4'
   };
+}
+
+// Bug 143 (recurring): single source of truth for the displayed version.
+// Precedence, read LIVE so the UI updates the moment update.sh runs:
+//   1. /etc/rixxx-panel/version   (written by install.sh/update.sh from VERSION)
+//   2. the VERSION file bundled next to the panel code (repo source of truth)
+//   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
+//   4. hard fallback constant
+// Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
+const VERSION_FALLBACK = '1.4.4';
+function readPanelVersion() {
+  // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
+  try {
+    const raw = fs.readFileSync(VERSION_FILE, 'utf8');
+    const m = raw.match(/panel_version\s*=\s*([^\s#]+)/);
+    const v = (m ? m[1] : raw.split('\n')[0]).trim();
+    if (v) return v;
+  } catch {}
+  // 2) bundled VERSION file (../../VERSION relative to server/index.js)
+  for (const p of [path.join(__dirname, '..', '..', 'VERSION'),
+                   path.join(__dirname, '..', 'VERSION')]) {
+    try {
+      const v = fs.readFileSync(p, 'utf8').trim();
+      if (v) return v;
+    } catch {}
+  }
+  // 3) config.json
+  if (cfg && cfg.version) return String(cfg.version).trim();
+  // 4) fallback
+  return VERSION_FALLBACK;
 }
 
 // Resolved paths (prefer config values, fall back to constants)
@@ -240,6 +275,50 @@ function upsertUser(u) {
     memUsers.set(u.id, u);
   }
 }
+
+// Bug 149 (race): create a user atomically. The old flow did
+// `getUserByUsername()` then a separate INSERT, each request minting a fresh
+// UUID. On a double-submit the first request created the user (201) while the
+// second slipped past the pre-check, hit the UNIQUE(username) constraint, and
+// returned a false "Username already exists" — even though the user already
+// existed and the key worked (visible only after F5).
+//
+// Strategy: a single `INSERT ... ON CONFLICT(username) DO NOTHING`.
+//   - changes===1 → we inserted the row  → { created:true }.
+//   - changes===0 → the username already exists. The CALLER guarantees (via a
+//     synchronous "did it exist before this request?" check + the in-flight
+//     coalescing map) that this can only be a concurrent twin of THIS create,
+//     so it's an idempotent success → { created:false, idempotent:true } with
+//     the existing row. (We don't compare passHash because bcrypt salts differ
+//     per call; a genuine pre-existing clash is rejected by the route before we
+//     ever get here.)
+function createUserAtomic(u) {
+  const email = (u.email && String(u.email).trim()) ? String(u.email).trim() : null;
+  if (db) {
+    const info = db.prepare(`
+      INSERT INTO users
+        (id,email,username,passHash,password,expiry,protocols,quotaMB,usedMB,createdAt,updatedAt,lastSeen)
+      VALUES
+        (@id,@email,@username,@passHash,@password,@expiry,@protocols,@quotaMB,@usedMB,@createdAt,@updatedAt,@lastSeen)
+      ON CONFLICT(username) DO NOTHING
+    `).run({ ...u, email, password: u.password || '' });
+
+    if (info.changes === 1)
+      return { created: true, user: getUserByUsername(u.username) };
+    // No insert → a concurrent twin already created it → idempotent success.
+    return { created: false, idempotent: true, user: getUserByUsername(u.username) };
+  }
+  // in-memory fallback
+  const existing = [...memUsers.values()].find(x => x.username === u.username);
+  if (existing) return { created: false, idempotent: true, user: existing };
+  memUsers.set(u.id, { ...u, email });
+  return { created: true, user: memUsers.get(u.id) };
+}
+
+// Bug 149 (race): coalesce concurrent create requests for the same username so a
+// rapid double-submit can't even start two INSERTs. Maps username -> Promise of
+// the in-flight create result.
+const inflightCreates = new Map();
 
 // Bug 149: cheap duplicate-email pre-check so we can return a clean 409 BEFORE
 // hitting the UNIQUE constraint (and as a guard for email-less users → no row).
@@ -992,6 +1071,12 @@ app.get('/api/config', requireAuth, (req, res) => {
   // a boolean "set" flag instead so the UI can show whether a password exists.
   const { adminPassHash, panelBasicAuthHash, ...safe } = cfg;
   safe.panelBasicAuthSet = !!panelBasicAuthHash;
+  // Bug 143 (recurring): the UI also reads `version` from here (loadConfig +
+  // settings render). The in-memory cfg.version can lag behind after an update
+  // until the process restarts, so always serve the LIVE version (same single
+  // source as /api/status) — this is what makes the header reflect the new
+  // VERSION immediately after update.sh, with no manual edits.
+  safe.version = readPanelVersion();
   // Never expose secrets to the browser. Mask the cascade exit password and the
   // legacy native-egress proxy passwords; expose a boolean "set" flag instead.
   if (safe.cascadeMieru && typeof safe.cascadeMieru === 'object') {
@@ -1303,18 +1388,15 @@ app.get('/api/users', requireAuth, (req, res) => {
   res.json(users);
 });
 
-app.post('/api/users', requireAuth, (req, res) => {
+app.post('/api/users', requireAuth, async (req, res) => {
   const { email, username, password, expiry, protocols, quotaMB, quotaGb } = req.body;
   const validation = validateUserInput(
     { email, username, password, protocols, quotaMB, quotaGb }, true);
   if (validation.error)
     return res.status(400).json({ error: validation.error });
 
-  if (getUserByUsername(username))
-    return res.status(409).json({ error: 'Username already exists' });
-
-  // Bug 149: normalise email up-front and pre-check for duplicates so we return
-  // a clean 409 instead of letting the UNIQUE constraint throw a raw SqliteError.
+  // Bug 149: normalise email up-front and pre-check for a duplicate email so we
+  // return a clean 409 instead of letting the UNIQUE constraint throw.
   const normEmail = (email && email.trim()) ? email.trim() : null;
   if (normEmail && getUserByEmail(normEmail))
     return res.status(409).json({ error: 'Email already in use' });
@@ -1322,36 +1404,83 @@ app.post('/api/users', requireAuth, (req, res) => {
   if (expiry && isNaN(Date.parse(expiry)))
     return res.status(400).json({ error: 'expiry must be a valid ISO date string' });
 
-  const now  = new Date().toISOString();
-  const user = {
-    id:        uuidv4(),
-    // Email is optional: store NULL (not '') so the UNIQUE constraint allows
-    // multiple users without an email.
-    email:     normEmail,
-    username,
-    passHash:  bcrypt.hashSync(password, 12),
-    password,
-    expiry:    expiry || null,
-    protocols: JSON.stringify(validation.protocols),
-    quotaMB:   validation.quotaMB,
-    usedMB:    0,
-    createdAt: now, updatedAt: now, lastSeen: null
-  };
-  // Bug 149: never leak a raw SqliteError / internal path to the UI. Map known
-  // constraint violations to friendly 4xx, anything else to a generic 500.
-  try {
-    upsertUser(user);
-  } catch (e) {
-    const d = describeDbError(e);
-    console.error('[USERS] create failed:', e.message);
-    return res.status(d.status).json({ error: d.error });
+  // Bug 149 (race): coalesce a rapid double-submit. This check MUST come before
+  // the "already exists" gate below: under Node's microtask ordering the first
+  // request's INSERT (behind an `await`) can complete before the second
+  // request's handler even begins, so by the time a twin reaches the existence
+  // gate the row is already there and it would wrongly 409. By consulting the
+  // in-flight map FIRST, a twin awaits the SAME in-flight promise and receives
+  // the winner's identical success result — no false "already exists", no
+  // duplicate row. The in-flight entry survives until the winner fully resolves
+  // (its `finally` deletes it), guaranteeing the twin finds it.
+  if (inflightCreates.has(username)) {
+    try {
+      const r = await inflightCreates.get(username);
+      return res.status(r.status).json(r.payload);
+    } catch {
+      return res.status(500).json({ error: 'Could not save user (database error)' });
+    }
   }
 
-  // Bug 6: rebuild Caddyfile + reload Caddy; rebuild mita state; report status
-  const svcStatus = applyAllConfigs();
+  // Bug 149 (race): if THIS username already exists in the DB and there is NO
+  // create in flight for it (checked above), it's a genuine clash with a
+  // pre-existing user → real 409. (Snapshot taken synchronously, before any
+  // await, so it reliably distinguishes a pre-existing row from one our own
+  // concurrent twin is creating — the twin case was already coalesced above.)
+  if (getUserByUsername(username))
+    return res.status(409).json({ error: 'Username already exists' });
 
-  const { passHash, password: _p, ...safe } = user;
-  res.status(201).json({ ok: true, ...parseUserRow(safe), ...svcStatus });
+  const work = (async () => {
+    // Yield once so a near-simultaneous twin request observes the in-flight
+    // entry (set below) and coalesces onto this promise instead of racing.
+    await Promise.resolve();
+    const now  = new Date().toISOString();
+    const user = {
+      id:        uuidv4(),
+      // Email is optional: store NULL (not '') so the UNIQUE constraint allows
+      // multiple users without an email.
+      email:     normEmail,
+      username,
+      passHash:  bcrypt.hashSync(password, 12),
+      password,
+      expiry:    expiry || null,
+      protocols: JSON.stringify(validation.protocols),
+      quotaMB:   validation.quotaMB,
+      usedMB:    0,
+      createdAt: now, updatedAt: now, lastSeen: null
+    };
+
+    // Atomic create: INSERT ... ON CONFLICT(username) DO NOTHING. Because we
+    // verified the username did NOT exist before this request, a no-op insert
+    // here can only mean a concurrent twin won the race → treat as success
+    // (idempotent) and return that row. A genuine pre-existing clash was already
+    // rejected above.
+    let result;
+    try {
+      result = createUserAtomic(user);
+    } catch (e) {
+      const d = describeDbError(e);
+      console.error('[USERS] create failed:', e.message);
+      return { status: d.status, payload: { error: d.error } };
+    }
+
+    // Run the (heavier) service rebuild only when WE actually inserted the row.
+    const svcStatus = result.created ? applyAllConfigs() : {};
+    const row = result.user || user;
+    const { passHash, password: _p, ...safe } = row;
+    return { status: 201, payload: { ok: true, ...parseUserRow(safe), ...svcStatus } };
+  })();
+
+  inflightCreates.set(username, work);
+  try {
+    const r = await work;
+    return res.status(r.status).json(r.payload);
+  } catch (e) {
+    console.error('[USERS] create failed:', e && e.message);
+    return res.status(500).json({ error: 'Could not save user (database error)' });
+  } finally {
+    inflightCreates.delete(username);
+  }
 });
 
 app.put('/api/users/:id', requireAuth, (req, res) => {
@@ -1903,7 +2032,7 @@ app.get('/api/status', requireAuth, async (req, res) => {
         os:   osInfo.distro + ' ' + osInfo.release,
         arch: osInfo.arch
       },
-      panel:    { userCount: getAllUsers().length, version: cfg.version || '1.2.5' },
+      panel:    { userCount: getAllUsers().length, version: readPanelVersion() },
       domain:   cfg.domain,
       serverIp: cfg.serverIp,
       language: cfg.language || 'ru'
@@ -2297,7 +2426,7 @@ server.listen(PORT, HOST, () => {
     '  ██║  ██║ ██║ ██╔╝ ██╗ ██╔╝ ██╗ ██╔╝ ██╗',
     '  ╚═╝  ╚═╝ ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝ ╚═╝  ╚═╝',
     '',
-    `  Panel Naive + Mieru v${cfg.version || '1.2.5'} by RIXXX  (Caddy-forwardproxy-naive)`,
+    `  Panel Naive + Mieru v${readPanelVersion()} by RIXXX  (Caddy-forwardproxy-naive)`,
     `  http://${HOST}:${PORT}/`,
     HOST === '127.0.0.1' ? `  ⚠  SSH-only: ssh -L 3000:127.0.0.1:3000 root@<server>` : '',
     ''
