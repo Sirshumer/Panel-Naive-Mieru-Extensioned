@@ -85,7 +85,7 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.4.4'
+    language: 'ru', version: '1.4.5'
   };
 }
 
@@ -96,7 +96,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.4.4';
+const VERSION_FALLBACK = '1.4.5';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -1395,24 +1395,23 @@ app.post('/api/users', requireAuth, async (req, res) => {
   if (validation.error)
     return res.status(400).json({ error: validation.error });
 
-  // Bug 149: normalise email up-front and pre-check for a duplicate email so we
-  // return a clean 409 instead of letting the UNIQUE constraint throw.
   const normEmail = (email && email.trim()) ? email.trim() : null;
-  if (normEmail && getUserByEmail(normEmail))
-    return res.status(409).json({ error: 'Email already in use' });
 
   if (expiry && isNaN(Date.parse(expiry)))
     return res.status(400).json({ error: 'expiry must be a valid ISO date string' });
 
-  // Bug 149 (race): coalesce a rapid double-submit. This check MUST come before
-  // the "already exists" gate below: under Node's microtask ordering the first
-  // request's INSERT (behind an `await`) can complete before the second
-  // request's handler even begins, so by the time a twin reaches the existence
-  // gate the row is already there and it would wrongly 409. By consulting the
-  // in-flight map FIRST, a twin awaits the SAME in-flight promise and receives
-  // the winner's identical success result — no false "already exists", no
-  // duplicate row. The in-flight entry survives until the winner fully resolves
-  // (its `finally` deletes it), guaranteeing the twin finds it.
+  // Bug 149 (race, v1.4.5): coalesce a rapid double-submit BEFORE any duplicate
+  // gate. This is critical and must be the very first thing after validation:
+  // under Node's microtask ordering the FIRST request's INSERT (behind an
+  // `await`) completes before the SECOND request's handler even begins. So if
+  // we ran ANY synchronous duplicate check first (username OR email), the twin
+  // would see the row the first request just inserted and wrongly 409 — that
+  // was the "Email already in use" symptom: the email pre-check fired before
+  // the in-flight check. By consulting the in-flight map FIRST (keyed by
+  // username), the twin awaits the SAME promise and gets the winner's identical
+  // success — no false error, no duplicate row. The entry survives until the
+  // winner fully resolves (its `finally` deletes it), so the twin always finds
+  // it.
   if (inflightCreates.has(username)) {
     try {
       const r = await inflightCreates.get(username);
@@ -1422,13 +1421,37 @@ app.post('/api/users', requireAuth, async (req, res) => {
     }
   }
 
-  // Bug 149 (race): if THIS username already exists in the DB and there is NO
-  // create in flight for it (checked above), it's a genuine clash with a
-  // pre-existing user → real 409. (Snapshot taken synchronously, before any
-  // await, so it reliably distinguishes a pre-existing row from one our own
-  // concurrent twin is creating — the twin case was already coalesced above.)
-  if (getUserByUsername(username))
+  // Bug 149 (v1.4.5): idempotent double-submit handling. Two rapid HTTP POSTs
+  // (double-click / Enter+click) do NOT overlap at the JS level — Node drains
+  // microtasks between socket events, so request #1 fully completes (INSERT +
+  // in-flight cleanup) before request #2's handler even starts. The in-flight
+  // map alone therefore can't catch them, and #2 would see the row #1 just
+  // created and wrongly 409. So when the username already exists we decide:
+  //   • password matches the stored hash  → this is the SAME submit replayed
+  //     (a double-submit) → idempotent SUCCESS, return the existing user (200).
+  //   • password differs                  → a genuine clash with a different,
+  //     pre-existing user → real 409 "Username already exists".
+  // This satisfies "повторный/двойной клик не плодит ошибку" without masking a
+  // real collision. (A double-submit always carries the identical password the
+  // user just typed; a different user would have a different password.)
+  const existingByName = getUserByUsername(username);
+  if (existingByName) {
+    const samePassword = password && existingByName.passHash &&
+      bcrypt.compareSync(password, existingByName.passHash);
+    if (samePassword) {
+      const { passHash, password: _p, ...safe } = existingByName;
+      return res.status(200).json({ ok: true, idempotent: true, ...parseUserRow(safe) });
+    }
     return res.status(409).json({ error: 'Username already exists' });
+  }
+  // Email is optional and used only as a note. Only reject when the email
+  // belongs to a DIFFERENT, already-existing user — never when empty (NULL is
+  // exempt from UNIQUE). A same-submit replay was already handled above.
+  if (normEmail) {
+    const emailOwner = getUserByEmail(normEmail);
+    if (emailOwner && emailOwner.username !== username)
+      return res.status(409).json({ error: 'Email already in use' });
+  }
 
   const work = (async () => {
     // Yield once so a near-simultaneous twin request observes the in-flight

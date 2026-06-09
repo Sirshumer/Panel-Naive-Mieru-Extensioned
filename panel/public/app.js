@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.4.4
+ * Panel Naive + Mieru — Frontend Application v1.4.5
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  * v1.2.5: probe-secret setting, disabled-button+spinner on all submit handlers,
