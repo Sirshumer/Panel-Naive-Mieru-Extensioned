@@ -594,6 +594,15 @@ img { max-width: 100%; display: block; }
   color: var(--accent);
 }
 
+/* v1.4.0: input + inline button / eye-toggle layout */
+.input-with-btn, .input-group {
+  display: flex;
+  gap: 8px;
+  align-items: stretch;
+}
+.input-with-btn input, .input-group input { flex: 1 1 auto; min-width: 0; }
+.input-with-btn .btn, .input-group .btn { flex: 0 0 auto; white-space: nowrap; }
+
 /* Ghost */
 .btn-ghost {
   background: transparent;

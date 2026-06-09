@@ -97,6 +97,8 @@ FORCE=false
 YES=false
 MODE=""
 EXPOSE_DOMAIN=""
+PANEL_BA_PASS_FLAG=""
+WEB_BASE_PATH_FLAG=""
 
 # ── Parse args ────────────────────────────────────────────────────────────────
 parse_args() {
@@ -106,6 +108,8 @@ parse_args() {
       --force)     FORCE=true ;;
       -y|--yes)    YES=true ;;
       --expose)    MODE="expose"; EXPOSE_DOMAIN="${2:-}"; shift ;;
+      --panel-ba-pass) PANEL_BA_PASS_FLAG="${2:-}"; shift ;;
+      --web-base-path) WEB_BASE_PATH_FLAG="${2:-}"; shift ;;
       --ssh-only)  MODE="ssh-only" ;;
       --status)    MODE="status" ;;
       --repair)    MODE="repair" ;;
@@ -138,8 +142,13 @@ OPTIONS:
   --dry-run              Show what would be done without making changes
   --force                Force update even if already on latest version
   -y / --yes             Non-interactive (auto-confirm all prompts)
-  --expose <domain>      Switch panel to public mode on :8080
-  --ssh-only             Switch panel back to SSH-tunnel-only (127.0.0.1:3000)
+  --expose <panel-domain> Enable EXTERNAL access via a TLS subdomain
+                          (https://panel-domain/<webBasePath>/, basic_auth, stub root).
+                          Panel stays loopback-only; Caddy reverse_proxies to it.
+  --panel-ba-pass <pass>  (with --expose) set basic-auth password (else auto-generated)
+  --web-base-path <hex>   (with --expose) set a custom webBasePath (else random 16-hex)
+  --ssh-only              Switch panel back to SSH-tunnel-only (127.0.0.1:3000),
+                          remove the panel block, close any legacy bare port
   --status               Print full health report
   --repair               Rebuild Caddyfile + mita config from SQLite DB; restart services
   --help                 Show this help
@@ -150,7 +159,7 @@ EXAMPLES:
   bash update.sh --force -y        # Force update, non-interactive
   bash update.sh --status          # Health check
   bash update.sh --repair          # Fix broken installation
-  bash update.sh --expose vpn.example.com
+  bash update.sh --expose panel.example.com
   bash update.sh --ssh-only        # Revert to SSH-only
 EOF
 }
@@ -187,6 +196,77 @@ load_config() {
   CADDY_FILE=$(jq -r '.caddyFile   // "/etc/caddy-naive/Caddyfile"' "$PANEL_CONFIG")
   CADDY_CONFIG_DIR=$(jq -r '.caddyConfigDir // "/etc/caddy-naive"'  "$PANEL_CONFIG")
   FAKE_SITE_DIR=$(jq -r '.fakeSiteDir   // "/var/www/fake-site"'    "$PANEL_CONFIG")
+  # v1.4.0: external panel access
+  PANEL_DOMAIN=$(jq -r '.panelDomain // ""'            "$PANEL_CONFIG")
+  WEB_BASE_PATH=$(jq -r '.webBasePath // ""'           "$PANEL_CONFIG")
+  PANEL_BA_USER=$(jq -r '.panelBasicAuthUser // ""'    "$PANEL_CONFIG")
+  PANEL_STUB_PAGE=$(jq -r '.panelStubPage // "/var/www/panel-stub/index.html"' "$PANEL_CONFIG")
+}
+
+# ── v1.4.0: helpers for external panel access (update.sh) ─────────────────────
+gen_web_base_path() { openssl rand -hex 8 2>/dev/null | tr -d '\n'; }
+
+panel_hash_password() {
+  local plain="$1" hash="" cb="${CADDY_BIN:-/usr/local/bin/caddy-naive}"
+  if [[ -x "$cb" ]]; then
+    hash=$(printf '%s' "$plain" | "$cb" hash-password 2>/dev/null | tr -d '\n') || true
+  fi
+  if [[ -z "$hash" ]] && command -v caddy &>/dev/null; then
+    hash=$(printf '%s' "$plain" | caddy hash-password 2>/dev/null | tr -d '\n') || true
+  fi
+  if [[ -z "$hash" ]]; then
+    command -v htpasswd &>/dev/null || \
+      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2-utils 2>/dev/null || true
+    hash=$(htpasswd -bnBC 12 "" "$plain" 2>/dev/null | tr -d ':\n' | sed 's/^[^$]*//')
+  fi
+  printf '%s' "$hash"
+}
+
+# Ensure the panel-stub static page exists (idempotent). Used by expose + repair.
+ensure_panel_stub() {
+  local stub="${PANEL_STUB_PAGE:-/var/www/panel-stub/index.html}"
+  local dir; dir="$(dirname "$stub")"
+  [[ -f "$stub" ]] && return 0
+  mkdir -p "$dir"
+  local asset="${PANEL_DIR}/assets/panel-stub.html"
+  if [[ -f "$asset" ]]; then
+    cp "$asset" "$stub"
+  else
+    cat > "$stub" <<'STUBHTML'
+<!DOCTYPE html><html><head><meta charset="utf-8"><title>Syncing</title><style>body{background:#080808;height:100vh;margin:0;display:flex;flex-direction:column;align-items:center;justify-content:center;font-family:sans-serif}.grid{width:60px;height:60px;position:relative;margin-bottom:25px}.cube{width:18px;height:18px;background:#fff;position:absolute;animation:rotate 2s infinite ease-in-out}.cube:nth-child(1){top:0;left:0;animation-delay:0s}.cube:nth-child(2){top:0;right:0;animation-delay:0.2s}.cube:nth-child(3){bottom:0;right:0;animation-delay:0.4s}.cube:nth-child(4){bottom:0;left:0;animation-delay:0.6s}@keyframes rotate{0%,100%{transform:scale(1) rotate(0deg);opacity:1}50%{transform:scale(0.5) rotate(180deg);opacity:0.3}}.t{color:#555;font-size:13px;letter-spacing:3px;font-weight:600}</style></head><body><div class="grid"><div class="cube"></div><div class="cube"></div><div class="cube"></div><div class="cube"></div></div><div class="t">CONNECTION</div></body></html>
+STUBHTML
+  fi
+  chmod 644 "$stub" 2>/dev/null || true
+}
+
+# Update one or more fields in config.json via node (UTF-8-safe, env-var data
+# channel — Bug 101). Usage: cfg_set_json KEY1 VAL1 [KEY2 VAL2 ...]
+# Values prefixed with "bool:" are written as booleans; "int:" as integers.
+cfg_set_json() {
+  [[ -f "$PANEL_CONFIG" ]] || return 1
+  # Separate fields with the ASCII Record Separator (0x1e). Unlike NUL, bash
+  # preserves it through command substitution, and it can't appear in our keys/
+  # values (domains, hex, bcrypt hashes). Values are still pure DATA in the env
+  # var — never interpolated into the JS source (Bug 101).
+  local sep=$'\x1e' joined="" first=1 a
+  for a in "$@"; do
+    if [[ $first -eq 1 ]]; then joined="$a"; first=0; else joined="${joined}${sep}$a"; fi
+  done
+  CFG_FILE="$PANEL_CONFIG" CFG_PAIRS="$joined" node -e '
+    const fs = require("fs");
+    const file = process.env.CFG_FILE;
+    const cfg = JSON.parse(fs.readFileSync(file, "utf8"));
+    const parts = (process.env.CFG_PAIRS || "").split("\u001e");
+    for (let i = 0; i + 1 < parts.length; i += 2) {
+      let k = parts[i], v = parts[i + 1];
+      if (v.startsWith("bool:"))      cfg[k] = (v.slice(5) === "1" || v.slice(5) === "true");
+      else if (v.startsWith("int:"))  cfg[k] = parseInt(v.slice(4), 10) || 0;
+      else                            cfg[k] = v;
+    }
+    const tmp = file + ".new";
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+  ' 2>/dev/null
 }
 
 # ── Bug 81: config migration ──────────────────────────────────────────────────
@@ -208,6 +288,68 @@ migrate_config() {
     fi
     rm -f "$tmp"
   fi
+
+  # v1.4.0: backward-compatible defaults for the external-access fields. Old
+  # installs (no panelDomain/webBasePath/…) stay SSH-only (exposePanel=false) —
+  # the operator explicitly enables external access via --expose or the UI.
+  local has_wbp; has_wbp=$(jq -r 'has("webBasePath")' "$PANEL_CONFIG" 2>/dev/null)
+  if [[ "$has_wbp" != "true" ]]; then
+    local tmp2; tmp2=$(mktemp)
+    if jq '
+        .panelHost          = "127.0.0.1"
+      | .panelPort          = (.panelPort // 3000)
+      | .panelDomain        = (.panelDomain // "")
+      | .panelBasicAuthUser = (.panelBasicAuthUser // "")
+      | .panelBasicAuthHash = (.panelBasicAuthHash // "")
+      | .webBasePath        = (.webBasePath // "")
+      | .panelStubPage      = (.panelStubPage // "/var/www/panel-stub/index.html")
+      | .exposePanel        = (if (.panelDomain // "") == "" then false else (.exposePanel // false) end)
+    ' "$PANEL_CONFIG" > "$tmp2" 2>/dev/null && [[ -s "$tmp2" ]]; then
+      cat "$tmp2" > "$PANEL_CONFIG"
+      log_info "Config migrated: external-access fields added (SSH-only default) ✓"
+    fi
+    rm -f "$tmp2"
+  fi
+}
+
+# ── v1.4.0: migrate away from the legacy bare panel port (8080) ───────────────
+# Old installs may have opened 0.0.0.0:8080 and/or a UFW rule for the panel.
+# This MUST NOT break access: we close 8080, force the panel back to loopback,
+# and (if it was relying on 8080) leave it in the safe SSH-only default. The
+# operator then explicitly re-enables external access via --expose / the UI.
+migrate_close_legacy_8080() {
+  local changed=0
+  # 1) UFW: drop any 8080 rule.
+  if command -v ufw &>/dev/null; then
+    if ufw status 2>/dev/null | grep -qE '(^|[^0-9])8080(/| )'; then
+      ufw delete allow 8080/tcp 2>/dev/null || true
+      ufw delete allow 8080 2>/dev/null || true
+      log_info "UFW: legacy 8080 rule removed ✓"
+      changed=1
+    fi
+  fi
+  # 2) Anything actually bound to 0.0.0.0:8080 → force panel loopback default.
+  if ss -tlnp 2>/dev/null | grep -qE '0\.0\.0\.0:8080|\*:8080|:::8080'; then
+    log_warn "Detected a service on 0.0.0.0:8080 — forcing panel to loopback (SSH-only)"
+    cfg_set_json panelHost "127.0.0.1" panelPort "int:3000" exposePanel "bool:0" || true
+    changed=1
+  fi
+  # 3) config.json legacy panelHost=0.0.0.0 → loopback.
+  if [[ -f "$PANEL_CONFIG" ]]; then
+    local ph; ph=$(jq -r '.panelHost // "127.0.0.1"' "$PANEL_CONFIG" 2>/dev/null)
+    if [[ "$ph" == "0.0.0.0" ]]; then
+      log_warn "config.json had panelHost=0.0.0.0 — switching to 127.0.0.1 (loopback)"
+      cfg_set_json panelHost "127.0.0.1" exposePanel "bool:0" || true
+      changed=1
+    fi
+  fi
+  [[ "$changed" == "1" ]] && {
+    log_info "Legacy 8080 migration applied. Panel is loopback-only; enable external"
+    log_info "  access with: bash update.sh --expose panel.<your-domain>"
+    # Re-launch panel on loopback if it was bound elsewhere.
+    PANEL_HOST=127.0.0.1 PANEL_PORT=3000 pm2 restart panel-naive-mieru --update-env 2>/dev/null || true
+  }
+  return 0
 }
 
 # ── Backup ────────────────────────────────────────────────────────────────────
@@ -404,7 +546,15 @@ if (fs.existsSync(TEMPLATE_JS)) {
     probeSecret,
     probeMode,
     logFile:     '/var/log/caddy-naive/access.log',
-    upstream:    (cfg.cascadeEnabled && cfg.cascadeNaiveUpstream) ? cfg.cascadeNaiveUpstream : ''
+    upstream:    (cfg.cascadeEnabled && cfg.cascadeNaiveUpstream) ? cfg.cascadeNaiveUpstream : '',
+    // v1.4.0: panel external-access subdomain block (TLS + basic_auth + webBasePath)
+    exposePanel:        !!cfg.exposePanel,
+    panelDomain:        cfg.panelDomain        || '',
+    panelBasicAuthUser: cfg.panelBasicAuthUser || '',
+    panelBasicAuthHash: cfg.panelBasicAuthHash || '',
+    webBasePath:        cfg.webBasePath        || '',
+    panelStubPage:      cfg.panelStubPage      || '/var/www/panel-stub/index.html',
+    panelPort:          cfg.panelPort          || 3000
   }, naiveUsers);
 } else {
   // Fallback (template not available): emit correct Bug 83 syntax directly
@@ -420,6 +570,25 @@ if (fs.existsSync(TEMPLATE_JS)) {
   if (probeMode === 'off') probeLine = '';
   else if (probeMode === 'secret' && probeSecret) probeLine = '\n    probe_resistance ' + probeSecret;
   else probeLine = '\n    probe_resistance';
+  // v1.4.0: panel external-access subdomain block (inline fallback)
+  let panelBlock = '';
+  {
+    const expose = !!cfg.exposePanel;
+    const pDom   = String(cfg.panelDomain || '').trim();
+    const baUser = String(cfg.panelBasicAuthUser || '').trim();
+    const baHash = String(cfg.panelBasicAuthHash || '').trim();
+    const stubF  = String(cfg.panelStubPage || '/var/www/panel-stub/index.html').trim();
+    const wbp    = String(cfg.webBasePath || '').trim().replace(/^\/+|\/+$/g, '').replace(/[^A-Za-z0-9._~-]/g, '');
+    const pPort  = parseInt(cfg.panelPort, 10) || 3000;
+    if (expose && pDom && wbp) {
+      const stubDir = stubF.replace(/\/[^/]*$/, '') || '/var/www/panel-stub';
+      let ba = '';
+      if (baUser && baHash) ba = '    basic_auth {\n      ' + baUser + ' ' + baHash + '\n    }\n';
+      panelBlock = '\n\n' + pDom + ' {\n  tls ' + (cfg.adminEmail || '') +
+        '\n\n  handle_path /' + wbp + '/* {\n' + ba + '    reverse_proxy 127.0.0.1:' + pPort +
+        '\n  }\n\n  handle {\n    root * ' + stubDir + '\n    file_server\n  }\n}\n';
+    }
+  }
   content = [
     '{',
     '  order forward_proxy before file_server',
@@ -455,7 +624,7 @@ if (fs.existsSync(TEMPLATE_JS)) {
     '    root ' + (cfg.fakeSiteDir || FAKE_SITE),
     '  }',
     '}'
-  ].join('\n');
+  ].join('\n') + panelBlock;
 }
 
 const tmp = CADDY_FILE + '.new';
@@ -950,6 +1119,24 @@ do_status() {
   fi
   echo ""
 
+  # v1.4.0: panel access mode
+  echo -e "${BOLD}Panel access:${NC}"
+  if [[ -f "$PANEL_CONFIG" ]]; then
+    local _exp _pd _wbp _stub
+    _exp=$(jq -r '.exposePanel // false' "$PANEL_CONFIG" 2>/dev/null)
+    _pd=$(jq -r '.panelDomain // ""'     "$PANEL_CONFIG" 2>/dev/null)
+    _wbp=$(jq -r '.webBasePath // ""'    "$PANEL_CONFIG" 2>/dev/null)
+    _stub=$(jq -r '.panelStubPage // "/var/www/panel-stub/index.html"' "$PANEL_CONFIG" 2>/dev/null)
+    if [[ "$_exp" == "true" && -n "$_pd" && -n "$_wbp" ]]; then
+      echo -e "  Mode: ${GREEN}EXTERNAL${NC} — https://${_pd}/${_wbp}/"
+    else
+      echo -e "  Mode: SSH-only (127.0.0.1:3000)"
+      [[ -n "$_pd" ]] && echo "  Saved panelDomain: $_pd (re-enable: bash update.sh --expose $_pd)"
+    fi
+    [[ -f "$_stub" ]] && echo "  Stub page: present ✓" || echo "  Stub page: MISSING ($_stub)"
+  fi
+  echo ""
+
   # Ports
   echo -e "${BOLD}Listening ports:${NC}"
   ss -tlnup 2>/dev/null | grep -E ":(443|80|8080|3000|20[0-9]{2})" | \
@@ -973,42 +1160,161 @@ do_status() {
   echo ""
 }
 
-# ── --expose mode ─────────────────────────────────────────────────────────────
+# ── --expose mode (v1.4.0) ────────────────────────────────────────────────────
+# Switch the panel to EXTERNAL access via a dedicated TLS subdomain. The panel
+# itself keeps listening on loopback (127.0.0.1:3000); Caddy reverse_proxies to
+# it behind basic_auth + a secret webBasePath. NO bare HTTP port is opened.
+#
+#   https://panel.<domain>/<webBasePath>/  → basic_auth → reverse_proxy 127.0.0.1:3000
+#   panel.<domain>/ and any other path     → static "CONNECTION" stub
+#
+# Idempotent: re-running with the same domain keeps the existing webBasePath and
+# basic-auth credentials, only regenerating the Caddyfile block from template.
 do_expose() {
-  log_step "Switching panel to public mode (expose)"
-  [[ -z "$EXPOSE_DOMAIN" ]] && die "--expose requires a domain argument"
+  log_step "Switching panel to EXTERNAL access (TLS subdomain)"
+  [[ -z "$EXPOSE_DOMAIN" ]] && die "--expose requires a panel-subdomain argument (e.g. --expose panel.example.com)"
 
-  $DRY_RUN && { log_dry "Would expose panel for domain $EXPOSE_DOMAIN"; return; }
+  $DRY_RUN && { log_dry "Would expose panel at https://$EXPOSE_DOMAIN/<webBasePath>/"; return; }
 
   auto_backup >/dev/null
 
-  jq --argjson v true '.exposePanel = $v' "$PANEL_CONFIG" > /tmp/cfg.tmp && \
-    mv /tmp/cfg.tmp "$PANEL_CONFIG"
+  # webBasePath: explicit --web-base-path wins; else preserve existing; else
+  # generate a fresh random 16-hex value on first enable.
+  local web_base_path="$WEB_BASE_PATH"
+  [[ -n "$WEB_BASE_PATH_FLAG" ]] && web_base_path="$WEB_BASE_PATH_FLAG"
+  [[ -z "$web_base_path" || "$web_base_path" == "null" ]] && web_base_path="$(gen_web_base_path)"
+  # Sanitize to a path-safe token (strip slashes / unsafe chars).
+  web_base_path="$(printf '%s' "$web_base_path" | sed 's#^/*##; s#/*$##; s#[^A-Za-z0-9._~-]##g')"
+  [[ -z "$web_base_path" ]] && web_base_path="$(gen_web_base_path)"
 
-  ufw allow 8080/tcp comment "Panel Web UI" 2>/dev/null || true
-  pm2 restart panel-naive-mieru 2>/dev/null || true
-  log_info "Panel accessible at http://$EXPOSE_DOMAIN:8080/ ✓"
+  # Basic-auth credentials. Keep an existing user; generate a password and hash
+  # only when none is stored yet (first enable). The plaintext is shown ONCE.
+  local ba_user="$PANEL_BA_USER" ba_pass="" ba_hash=""
+  [[ -z "$ba_user" || "$ba_user" == "null" ]] && ba_user="admin"
+  ba_hash=$(jq -r '.panelBasicAuthHash // ""' "$PANEL_CONFIG")
+  local ba_generated=0
+  if [[ -z "$ba_hash" || "$ba_hash" == "null" ]]; then
+    if [[ -n "${PANEL_BA_PASS_FLAG:-}" ]]; then
+      ba_pass="$PANEL_BA_PASS_FLAG"
+    else
+      ba_pass="$(openssl rand -base64 18 | tr -d '/+=' | head -c 20)"
+      ba_generated=1
+    fi
+    ba_hash="$(panel_hash_password "$ba_pass")"
+  fi
+
+  ensure_panel_stub
+
+  # Persist config (node, UTF-8-safe). exposePanel=true, listenHost stays loopback.
+  cfg_set_json \
+    exposePanel "bool:1" \
+    panelDomain "$EXPOSE_DOMAIN" \
+    webBasePath "$web_base_path" \
+    panelBasicAuthUser "$ba_user" \
+    panelBasicAuthHash "$ba_hash" \
+    panelStubPage "${PANEL_STUB_PAGE:-/var/www/panel-stub/index.html}" \
+    panelHost "127.0.0.1" \
+    panelPort "int:3000" \
+    && log_ok_or_info "config.json updated (exposePanel=true, panelDomain=$EXPOSE_DOMAIN)"
+
+  # Reload local vars so the banner/rebuild use the new values.
+  WEB_BASE_PATH="$web_base_path"; PANEL_DOMAIN="$EXPOSE_DOMAIN"; PANEL_BA_USER="$ba_user"
+
+  # Regenerate Caddyfile (now includes the panel block) and restart caddy-naive.
+  rebuild_caddyfile_direct || log_warn "Caddyfile rebuild returned non-zero — check above"
+  fix_caddy_perms
+  systemctl reset-failed caddy-naive 2>/dev/null || true
+  if systemctl restart caddy-naive 2>/dev/null && \
+     [[ "$(systemctl is-active caddy-naive 2>/dev/null)" == "active" ]]; then
+    log_info "caddy-naive restarted ✓"
+  else
+    log_error "caddy-naive failed to start after expose — rolling back is recommended:"
+    journalctl -u caddy-naive -n 20 --no-pager 2>/dev/null || true
+  fi
+  # The panel itself does not change (loopback only) — no pm2 restart needed.
+
+  print_panel_credentials "expose" "$ba_generated" "$ba_pass"
 }
 
-# ── --ssh-only mode ───────────────────────────────────────────────────────────
+# ── --ssh-only mode (v1.4.0) ──────────────────────────────────────────────────
+# Symmetric reverse of --expose: drop the panel subdomain block, close any old
+# bare panel port, and keep the panel loopback-only (SSH-tunnel access). The
+# panelDomain / webBasePath / basic-auth hash are PRESERVED in config.json so
+# external access can be restored with `--expose <same domain>`.
 do_ssh_only() {
-  log_step "Switching panel to SSH-only mode"
+  log_step "Switching panel to SSH-only mode (loopback)"
 
-  $DRY_RUN && { log_dry "Would switch panel to 127.0.0.1:3000 (SSH-only)"; return; }
+  $DRY_RUN && { log_dry "Would switch panel to 127.0.0.1:3000 (SSH-only), remove panel block, close port 8080"; return; }
+
+  if ! $YES; then
+    read -rp "Switch panel to SSH-only (external access OFF)? [y/N]: " confirm
+    [[ "${confirm^^}" != "Y" ]] && { log_info "Aborted."; exit 0; }
+  fi
 
   auto_backup >/dev/null
 
-  jq --argjson v false '.exposePanel = $v' "$PANEL_CONFIG" > /tmp/cfg.tmp && \
-    mv /tmp/cfg.tmp "$PANEL_CONFIG"
+  # exposePanel=false → template/rebuild omits the panel subdomain block.
+  cfg_set_json exposePanel "bool:0" panelHost "127.0.0.1" panelPort "int:3000" \
+    && log_ok_or_info "config.json updated (exposePanel=false, panelDomain preserved)"
 
-  ufw delete allow 8080/tcp 2>/dev/null || true
-  pm2 restart panel-naive-mieru 2>/dev/null || true
+  # Migration cleanup: close any legacy bare panel port left by old installs.
+  if command -v ufw &>/dev/null; then
+    ufw delete allow 8080/tcp 2>/dev/null || true
+    ufw delete allow 8080 2>/dev/null || true
+  fi
+
+  # Regenerate Caddyfile WITHOUT the panel block and restart caddy.
+  rebuild_caddyfile_direct || log_warn "Caddyfile rebuild returned non-zero — check above"
+  fix_caddy_perms
+  systemctl reset-failed caddy-naive 2>/dev/null || true
+  systemctl restart caddy-naive 2>/dev/null && log_info "caddy-naive restarted ✓" || \
+    log_warn "caddy-naive restart failed — journalctl -u caddy-naive -n 20"
+
   log_info "Panel now SSH-only (127.0.0.1:3000) ✓"
-
   local server_ip; server_ip=$(jq -r '.serverIp' "$PANEL_CONFIG")
   echo ""
   echo -e "  SSH tunnel:  ${CYAN}ssh -L 3000:127.0.0.1:3000 root@$server_ip${NC}"
   echo -e "  Then open:   ${CYAN}http://localhost:3000/${NC}"
+  [[ -n "$PANEL_DOMAIN" && "$PANEL_DOMAIN" != "null" ]] && \
+    echo -e "  Re-enable:   ${CYAN}bash update.sh --expose $PANEL_DOMAIN${NC}"
+}
+
+# Small helper: log_ok if available, else log_info (reference uses log_ok).
+log_ok_or_info() { log_info "$*"; }
+
+# ── v1.4.0: final credentials banner (install + expose/change) ────────────────
+# $1 = context ("install" | "expose"); $2 = ba_generated (1/0); $3 = ba_pass (plain)
+print_panel_credentials() {
+  local ctx="$1" ba_generated="${2:-0}" ba_pass="${3:-}"
+  local server_ip; server_ip=$(jq -r '.serverIp // ""' "$PANEL_CONFIG" 2>/dev/null)
+  local expose; expose=$(jq -r '.exposePanel // false' "$PANEL_CONFIG" 2>/dev/null)
+  local pdom;   pdom=$(jq -r '.panelDomain // ""'      "$PANEL_CONFIG" 2>/dev/null)
+  local wbp;    wbp=$(jq -r '.webBasePath // ""'       "$PANEL_CONFIG" 2>/dev/null)
+  local bauser; bauser=$(jq -r '.panelBasicAuthUser // ""' "$PANEL_CONFIG" 2>/dev/null)
+
+  echo ""
+  echo -e "${CYAN}${BOLD}╔══════════════════════════════════════════════════════════════╗${NC}"
+  echo -e "${CYAN}${BOLD}║   🌐  ПАНЕЛЬ УПРАВЛЕНИЯ — реквизиты доступа                  ║${NC}"
+  echo -e "${CYAN}${BOLD}╠══════════════════════════════════════════════════════════════╣${NC}"
+  if [[ "$expose" == "true" && -n "$pdom" && -n "$wbp" ]]; then
+    echo -e "  URL:        ${BOLD}https://${pdom}/${wbp}/${NC}"
+    echo -e "  Basic auth логин:  ${BOLD}${bauser}${NC}"
+    if [[ "$ba_generated" == "1" && -n "$ba_pass" ]]; then
+      echo -e "  Basic auth пароль: ${BOLD}${ba_pass}${NC}   ${YELLOW}(показывается один раз!)${NC}"
+    else
+      echo -e "  Basic auth пароль: ${YELLOW}(не изменён — хранится только bcrypt-хеш)${NC}"
+    fi
+    echo -e "  ${YELLOW}Корень panel.<домен>/ и пути вне webBasePath → статическая заглушка.${NC}"
+  else
+    echo -e "  🔒  SSH-only режим (панель не доступна из Интернета)"
+    echo -e "  SSH-туннель:  ${BOLD}ssh -L 3000:127.0.0.1:3000 root@${server_ip}${NC}"
+    echo -e "  Затем:        ${BOLD}http://localhost:3000/${NC}"
+    [[ -n "$pdom" ]] && echo -e "  Открыть публично: ${BOLD}bash update.sh --expose ${pdom}${NC}"
+  fi
+  echo -e "  Логин в панель:    ${BOLD}admin${NC}  ${YELLOW}(если не меняли — смените в настройках!)${NC}"
+  echo -e "${CYAN}${BOLD}╚══════════════════════════════════════════════════════════════╝${NC}"
+  echo -e "  ${YELLOW}${BOLD}⚠  Сохраните эти данные — basic-auth пароль больше не будет показан!${NC}"
+  echo ""
 }
 
 # ── --repair mode ─────────────────────────────────────────────────────────────
@@ -1092,6 +1398,43 @@ FAKEHTML
   log_info "Repair complete ✓"
 }
 
+# ── v1.4.0: external-access prompt during update ──────────────────────────────
+# Contract:
+#   • exposePanel already true → keep mode (block is regenerated by the normal
+#     rebuild_caddyfile_direct later in do_update). Ask nothing.
+#   • exposePanel false + interactive → ask ONCE; default N keeps it local.
+#       If yes → ask subdomain, generate webBasePath, ask basic-auth user/pass
+#       (password hashed via caddy hash-password), then run the expose flow.
+#   • exposePanel false + non-interactive (-y) → keep current mode (do nothing).
+maybe_prompt_external_access() {
+  local expose; expose=$(jq -r '.exposePanel // false' "$PANEL_CONFIG" 2>/dev/null)
+  if [[ "$expose" == "true" ]]; then
+    log_info "External access is ON — panel block will be regenerated from template."
+    return 0
+  fi
+  # SSH-only from here on.
+  if $YES || $DRY_RUN; then
+    log_info "SSH-only mode kept (non-interactive). Enable later: bash update.sh --expose panel.<domain>"
+    return 0
+  fi
+  echo ""
+  read -rp "Перевести панель в открытый доступ по домену? [y/N]: " _ans
+  if [[ ! "${_ans:-N}" =~ ^([yYдД])$ ]]; then
+    log_info "Панель остаётся в SSH-only режиме."
+    return 0
+  fi
+  local def_domain="panel.${DOMAIN}"
+  read -rp "Поддомен панели [${def_domain}]: " _pd
+  EXPOSE_DOMAIN="${_pd:-$def_domain}"
+  read -rp "Логин basic auth [admin]: " _bu
+  PANEL_BA_USER="${_bu:-admin}"
+  read -rsp "Пароль basic auth (Enter — сгенерировать): " _bp; echo ""
+  [[ -n "$_bp" ]] && PANEL_BA_PASS_FLAG="$_bp"
+  # Hand off to the shared expose flow (it generates webBasePath, hashes the
+  # password, persists config, rebuilds the Caddyfile, restarts, prints creds).
+  do_expose
+}
+
 # ── Main update flow ──────────────────────────────────────────────────────────
 do_update() {
   detect_arch
@@ -1128,7 +1471,16 @@ do_update() {
   auto_backup >/dev/null
 
   # Bug 81: migrate config (set probeMode='bare' for pre-Bug 81 installs).
+  # v1.4.0: also adds external-access fields (SSH-only default) and closes any
+  # legacy bare 8080 port without breaking access.
   migrate_config
+  migrate_close_legacy_8080
+
+  # v1.4.0: external-access decision on update.
+  #   • already exposed → keep mode, regenerate block from template, ask nothing.
+  #   • SSH-only + interactive → ask ONCE (default N → stays local).
+  #   • SSH-only + -y (non-interactive) → keep current mode (safe default).
+  maybe_prompt_external_access
 
   # Update components
   update_caddy_naive     # replaces update_naiveproxy() from v1.2.x
