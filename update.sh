@@ -203,6 +203,83 @@ load_config() {
   PANEL_STUB_PAGE=$(jq -r '.panelStubPage // "/var/www/panel-stub/index.html"' "$PANEL_CONFIG")
 }
 
+# ── Bug 103: IPv4 preference when no working IPv6 route (update.sh) ───────────
+# mieru/mita pile up NetworkUnreachableErrors when AAAA traffic is routed over a
+# non-existent IPv6 path. Detect a missing outbound IPv6 route and force IPv4.
+has_working_ipv6() {
+  local routes
+  routes=$(ip -6 route show default 2>/dev/null; ip -6 route show 2>/dev/null \
+            | grep -vE '^(fe80|ff00|::1|unreachable)' | grep -E '::/|/[0-9]')
+  [[ -n "$(echo "$routes" | grep -E 'default|::/0|/[0-9]')" ]]
+}
+
+ensure_ipv4_preference() {
+  log_step "Checking IPv6 connectivity"
+  if has_working_ipv6; then
+    log_info "Working IPv6 route present — leaving as-is"
+    return 0
+  fi
+  log_warn "No outbound IPv6 route — enabling IPv4 preference (prevents mieru/mita NetworkUnreachableErrors on AAAA sites)"
+
+  if ! grep -qE '^\s*precedence\s+::ffff:0:0/96\s+100' /etc/gai.conf 2>/dev/null; then
+    {
+      echo ''
+      echo '# Added by Panel Naive+Mieru (Bug 103): prefer IPv4 — no working IPv6 route.'
+      echo 'precedence ::ffff:0:0/96  100'
+    } >> /etc/gai.conf 2>/dev/null \
+      && log_info "/etc/gai.conf: IPv4 preference set ✓" \
+      || log_warn "Could not write /etc/gai.conf"
+  fi
+
+  local sc=/etc/sysctl.d/99-rixxx-disable-ipv6.conf
+  cat > "$sc" <<'SYSCTL'
+# Added by Panel Naive+Mieru (Bug 103): no working outbound IPv6 route → disable
+# IPv6 so mieru/mita stop routing AAAA traffic into a black hole. Remove this
+# file and run `sysctl --system` to re-enable IPv6.
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 0
+SYSCTL
+  sysctl -p "$sc" >/dev/null 2>&1 \
+    && log_info "IPv6 disabled (sysctl, survives reboot) ✓" \
+    || log_warn "Could not apply IPv6 sysctl"
+
+  # Restart mita so it re-resolves over IPv4 and drops the error backlog.
+  systemctl restart mita 2>/dev/null || true
+}
+
+# Bug A (v1.3.1) / Bug 104 (v1.4.2): the panel UI shows cfg.version read from
+# config.json (/api/status → panel.version), NOT /etc/rixxx-panel/version.
+# do_repair historically only restarted the process without bumping
+# config.json, so after `--repair` the UI/PM2 kept displaying a stale version
+# (e.g. 1.2.6 while 1.4.x is installed). Centralised here so do_update AND
+# do_repair both sync config.json's "version" field to $TARGET_VERSION.
+sync_config_version() {
+  [[ -f "$PANEL_CONFIG" ]] || { log_warn "config.json not found — cannot sync version"; return 0; }
+  if command -v jq >/dev/null 2>&1; then
+    local _tmp_cfg
+    _tmp_cfg="$(mktemp)"
+    if jq --arg v "$TARGET_VERSION" '.version = $v' "$PANEL_CONFIG" > "$_tmp_cfg" 2>/dev/null \
+         && [[ -s "$_tmp_cfg" ]]; then
+      cat "$_tmp_cfg" > "$PANEL_CONFIG"   # preserve owner/perms of original file
+      log_info "config.json version synced to $TARGET_VERSION ✓"
+    else
+      log_warn "Could not update config.json version with jq — UI may show stale version"
+    fi
+    rm -f "$_tmp_cfg"
+  else
+    # jq missing (shouldn't happen — it's a hard dep): best-effort sed fallback.
+    if grep -q '"version"' "$PANEL_CONFIG"; then
+      sed -i "s|\"version\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"version\": \"${TARGET_VERSION}\"|" \
+        "$PANEL_CONFIG" 2>/dev/null \
+        && log_info "config.json version synced to $TARGET_VERSION (sed) ✓" \
+        || log_warn "Could not update config.json version — UI may show stale version"
+    else
+      log_warn "config.json has no \"version\" field — UI may show stale version"
+    fi
+  fi
+}
+
 # ── v1.4.0: helpers for external panel access (update.sh) ─────────────────────
 gen_web_base_path() { openssl rand -hex 8 2>/dev/null | tr -d '\n'; }
 
@@ -592,7 +669,7 @@ if (fs.existsSync(TEMPLATE_JS)) {
   }
   content = [
     '{',
-    '  order forward_proxy before file_server',
+    '  order forward_proxy first',
     '  servers {',
     '    protocols h1 h2',
     '  }',
@@ -1041,6 +1118,21 @@ smoke_test() {
     echo -e "  ${YELLOW}⚠${NC}  mita status unclear"
   fi
 
+  # Bug 103: real outbound egress check (IPv4 always; IPv6 only if a route exists).
+  if curl -4 -fsS --max-time 8 -o /dev/null https://www.google.com 2>/dev/null; then
+    echo -e "  ${GREEN}✓${NC} IPv4 outbound OK"; (( pass++ ))
+  else
+    echo -e "  ${YELLOW}⚠${NC}  IPv4 outbound check failed (firewall/DNS?)"
+  fi
+  if has_working_ipv6; then
+    if curl -6 -fsS --max-time 8 -o /dev/null https://www.google.com 2>/dev/null; then
+      echo -e "  ${GREEN}✓${NC} IPv6 outbound OK"; (( pass++ ))
+    else
+      echo -e "  ${YELLOW}⚠${NC}  IPv6 advertised but unreachable — enforcing IPv4 preference"
+      ensure_ipv4_preference
+    fi
+  fi
+
   echo ""
   echo -e "  Smoke: ${GREEN}$pass passed${NC}  ${RED}$fail failed${NC}"
   return $fail
@@ -1393,7 +1485,17 @@ FAKEHTML
   fi
   systemctl restart mita 2>/dev/null && log_info "mita restarted ✓" || \
     log_warn "mita restart failed — journalctl -u mita -n 20"
+
+  # Bug 104 (v1.4.2): --repair previously left config.json's "version" untouched,
+  # so PM2 / the UI kept reporting a stale version (e.g. 1.2.6 while 1.4.x is
+  # installed). Sync config.json to the installed VERSION *before* restarting the
+  # panel so the freshly-started process reads the correct version.
+  sync_config_version
+
   pm2 restart panel-naive-mieru 2>/dev/null || true
+
+  # Bug 103: repair must also fix a missing-IPv6 black hole.
+  ensure_ipv4_preference
 
   smoke_test || log_warn "Some smoke tests failed — check above"
   log_info "Repair complete ✓"
@@ -1518,34 +1620,9 @@ do_update() {
   fi
   log_info "Version file updated to $TARGET_VERSION ✓"
 
-  # Bug A (v1.3.1): the panel UI shows cfg.version read from config.json
-  # (/api/status → panel.version), NOT /etc/rixxx-panel/version. Older do_update
-  # only bumped the version file, so the UI kept displaying the stale version
-  # (e.g. 1.2.6) after an update. Sync config.json's "version" field too.
-  if [[ -f "$PANEL_CONFIG" ]]; then
-    if command -v jq >/dev/null 2>&1; then
-      local _tmp_cfg
-      _tmp_cfg="$(mktemp)"
-      if jq --arg v "$TARGET_VERSION" '.version = $v' "$PANEL_CONFIG" > "$_tmp_cfg" 2>/dev/null \
-           && [[ -s "$_tmp_cfg" ]]; then
-        cat "$_tmp_cfg" > "$PANEL_CONFIG"   # preserve owner/perms of original file
-        log_info "config.json version synced to $TARGET_VERSION ✓"
-      else
-        log_warn "Could not update config.json version with jq — UI may show stale version"
-      fi
-      rm -f "$_tmp_cfg"
-    else
-      # jq missing (shouldn't happen — it's a hard dep): best-effort sed fallback.
-      if grep -q '"version"' "$PANEL_CONFIG"; then
-        sed -i "s|\"version\"[[:space:]]*:[[:space:]]*\"[^\"]*\"|\"version\": \"${TARGET_VERSION}\"|" \
-          "$PANEL_CONFIG" 2>/dev/null \
-          && log_info "config.json version synced to $TARGET_VERSION (sed) ✓" \
-          || log_warn "Could not update config.json version — UI may show stale version"
-      else
-        log_warn "config.json has no \"version\" field — UI may show stale version"
-      fi
-    fi
-  fi
+  # Bug A (v1.3.1): keep config.json's "version" in sync so the UI / PM2 show
+  # the real version (centralised in sync_config_version — also used by --repair).
+  sync_config_version
 
   # Remove legacy naive paths if present (migration cleanup)
   if [[ -f "$LEGACY_NAIVE_BIN" ]]; then
@@ -1556,6 +1633,10 @@ do_update() {
     rm -rf "$LEGACY_NAIVE_CONFIG_DIR"
     log_info "Legacy /etc/naive directory removed ✓"
   fi
+
+  # Bug 103: on existing installs without a working IPv6 route, force IPv4 so
+  # mieru/mita stop black-holing AAAA traffic (google/youtube via the tunnel).
+  ensure_ipv4_preference
 
   smoke_test && log_info "Update completed successfully ✓" || \
     log_warn "Update completed with warnings — check services"

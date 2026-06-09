@@ -7,6 +7,65 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.2] — Audit 2026-06-09 (CRITICAL: dead NaiveProxy keys after Bug 98 + no-IPv6 black hole)
+
+Critical bugfix release. After Bug 98 (fake-site switched from `file_server` to
+`reverse_proxy`) **every NaiveProxy key stopped egressing** while the panel still
+looked "green". Update with one command — no manual edits:
+
+```
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+### Fixed
+
+- **BUG-102 (CRITICAL — all naive keys dead): wrong global `order`.** The Caddyfile
+  global block still emitted `order forward_proxy before file_server`, but Bug 98 made
+  the masquerade block a `reverse_proxy` (mirror mode). `before file_server` did **not**
+  place `forward_proxy` ahead of `reverse_proxy`, so the fake-site `reverse_proxy`
+  intercepted even authenticated `CONNECT` requests and forwarded them to `fakeSiteUrl`
+  → client got `400 Bad Request` from the nginx fake-site → no traffic egressed. TLS and
+  `basic_auth` still passed, so the panel showed everything healthy while keys were dead.
+  - Fixed to the canonical **`order forward_proxy first`** (per caddy-forwardproxy-naive),
+    which places `forward_proxy` ahead of **both** `file_server` (local mode) and
+    `reverse_proxy` (mirror mode) — robust against future masquerade-mode changes.
+  - Applied to **all four Caddyfile generators** so a regenerate (key create/delete,
+    `--repair`, `--update`, panel restart) can never re-break it:
+    `panel/server/caddyTemplate.js` (canonical), `panel/server/index.js` `buildCaddyfile()`
+    inline fallback, `install.sh` inline fallback, `update.sh rebuild_caddyfile_direct`
+    inline fallback. Verified: render emits `order forward_proxy first` in both local and
+    mirror modes; no `before file_server` directive remains anywhere.
+  - Existing installs are fixed automatically on update because `do_update` calls
+    `rebuild_caddyfile_direct`, which renders from the fixed on-disk `caddyTemplate.js`.
+- **BUG-103 (CRITICAL — no egress on IPv6-less VPS): NetworkUnreachable black hole.**
+  On servers with no working outbound IPv6 route (`ip -6 route` shows only `fe80`),
+  mieru/mita routed AAAA-site traffic over IPv6 into a black hole, piling up hundreds of
+  `NetworkUnreachableError`s and breaking google/youtube.
+  - `install.sh` and `update.sh` now detect a missing working IPv6 route
+    (`has_working_ipv6`) and force IPv4 preference (`ensure_ipv4_preference`):
+    `precedence ::ffff:0:0/96 100` in `/etc/gai.conf` (getaddrinfo) **and**
+    `net.ipv6.conf.all.disable_ipv6=1` in `/etc/sysctl.d/99-rixxx-disable-ipv6.conf`
+    (survives reboot). Applied in `install.sh main()`, `do_update`, and `do_repair`.
+  - Smoke tests now include real egress checks: `curl -4` always, `curl -6` only when a
+    working IPv6 route is present; auto-fixes (enables IPv4 preference) if IPv6 is
+    unreachable. `mita` is restarted so it re-resolves over IPv4 and drains the backlog.
+- **BUG-104 (medium): stale version after `--repair`.** `--repair` restarted the panel
+  without bumping `config.json`'s `version`, so PM2/UI kept showing an old version
+  (e.g. 1.2.6 while 1.4.x was installed). Extracted the config.json version-sync logic
+  into a shared `sync_config_version()` helper now called by **both** `do_update` and
+  `do_repair`, syncing before the panel restart so the live process reports the real
+  version.
+
+### Notes
+
+- **BUG (case syntax at update.sh:1578)** reported from the field was in the *old
+  deployed* `update.sh`. The current repo `update.sh` passes `bash -n`; because the
+  one-command update is a curl-pipe, it runs the freshly-fetched fixed script directly,
+  so the old case error never executes.
+- No DB schema changes. Working keys and cascades are preserved.
+
+---
+
 ## [v1.4.1] — Audit 2026-06-09 (External access fixes: webBasePath base-path proxy, stub editor, version sync)
 
 Bugfix release for the v1.4.0 external-access feature, addressing field-test findings.
