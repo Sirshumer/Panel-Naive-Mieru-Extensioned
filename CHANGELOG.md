@@ -7,6 +7,55 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.3] — Audit 2026-06-09 (CRITICAL: cannot create any user after upgrade from v1.2)
+
+Critical bugfix. On servers upgraded from **v1.2**, creating *any* new user failed
+with a raw `SqliteError: UNIQUE constraint failed: users.email` dumped straight
+into the "add user" modal — existing keys/cascade worked, but no new user could be
+added at all. Update with one command:
+
+```
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+### Fixed
+
+- **BUG-149 (CRITICAL — cannot create any user after upgrade from v1.2).**
+  v1.2 stored email-less users with an **empty string** `''` under a `UNIQUE`
+  column. SQLite treats `''` as a real, distinct value, so the *second* empty
+  email already collides — and every new-user INSERT then failed on
+  `users.email`. The existing email→nullable migration only ran when the column
+  was still `NOT NULL`; on v1.2 the column was already nullable (`notnull=0`), so
+  the migration was **skipped** and the `''` rows survived.
+  - **Migration:** added an *unconditional* startup step
+    `UPDATE users SET email = NULL WHERE email = ''` (NULL is exempt from
+    SQLite's UNIQUE, so any number of users may have no email). Logs how many
+    rows were normalised. Runs on every boot, so `--update`/restart fixes
+    existing installs automatically.
+  - **`upsertUser`:** now coerces any empty/whitespace email to `NULL` before
+    writing, so `''` can never be re-introduced (also guards the traffic-snapshot
+    upsert path).
+  - **Create/Update user routes:** pre-check for a duplicate non-empty email and
+    return a clean **409 "Email already in use"** (and 409 for duplicate
+    username) *before* hitting the constraint; the `upsertUser` call is wrapped
+    in try/catch that maps known constraint errors to friendly 4xx.
+  - **Global Express error handler:** last-resort safety net so a raw
+    `SqliteError`/HTML stacktrace exposing internal paths
+    (`/opt/panel-naive-mieru/server/index.js:NNN`) can never reach the UI —
+    unexpected errors return clean JSON instead.
+  - **Test:** added `tests/migration-bug149.test.js` (and `npm test`) — builds a
+    realistic v1.2 DB with `''` emails, applies the migration, and asserts legacy
+    users survive, empty emails become NULL, new users (with/without email) are
+    created, multiple email-less users coexist, and duplicate emails return a
+    clean 409 with no leaked path. 13/13 assertions pass.
+
+### Notes
+
+- No DB schema changes beyond normalising data (`'' → NULL`). Existing users,
+  keys and cascades are preserved. VERSION 1.4.2 → 1.4.3.
+
+---
+
 ## [v1.4.2] — Audit 2026-06-09 (CRITICAL: dead NaiveProxy keys after Bug 98 + no-IPv6 black hole)
 
 Critical bugfix release. After Bug 98 (fake-site switched from `file_server` to
