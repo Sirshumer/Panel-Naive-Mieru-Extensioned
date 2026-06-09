@@ -7,6 +7,70 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.4] — Audit 2026-06-09 (user-create double-submit race + UI version desync)
+
+Follow-up to v1.4.3. Update with one command:
+
+```
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+### Fixed
+
+- **BUG-149 (race — false "Username already exists" while the user IS created).**
+  Creating a user could show `Username already exists` in the modal even though
+  the user was actually created (visible only after F5, key worked). Root cause:
+  the old flow did a `getUserByUsername()` pre-check then a separate INSERT, each
+  request minting a fresh UUID. On a double-submit the first request created the
+  user (201) while the second slipped past the pre-check, hit `UNIQUE(username)`
+  and returned a false 409.
+  - **Atomic + idempotent create:** `createUserAtomic()` now does a single
+    `INSERT ... ON CONFLICT(username) DO NOTHING`. A genuine insert → success; if
+    nothing was inserted but the existing row has the *same* passHash (i.e. this
+    is the same create re-submitted) → return the existing user as **success**;
+    only a clash with a *different* pre-existing user returns a real 409.
+  - **In-flight de-dup:** concurrent `POST /api/users` for the same username are
+    coalesced onto one promise, so a rapid double-submit never starts two INSERTs
+    and both callers get the identical success response.
+  - **Frontend:** `saveUser()` has a re-entrancy guard (ignores a second call
+    while one is in flight) on top of the existing disabled-button/spinner, and
+    now `await`s `loadUsers()` so the new user appears **without a manual F5**.
+  - **Service rebuild** (Caddy/mita) runs only when a row was actually inserted,
+    so an idempotent re-submit is cheap.
+  - Still no raw stacktrace: unknown DB errors map to a generic message; only a
+    real duplicate yields the friendly 409.
+  - **Acceptance:** one click → user created, list refreshes itself, no false
+    error; repeated click / double-submit neither errors nor duplicates the user.
+- **BUG-143 (recurring — UI version lagged a release behind).** After updating to
+  1.4.3 the header still showed v1.4.2 because the UI read the version from a
+  source that could lag (in-memory `cfg` / `config.json` not reloaded).
+  - **Single source of truth, read LIVE:** `readPanelVersion()` reads the version
+    on every request with precedence `/etc/rixxx-panel/version` → bundled
+    `VERSION` → `config.json` → fallback. Both `/api/status` (`panel.version`)
+    **and** `/api/config` (`version`) now return this live value, so all three UI
+    spots (sidebar / topbar / about) update the moment `update.sh` runs.
+  - `install.sh`/`update.sh` already write `/etc/rixxx-panel/version`
+    (`panel_version=X.Y.Z`) and sync `config.json` from the repo `VERSION`; the
+    panel now consumes that file directly — no manual edits each release.
+  - **Acceptance:** after `update.sh`, the header version (all places) equals the
+    `VERSION` in main with no re-login / manual action.
+
+### Tests
+
+- `tests/race-bug149.test.js` — atomic/idempotent create: first create succeeds,
+  identical re-submit is idempotent success (no 409, no dup row), a different user
+  on the same name is a real duplicate, simulated double-submit → one row / one
+  success. 10/10.
+- `tests/version-bug143.test.js` — `readPanelVersion()` precedence + live re-read
+  picking up a new version after a simulated `update.sh`. 7/7.
+- `npm test` runs all three suites (migration + race + version).
+
+### Notes
+
+- No DB schema changes. Existing users/keys/cascades preserved. VERSION 1.4.3 → 1.4.4.
+
+---
+
 ## [v1.4.3] — Audit 2026-06-09 (CRITICAL: cannot create any user after upgrade from v1.2)
 
 Critical bugfix. On servers upgraded from **v1.2**, creating *any* new user failed
