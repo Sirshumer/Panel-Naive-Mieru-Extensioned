@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.3.2
+ * Panel Naive + Mieru — Frontend Application v1.4.1
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  * v1.2.5: probe-secret setting, disabled-button+spinner on all submit handlers,
@@ -7,6 +7,43 @@
  * v1.2.6: cascade/relay settings (Naive upstream + Mieru egress SOCKS5)
  */
 'use strict';
+
+// ══════════════════════════════════════════════════════════════
+// BASE PATH (v1.4.0, BUG-140)
+// ══════════════════════════════════════════════════════════════
+// When external access is enabled the panel is served behind a secret
+// webBasePath:  https://panel.<domain>/<webBasePath>/ . Caddy's
+// `handle_path /<webBasePath>/*` STRIPS the prefix before reverse-proxying,
+// so the Express app itself is unaware of the prefix — but the BROWSER is.
+// Therefore every request the browser makes ( /api/*, /locales/* ) MUST carry
+// the prefix back, otherwise Caddy can't match it and serves the stub → 404.
+//
+// We derive the prefix from THIS script's own URL. `app.js` is loaded with a
+// relative <script src="app.js">, so its resolved URL is
+//   https://panel.<domain>/<webBasePath>/app.js
+// and the directory part ("/<webBasePath>/") is exactly the base we need.
+// This is robust for deep links and page refreshes (location.pathname can be
+// any sub-route, but the script URL is always the panel root).
+const BASE_PATH = (function () {
+  try {
+    const self = (document.currentScript && document.currentScript.src) || '';
+    if (self) {
+      const p = new URL(self).pathname;          // /<webBasePath>/app.js  (or /app.js)
+      const dir = p.replace(/[^/]*$/, '');        // /<webBasePath>/        (or /)
+      return dir.replace(/\/+$/, '');             // /<webBasePath>         (or '')
+    }
+  } catch (_) {}
+  return '';
+})();
+
+// Prefix an absolute server path ("/api/...", "/locales/...") with BASE_PATH.
+// Leaves already-absolute http(s) URLs and non-rooted paths untouched.
+function apiUrl(p) {
+  if (typeof p !== 'string') return p;
+  if (/^https?:\/\//i.test(p)) return p;
+  if (p[0] !== '/') return p;
+  return BASE_PATH + p;
+}
 
 // ══════════════════════════════════════════════════════════════
 // I18N SYSTEM
@@ -17,7 +54,7 @@ let locale = {};
 
 async function loadLocale(lang) {
   try {
-    const res = await fetch(`/locales/${lang}.json`);
+    const res = await fetch(apiUrl(`/locales/${lang}.json`));
     if (!res.ok) throw new Error('locale not found');
     locale = await res.json();
   } catch {
@@ -179,7 +216,7 @@ document.addEventListener('DOMContentLoaded', async () => {
   });
 
   // ── Check existing session ────────────────────────────────────
-  fetch('/api/me')
+  fetch(apiUrl('/api/me'))
     .then(r => r.ok ? r.json() : null)
     .then(data => {
       if (data && data.authenticated) {
@@ -244,6 +281,8 @@ function handleDelegatedClick(e) {
     case 'gen-web-base-path':    generateWebBasePath(); break;
     case 'save-external-access': saveExternalAccess(); break;
     case 'toggle-external-fields': toggleExternalFields(); break;
+    case 'load-panel-stub':      loadPanelStub(); break;
+    case 'save-panel-stub':      savePanelStub(); break;
 
     // ── Monitoring
     case 'refresh-stats':    refreshStats(); break;
@@ -337,7 +376,7 @@ async function syncVersionDisplay() {
 }
 
 async function logout() {
-  await fetch('/api/logout', { method: 'POST' }).catch(() => {});
+  await fetch(apiUrl('/api/logout'), { method: 'POST' }).catch(() => {});
   state.authenticated = false;
   if (state.ws) state.ws.close();
   document.getElementById('app').classList.add('hidden');
@@ -724,7 +763,7 @@ async function downloadMieruConfig() {
     const q = mieruPortQuery();
     if (q === null) return;              // invalid port — abort (toast already shown)
     const res = await fetch(
-      `/api/users/${state.selectedUserId}/config/mieru${q}`,
+      apiUrl(`/api/users/${state.selectedUserId}/config/mieru${q}`),
       { credentials: 'include' });
     if (res.status === 401) { redirectToLogin(); return; }
     if (!res.ok) throw new Error(await res.text());
@@ -741,7 +780,7 @@ async function downloadUniversalConfig() {
     const q = mieruPortQuery();
     if (q === null) return;              // invalid port — abort (toast already shown)
     const res = await fetch(
-      `/api/users/${state.selectedUserId}/config/universal${q}`,
+      apiUrl(`/api/users/${state.selectedUserId}/config/universal${q}`),
       { credentials: 'include' });
     if (res.status === 401) { redirectToLogin(); return; }
     if (!res.ok) throw new Error(await res.text());
@@ -814,14 +853,25 @@ async function loadSettings() {
     if (wbpEl) wbpEl.value = cfg.webBasePath || '';
     const baUserEl = el('s-ba-user');
     if (baUserEl) baUserEl.value = cfg.panelBasicAuthUser || 'admin';
+    // BUG-144: label + placeholder + validation depend on whether a basic-auth
+    // hash already exists. First enable → password REQUIRED; existing → optional.
+    state.panelBasicAuthSet = cfg.panelBasicAuthSet === true;
     const baPassEl = el('s-ba-pass');
     if (baPassEl) {
       baPassEl.value = '';
-      baPassEl.placeholder = cfg.panelBasicAuthSet
+      baPassEl.placeholder = state.panelBasicAuthSet
         ? '••••••• (set — leave blank to keep)'
         : (t('settings.externalBaPassPlaceholder') || 'Set a basic-auth password');
     }
+    const baLabel = el('s-ba-pass-label');
+    if (baLabel) {
+      baLabel.textContent = state.panelBasicAuthSet
+        ? (t('settings.externalBaPassKeep') || 'Basic-auth password (leave blank to keep current)')
+        : (t('settings.externalBaPassNew')  || 'Basic-auth password (required on first enable)');
+    }
     toggleExternalFields();
+    // BUG-141: prefill the stub editor with the current stub HTML (best-effort).
+    loadPanelStub().catch(() => {});
 
     // Bug A (v1.3.2): keep all three version displays in sync.
     {
@@ -862,6 +912,9 @@ async function saveExternalAccess() {
     const pass = el('s-ba-pass') ? el('s-ba-pass').value : '';
     if (pass) body.basicAuthPass = pass;     // omit → keep existing hash
     if (!body.panelDomain) return showMsg('external-access-msg', t('settings.externalNeedDomain') || 'Panel subdomain is required', false);
+    // BUG-144: on first enable (no stored hash) a password is mandatory.
+    if (!state.panelBasicAuthSet && !pass)
+      return showMsg('external-access-msg', t('settings.externalBaPassNew') || 'Basic-auth password is required on first enable', false);
   } else {
     if (!confirm(t('settings.externalDisableConfirm') || 'Disable external access? The panel will be reachable only via SSH tunnel.')) return;
   }
@@ -888,6 +941,34 @@ async function saveExternalAccess() {
   } catch (err) {
     showMsg('external-access-msg', err.message || 'Failed to apply', false);
     toast(err.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// BUG-141: load the current panel-stub HTML into the editor.
+async function loadPanelStub() {
+  try {
+    const r = await api('GET', '/api/panel/stub');
+    if (el('s-panel-stub')) el('s-panel-stub').value = r.html || '';
+    showMsg('panel-stub-msg', (t('settings.externalStubLoaded') || 'Loaded current stub') + (r.path ? ` (${esc(r.path)})` : ''), true);
+  } catch (err) { showMsg('panel-stub-msg', err.message, false); }
+}
+
+// BUG-141: save custom panel-stub HTML (atomic write server-side, no restart).
+async function savePanelStub() {
+  let html = el('s-panel-stub') ? el('s-panel-stub').value : '';
+  // Strip a stray leading "Copy" clipboard artifact before sending.
+  html = html.replace(/^\uFEFF/, '').replace(/^Copy(?=\s*<)/, '');
+  if (!html.trim()) return showMsg('panel-stub-msg', t('settings.externalStubEmpty') || 'Stub HTML must not be empty', false);
+  const btn = document.querySelector('[data-action="save-panel-stub"]');
+  if (btn) btn.disabled = true;
+  try {
+    const r = await api('POST', '/api/panel/stub', { html });
+    showMsg('panel-stub-msg', (t('settings.externalStubSaved') || 'Stub saved ✓') + ` (${r.bytes} B)`, true);
+    toast(t('settings.externalStubSaved') || 'Stub saved', 'success');
+  } catch (err) {
+    showMsg('panel-stub-msg', err.message, false);
   } finally {
     if (btn) btn.disabled = false;
   }
@@ -1286,7 +1367,8 @@ async function svcAction(service, action) {
 function connectWebSocket() {
   if (state.wsReconnectTimer) clearTimeout(state.wsReconnectTimer);
   const proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const wsUrl = `${proto}//${location.host}/ws`;
+  // BUG-140: carry webBasePath so Caddy's handle_path matches and strips it.
+  const wsUrl = `${proto}//${location.host}${BASE_PATH}/ws`;
 
   try {
     const ws = new WebSocket(wsUrl);
@@ -1339,7 +1421,7 @@ async function api(method, path, body) {
   };
   if (body) opts.body = JSON.stringify(body);
 
-  const res  = await fetch(path, opts);
+  const res  = await fetch(apiUrl(path), opts);
 
   // Bug 10: auto-redirect on 401
   if (res.status === 401) {
