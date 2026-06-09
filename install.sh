@@ -668,7 +668,7 @@ panel_hash_password() {
 # Bug 27: backup existing Caddyfile; restore DB users when --force.
 # Bug 28: no  tls <email>  in site block — Caddy handles TLS automatically.
 # Bug 29: directive order inside forward_proxy:  basic_auth → hide_ip → hide_via → probe_resistance.
-# Bug 30: global  order forward_proxy before file_server.
+# Bug 30: global  order forward_proxy first.
 # Bug 33: DNS check — warn if domain doesn't resolve to server IP.
 # Bug 38: log rotation uses  roll_keep_for 720h  (30 days).
 write_caddyfile() {
@@ -811,12 +811,15 @@ write_caddyfile() {
 
     # Bug 28: no tls directive — Caddy automatic HTTPS handles it
     # Bug 29: order: basic_auth → hide_ip → hide_via → probe_resistance
-    # Bug 30: order forward_proxy before file_server
+    # Bug 30: order forward_proxy first
     # Bug 38: roll_keep_for 720h instead of roll_keep 5
     # Bug 21: no site-level log block
     caddyfile_content="{
-  # Bug 30: ensure forward_proxy is evaluated before file_server
-  order forward_proxy before file_server
+  # Bug 30 / Bug 102 (CRITICAL): forward_proxy before ANY handler. 'before
+  # file_server' let mirror-mode reverse_proxy (Bug 98) hijack authenticated
+  # CONNECT → all naive keys broke. 'first' covers both file_server and
+  # reverse_proxy masquerade modes.
+  order forward_proxy first
   # Bug 80: HTTP/1.1 + HTTP/2 only (disable HTTP/3 / QUIC)
   servers {
     protocols h1 h2
@@ -1606,6 +1609,79 @@ tune_network() {
   fi
 }
 
+# ── Bug 103: IPv4 preference on VPS without working IPv6 ──────────────────────
+# Symptom: mieru/mita pile up NetworkUnreachableErrors because traffic to sites
+# with AAAA records is routed over IPv6, but the VPS has no IPv6 route (only a
+# link-local fe80::/64). Sites like google/youtube then never load through the
+# tunnel. Most cheap VPS have no IPv6 — detect it and force IPv4 preference.
+#
+# Returns 0 if a working (non-link-local) global IPv6 route exists, 1 otherwise.
+has_working_ipv6() {
+  # A default route or any non-link-local global route counts as "working".
+  local routes
+  routes=$(ip -6 route show default 2>/dev/null; ip -6 route show 2>/dev/null \
+            | grep -vE '^(fe80|ff00|::1|unreachable)' | grep -E '::/|/[0-9]')
+  [[ -n "$(echo "$routes" | grep -E 'default|::/0|/[0-9]')" ]]
+}
+
+ensure_ipv4_preference() {
+  log_step "$(t 'Проверка IPv6-маршрута' 'Checking IPv6 connectivity')"
+  if has_working_ipv6; then
+    log_info "$(t 'IPv6-маршрут найден — оставляем как есть' 'Working IPv6 route present — leaving as-is')"
+    return 0
+  fi
+  log_warn "$(t 'IPv6-маршрут наружу отсутствует — включаю предпочтение IPv4 (иначе mieru/mita копит NetworkUnreachableErrors на сайтах с AAAA)' \
+               'No outbound IPv6 route — enabling IPv4 preference (otherwise mieru/mita piles up NetworkUnreachableErrors on AAAA sites)')"
+
+  # 1) getaddrinfo (glibc) preference: prefer IPv4 over IPv6 in /etc/gai.conf.
+  #    "precedence ::ffff:0:0/96 100" pushes IPv4-mapped addresses to the top.
+  if ! grep -qE '^\s*precedence\s+::ffff:0:0/96\s+100' /etc/gai.conf 2>/dev/null; then
+    {
+      echo ''
+      echo '# Added by Panel Naive+Mieru (Bug 103): prefer IPv4 — no working IPv6 route.'
+      echo 'precedence ::ffff:0:0/96  100'
+    } >> /etc/gai.conf 2>/dev/null \
+      && log_info "$(t '/etc/gai.conf: предпочтение IPv4 включено ✓' '/etc/gai.conf: IPv4 preference set ✓')" \
+      || log_warn "$(t 'Не удалось записать /etc/gai.conf' 'Could not write /etc/gai.conf')"
+  fi
+
+  # 2) Disable IPv6 at the kernel level so it survives reboot. We write a
+  #    sysctl.d drop-in (persistent) AND apply it live.
+  local sc=/etc/sysctl.d/99-rixxx-disable-ipv6.conf
+  cat > "$sc" <<'SYSCTL'
+# Added by Panel Naive+Mieru (Bug 103): this host has no working outbound IPv6
+# route, so IPv6 is disabled to keep mieru/mita from routing AAAA traffic into a
+# black hole. Remove this file and `sysctl --system` to re-enable IPv6.
+net.ipv6.conf.all.disable_ipv6 = 1
+net.ipv6.conf.default.disable_ipv6 = 1
+net.ipv6.conf.lo.disable_ipv6 = 0
+SYSCTL
+  sysctl -p "$sc" >/dev/null 2>&1 \
+    && log_info "$(t 'IPv6 отключён (sysctl, переживёт reboot) ✓' 'IPv6 disabled (sysctl, survives reboot) ✓')" \
+    || log_warn "$(t 'Не удалось применить sysctl для IPv6' 'Could not apply IPv6 sysctl')"
+}
+
+# ── Bug 103: outbound connectivity smoke test (IPv4 + optional IPv6) ──────────
+smoke_test_outbound() {
+  log_step "$(t 'Проверка выхода в интернет' 'Outbound connectivity check')"
+  if curl -4 -fsS --max-time 8 -o /dev/null https://www.google.com 2>/dev/null; then
+    log_info "$(t 'IPv4 выход наружу работает ✓' 'IPv4 outbound OK ✓')"
+  else
+    log_warn "$(t 'IPv4 выход наружу не прошёл (проверьте firewall/DNS)' 'IPv4 outbound check failed (check firewall/DNS)')"
+  fi
+  # Only test IPv6 if the host actually claims a working route; otherwise it is
+  # expected to fail and we already disabled it above.
+  if has_working_ipv6; then
+    if curl -6 -fsS --max-time 8 -o /dev/null https://www.google.com 2>/dev/null; then
+      log_info "$(t 'IPv6 выход наружу работает ✓' 'IPv6 outbound OK ✓')"
+    else
+      log_warn "$(t 'IPv6 заявлен, но выход не прошёл — включаю предпочтение IPv4' \
+                   'IPv6 advertised but unreachable — enforcing IPv4 preference')"
+      ensure_ipv4_preference
+    fi
+  fi
+}
+
 # ── Main ──────────────────────────────────────────────────────────────────────
 main() {
   parse_install_args "$@"
@@ -1631,9 +1707,11 @@ main() {
   write_config_json
   write_version
   tune_network      # BBR + UDP buffers (uses panel/scripts/sysctl_tune.sh)
+  ensure_ipv4_preference   # Bug 103: force IPv4 when no working IPv6 route
   maybe_ufw
   start_services
   smoke_test
+  smoke_test_outbound      # Bug 103: verify real egress (curl -4 / -6)
   print_banner
 }
 

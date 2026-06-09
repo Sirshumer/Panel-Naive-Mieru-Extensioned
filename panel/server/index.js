@@ -80,7 +80,7 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.4.1'
+    language: 'ru', version: '1.4.2'
   };
 }
 
@@ -243,7 +243,7 @@ function saveConfig() {
 // Bug 29 (P1): directive order inside forward_proxy is now enforced by the
 //   template: basic_auth lines → hide_ip → hide_via → probe_resistance.
 //
-// Bug 30 (P1): "order forward_proxy before file_server" now appears in the
+// Bug 30 (P1): "order forward_proxy first" now appears in the
 //   global block via the template.
 //
 // Bug 34: placeholder emitted when naiveUsers is empty so the forward_proxy
@@ -400,8 +400,10 @@ function buildCaddyfile(config, users) {
   // Bug 30: order directive in global block
   // Bug 38: roll_keep_for 720h
   return `{
-  # Bug 30: evaluate forwardproxy before file_server
-  order forward_proxy before file_server
+  # Bug 30 / Bug 102 (CRITICAL): forward_proxy before ANY handler (file_server
+  # OR reverse_proxy). "before file_server" let mirror-mode reverse_proxy hijack
+  # authenticated CONNECT → all naive keys broke. "first" fixes both modes.
+  order forward_proxy first
   # Bug 80: HTTP/1.1 + HTTP/2 only (disable HTTP/3 / QUIC)
   servers {
     protocols h1 h2

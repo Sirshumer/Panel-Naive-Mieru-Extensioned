@@ -24,7 +24,8 @@
  *             hide_via
  *             probe_resistance  <secret>   (only when secret is set)
  *
- * Bug 30: Global  order  directive ensures forwardproxy is evaluated before file_server.
+ * Bug 30 / Bug 102: Global  order forward_proxy first  ensures forwardproxy is
+ *         evaluated before ANY masquerade handler (file_server OR reverse_proxy).
  *
  * Bug 34: Placeholder logic — emit ONE placeholder line only when naiveUsers is empty;
  *         as soon as the first real user exists, placeholder is dropped.
@@ -269,8 +270,14 @@ function render(cfg, naiveUsers) {
 
   // Bug 63: use consistent 2-space indentation throughout to silence caddy fmt
   return `{
-  # Bug 30: evaluate forwardproxy handler before file_server
-  order forward_proxy before file_server
+  # Bug 30 / Bug 102 (CRITICAL): forward_proxy MUST be evaluated before ANY other
+  # handler. With Bug 98 the masquerade can be reverse_proxy (mirror mode), and
+  # "before file_server" did NOT place forward_proxy ahead of reverse_proxy — so
+  # the mirror handler hijacked authenticated CONNECT requests and every naive
+  # key broke (client got "400 Bad Request" from the fake-site). "first" puts
+  # forward_proxy ahead of BOTH file_server and reverse_proxy, covering local and
+  # mirror masquerade modes. (Canonical form per caddyserver/forwardproxy.)
+  order forward_proxy first
   # Bug 80: restrict to HTTP/1.1 + HTTP/2 only (disable HTTP/3 / QUIC).
   # NaiveProxy tunnels over HTTP/2 CONNECT; HTTP/3 can break some clients.
   servers {
@@ -299,7 +306,7 @@ function render(cfg, naiveUsers) {
   #     CONNECT request matches this site regardless of how the client sets SNI/Host
   #   - explicit "tls <email>" inside the block (not relying on the global email)
   #   - no route{} wrapper — forward_proxy/file_server directly in the site block
-  #     (ordering comes from the global "order forward_proxy before file_server")
+  #     (ordering comes from the global "order forward_proxy first")
   tls ${email}
 
   forward_proxy {
