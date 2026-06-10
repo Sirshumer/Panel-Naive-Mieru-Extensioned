@@ -298,12 +298,20 @@ apply_iptables() {
 
 clear_iptables() {
   local uid; uid=$(mita_uid)
-  # Remove OUTPUT jump(s) to REDSOCKS (loop until none remain).
+  # Remove OUTPUT jump(s) to REDSOCKS for the mita uid (loop until none remain).
   if [[ -n "$uid" ]]; then
     while iptables -t nat -C OUTPUT -p tcp -m owner --uid-owner "$uid" -j REDSOCKS 2>/dev/null; do
       iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner "$uid" -j REDSOCKS 2>/dev/null || break
     done
   fi
+  # Bug 150: also strip ANY remaining OUTPUT rule that jumps to REDSOCKS, even if
+  # mita's uid changed or the user was removed — parse the rule numbers and delete
+  # from the bottom up so a stale jump can never survive a teardown.
+  local nums
+  nums=$(iptables -t nat -L OUTPUT -n --line-numbers 2>/dev/null | awk '$2=="REDSOCKS"{print $1}' | sort -rn)
+  for n in $nums; do
+    iptables -t nat -D OUTPUT "$n" 2>/dev/null || true
+  done
   # Flush + delete the chain.
   iptables -t nat -F REDSOCKS 2>/dev/null || true
   iptables -t nat -X REDSOCKS 2>/dev/null || true
@@ -427,23 +435,54 @@ STEOF
   do_status || true
 }
 
+# Bug 150: FULL, idempotent teardown — returns the host to its pre-cascade
+# state in EVERY layer (iptables / redsocks / mieru-client / watchdog / state),
+# leaving NO active artifact behind, and verifies egress is the native IP.
+# Safe to run repeatedly (every step tolerates "already gone").
 do_teardown() {
-  log "tearing down cascade…"
+  log "tearing down cascade (full)…"
+
+  # 1) NETWORK: drop the iptables REDSOCKS chain + the OUTPUT jump first, so no
+  #    traffic is redirected the moment we stop the relay.
   clear_iptables
+
+  # 2) WATCHDOG: cron + helper binary (else it would restart mieru after stop).
   remove_watchdog
-  systemctl stop mieru     2>/dev/null || true
-  systemctl disable mieru  2>/dev/null || true
-  remove_redsocks_dropin
-  systemctl stop redsocks  2>/dev/null || true
-  systemctl disable redsocks 2>/dev/null || true
-  systemctl daemon-reload
+  # Bug 150: also clear any watchdog failure-counter scratch file.
+  rm -f /tmp/mieru-watchdog.fails 2>/dev/null || true
 
-  # Shred the client config (contains exit credentials).
-  [[ -f "$MIERU_CLIENT_CONFIG" ]] && { shred -u "$MIERU_CLIENT_CONFIG" 2>/dev/null || rm -f "$MIERU_CLIENT_CONFIG"; }
+  # 3) MIERU-CLIENT service: stop, disable, reset-failed (so a stuck failed
+  #    unit can't auto-restart), then remove the unit file.
+  systemctl stop mieru        2>/dev/null || true
+  systemctl disable mieru     2>/dev/null || true
+  systemctl reset-failed mieru 2>/dev/null || true
   rm -f "$MIERU_SERVICE"
-  [[ -f "$STATE_FILE" ]] && { echo "enabled=0" > "$STATE_FILE"; chmod 600 "$STATE_FILE"; }
+
+  # 4) REDSOCKS: remove the drop-in, stop, disable, reset-failed, AND delete the
+  #    config file on disk (Bug 150a: redsocks.conf used to linger after
+  #    disable — clean it so nothing references the dead relay).
+  remove_redsocks_dropin
+  systemctl stop redsocks         2>/dev/null || true
+  systemctl disable redsocks      2>/dev/null || true
+  systemctl reset-failed redsocks 2>/dev/null || true
+  rm -f "$REDSOCKS_CONF"
 
   systemctl daemon-reload
+
+  # 5) CREDENTIALS / CLIENT CONFIG: shred (contains the exit password).
+  [[ -f "$MIERU_CLIENT_CONFIG" ]] && { shred -u "$MIERU_CLIENT_CONFIG" 2>/dev/null || rm -f "$MIERU_CLIENT_CONFIG"; }
+
+  # 6) STATE: mark disabled (keep the file so status reads cleanly).
+  [[ -f "$STATE_FILE" ]] && { echo "enabled=0" > "$STATE_FILE"; chmod 600 "$STATE_FILE"; } || true
+
+  systemctl daemon-reload
+
+  # 7) VERIFY: egress should now be the server's OWN public IP (relay gone).
+  #    Best-effort — never fail teardown on a transient curl error.
+  local direct_ip socks_dead="yes"
+  systemctl is-active --quiet redsocks 2>/dev/null && socks_dead="no"
+  direct_ip=$(curl -s --max-time 8 https://api.ipify.org 2>/dev/null | tr -d '[:space:]')
+  log "teardown complete: redsocks_inactive=${socks_dead} native_egress=${direct_ip:-'(unknown)'}"
   log "cascade DISABLED ✓"
 }
 
@@ -464,9 +503,19 @@ do_status() {
   iptables -t nat -L OUTPUT -n 2>/dev/null | grep -q REDSOCKS && jump="yes"
   echo "  iptables REDSOCKS: $jump"
   # Live egress IP check (best-effort).
+  # Bug 152: the previous line concatenated the value with ITSELF — the
+  # `${egress_ip:+ $egress_ip}${egress_ip:-...}` pattern prints " $egress_ip"
+  # (non-empty branch) AND, because $egress_ip is non-empty, the second
+  # expansion `${egress_ip:-fallback}` resolves to $egress_ip AGAIN → e.g.
+  # "1.2.3.41.2.3.4". Build the string ONCE, trimmed, with a single fallback.
   local egress_ip
   egress_ip=$(curl -s --socks5 127.0.0.1:${SOCKS5_PORT} --max-time 8 https://api.ipify.org 2>/dev/null || echo "")
-  echo "  egress IP (socks5):${egress_ip:+ $egress_ip}${egress_ip:-' (unreachable)'}"
+  egress_ip=$(printf '%s' "$egress_ip" | tr -d '[:space:]')
+  if [[ -n "$egress_ip" ]]; then
+    echo "  egress IP (socks5): $egress_ip"
+  else
+    echo "  egress IP (socks5): (unreachable)"
+  fi
 
   # ── Bug 95: handshake-level diagnostics ─────────────────────────────────────
   # The mieru key = f(username, password, system clock). If the client can reach

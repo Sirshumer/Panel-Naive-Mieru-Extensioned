@@ -7,6 +7,50 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.6] — Release-fix 2026-06-10 (mieru users in mita-state, full cascade teardown, foolproofing)
+
+Field-tested 1.2.x→1.4.5 batch. Six items:
+
+- **BUG-151 (CRITICAL):** mita-state.json was rebuilt without a `users` section,
+  so `mita` saw N endpoints, found no user → `FATAL: no user found` → failed-loop.
+  Root cause: `update.sh rebuild_mita_state_direct` used a `'[]'` protocols-filter
+  fallback (dropping NULL-protocol users) and suppressed Node errors with
+  `2>/dev/null`, diverging from `index.js buildMitaStateFile` (which uses
+  `'["naive","mieru"]'`). Fixed the filter to match index.js, removed error
+  suppression, and added `reset-failed → apply → restart → is-active` verification.
+  `index.js applyMitaConfig()` now keeps mita **idle** (not FATAL) on an empty
+  base via `countMieruUsers()`.
+- **BUG-150 (CRITICAL):** Cascade teardown was incomplete. `cascade_mieru.sh
+  do_teardown` rewritten to be fully idempotent: flush/delete/destroy iptables
+  REDSOCKS chain + OUTPUT jump (by line-number), stop+disable+reset-failed
+  redsocks and delete `redsocks.conf`, remove watchdog/cron + fails file, stop
+  mieru-client + remove unit, daemon-reload, shred client config, mark state
+  disabled, verify native egress. `clear_iptables` hardened to remove ANY
+  OUTPUT→REDSOCKS jump.
+- **Доработка 1:** new explicit **"Сбросить каскад"** button →
+  `POST /api/settings/cascade/reset` performs the full BUG-150 teardown as one
+  atomic op (config.json, Caddyfile/upstream, mita rebuilt WITH native users,
+  iptables/redsocks/watchdog), restarts services and reports native egress.
+  Idempotent.
+- **Доработка 2 (foolproofing):** cascade-apply, cascade-reset and mita
+  restart/start buttons are greyed-out with a "Сначала создайте хотя бы один
+  ключ" tooltip while `users.count == 0` (`applyFoolproofGates()`), and the
+  delegated click handler now respects the `disabled` flag. mita no longer
+  loops on an empty base.
+- **BUG-153 (MEDIUM):** deleting a key now re-fetches the list + dashboard and
+  re-applies the foolproof gates without a re-login (delete already regenerates
+  Caddyfile/mita via `applyAllConfigs`).
+- **BUG-152 (LOW):** doubled egress IP in cascade status fixed — the probe
+  result is built once and trimmed.
+
+Update with one command:
+
+```
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+---
+
 ## [v1.4.5] — Audit 2026-06-09 (user-create double-submit: definitive fix — false "Email already in use")
 
 Follow-up to v1.4.4. The v1.4.4 fix coalesced concurrent requests via an

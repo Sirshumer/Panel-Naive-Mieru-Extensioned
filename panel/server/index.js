@@ -85,7 +85,7 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.4.5'
+    language: 'ru', version: '1.4.6'
   };
 }
 
@@ -96,7 +96,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.4.5';
+const VERSION_FALLBACK = '1.4.6';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -677,6 +677,16 @@ function ufwMieruRule(action, start, end, proto, comment) {
 
 // ── Mieru state JSON builder ──────────────────────────────────────────────────
 // Bug 51: use safe defaults for mieruPortStart/End in case config values absent
+// Bug 151 / Доработка 2: count the mieru-protocol users in the DB. mita FATALs
+// with "no user found" and enters a restart loop if it is started while this is
+// 0, so callers use it to keep mita idle on an empty base instead of crashing.
+function countMieruUsers() {
+  return getAllUsers().filter(u => {
+    try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('mieru'); }
+    catch { return true; }
+  }).length;
+}
+
 function buildMitaStateFile() {
   const allUsers = getAllUsers();
   const mieruUsers = allUsers.filter(u => {
@@ -774,6 +784,20 @@ function applyMitaConfig() {
     // Bug 96: always clear a lingering failed state first so subsequent
     //   start/restart commands are honoured by systemd.
     resetMitaFailed();
+
+    // Bug 151 / Доработка 2 (foolproofing): if there are NO mieru users yet,
+    // do NOT start mita. Starting it with an empty users[] makes it FATAL with
+    // "no user found" and spin in a restart loop. Apply the (userless) config so
+    // the file is in sync, then keep the service stopped+reset until the first
+    // key is created (creating a user calls applyAllConfigs() → here again).
+    if (countMieruUsers() === 0) {
+      try { execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 15000 }); } catch {}
+      try { execSync('mita stop 2>/dev/null || true', { timeout: 10000 }); } catch {}
+      try { execSync('systemctl stop mita 2>/dev/null || true', { timeout: 10000 }); } catch {}
+      resetMitaFailed();
+      shredFile(file + '.last');
+      return true;   // idle is the correct, healthy state on an empty base
+    }
 
     execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 15000 });
 
@@ -1850,6 +1874,68 @@ app.post('/api/settings/cascade', requireAuth, (req, res) => {
             ? 'Cascade enabled. Naive upstream + Mieru relay (Variant B) applied.'
             : 'Cascade enabled for Naive only (no Mieru exit configured).')
         : 'Cascade disabled. Relay torn down.'
+    });
+  } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// Доработка 1 / Bug 150: explicit "Reset cascade" — one atomic, idempotent
+// operation that returns the server to its exact pre-cascade state across EVERY
+// layer, independent of the enable checkbox:
+//   • UI/config state  : cascadeEnabled=false, clear Naive upstream + Mieru exit
+//   • Caddyfile        : rebuilt with NO upstream (Naive leg back to direct)
+//   • Network          : full Variant-B teardown (iptables/redsocks/mieru-client/
+//                        watchdog/redsocks.conf) via cascade_mieru.sh teardown
+//   • mita             : rebuilt from DB with the NATIVE users (Bug 151) and
+//                        reset-failed + (re)started, or left idle if no keys
+// Running it twice is safe (every step tolerates "already clean").
+app.post('/api/settings/cascade/reset', requireAuth, (req, res) => {
+  try {
+    // 1) Wipe cascade state from config so nothing re-applies it on next boot.
+    cfg.cascadeEnabled       = false;
+    cfg.cascadeNaiveUpstream = '';
+    const prevMieru = cfg.cascadeMieru || {};
+    cfg.cascadeMieru = {
+      host: '', portStart: prevMieru.portStart || 2012,
+      portEnd: prevMieru.portEnd || 2022, user: '', pass: '',
+      mtu: prevMieru.mtu || cfg.mtu || 1400
+    };
+    // Drop any legacy Variant-A native egress too.
+    cfg.cascadeMieruEgress = {};
+    saveConfig();
+
+    // 2) Naive leg → Caddyfile with no upstream (back to direct).
+    let caddyOk = false, caddyError = '';
+    try {
+      const content = buildCaddyfile(cfg, getAllUsers());
+      writeCaddyfileAtomic(content);
+      const r = applyCaddyConfig();
+      caddyOk = r.ok; caddyError = r.ok ? '' : (r.error || '');
+    } catch (e) { caddyError = e.message; }
+
+    // 3) Mieru leg → full Variant-B teardown (idempotent).
+    const td = runCascadeMieru('teardown');
+
+    // 4) Entry mita → rebuild from DB with native users (Bug 151) + (re)start,
+    //    or stay idle on an empty base.
+    const mitaOk = applyMitaConfig();
+
+    // 5) Report native egress so the operator sees egress=RU immediately.
+    let egress = '';
+    try {
+      egress = execSync(
+        "curl -s --max-time 8 https://api.ipify.org 2>/dev/null",
+        { timeout: 10000 }
+      ).toString().trim();
+    } catch { egress = ''; }
+
+    res.json({
+      ok: caddyOk && td.ok,
+      caddyOk, mitaOk, teardownOk: td.ok, caddyError,
+      cascadeOutput: td.output || '',
+      nativeEgress: egress || '(unknown)',
+      message: 'Каскад полностью сброшен: конфиг очищен, Caddy без upstream, '
+             + 'relay снят (iptables/redsocks/mieru-client/watchdog), '
+             + 'mita пересобрана с родными ключами.'
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
