@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.4.6
+ * Panel Naive + Mieru — Frontend Application v1.4.7
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  * v1.2.5: probe-secret setting, disabled-button+spinner on all submit handlers,
@@ -529,21 +529,36 @@ async function loadUsers() {
 // Доработка 2 (защита от дурака): most service crashes happen because operators
 // enable the cascade or restart mita BEFORE the first key exists (mita then
 // FATALs "no user found"). While there are 0 keys we grey-out and disable the
-// cascade-apply, cascade-reset and service restart/start buttons with an
-// explanatory tooltip. `count` is optional — if omitted we read state.users.
+// cascade-apply and service restart/start buttons with an explanatory tooltip.
+//
+// BUG-154: the gate must use the LIVE key count, not the cached `state.users`
+// (which is initialised to [] and only filled by loadUsers() — so a direct
+// entry into Settings saw length 0 and falsely blocked the buttons). When
+// `count` is not passed we ask the backend; on any error we FAIL-OPEN (treat
+// as having keys) so a flaky request never blocks a configured server.
+//
+// BUG-154: "Сбросить каскад" is deliberately NOT gated — it is a safe cleanup
+// that must always work (otherwise a stuck cascade + a glitchy gate could
+// leave the operator unable to reset it).
 async function applyFoolproofGates(count) {
   let n = count;
-  if (n === undefined) {
-    // Best-effort: prefer the cached user list, else ask the server.
-    if (Array.isArray(state.users)) n = state.users.length;
-    else { try { n = (await api('GET', '/api/status')).panel.userCount; } catch { n = 1; } }
+  if (typeof n !== 'number') {
+    // Always read the live count from the backend; do not trust the cache.
+    try {
+      const st = await api('GET', '/api/status');
+      n = st && st.panel ? st.panel.userCount : undefined;
+    } catch { n = undefined; }
+    // Secondary best-effort from the cache, then FAIL-OPEN (assume keys exist).
+    if (typeof n !== 'number') {
+      n = Array.isArray(state.users) && state.users.length ? state.users.length : 1;
+    }
   }
   const noKeys = (n || 0) === 0;
   const tip = t('settings.needKeyFirst') || 'Сначала создайте хотя бы один ключ';
-  // Buttons that must be blocked on an empty base.
+  // Buttons blocked on an empty base. NOTE: reset-cascade is intentionally
+  // excluded — it is a safe teardown that must always be available.
   const selectors = [
     '[data-action="change-cascade"]',
-    '[data-action="reset-cascade"]',
     '[data-action="svc"][data-svc="mita"][data-svc-action="restart"]',
     '[data-action="svc"][data-svc="mita"][data-svc-action="start"]'
   ];
@@ -554,6 +569,13 @@ async function applyFoolproofGates(count) {
       if (noKeys) { btn.title = tip; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed'; }
       else        { btn.title = ''; btn.style.opacity = ''; btn.style.cursor = ''; }
     });
+  });
+  // BUG-154: actively un-gate "Сбросить каскад" in case an earlier build (or a
+  // stale class) left it disabled — it must always be clickable.
+  document.querySelectorAll('[data-action="reset-cascade"]').forEach(btn => {
+    btn.disabled = false;
+    btn.classList.remove('is-disabled');
+    btn.title = ''; btn.style.opacity = ''; btn.style.cursor = '';
   });
 }
 

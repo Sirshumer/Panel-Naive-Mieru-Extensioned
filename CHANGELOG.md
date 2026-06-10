@@ -7,6 +7,33 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.7] — Hotfix 2026-06-10 (BUG-154: cascade foolproof gate falsely blocked buttons)
+
+- **BUG-154 (MEDIUM, cosmetic):** the v1.4.6 foolproof gate falsely disabled the
+  "Применить каскад" / "Сбросить каскад" buttons on the Settings page until the
+  Keys page had been visited at least once. Root cause: `applyFoolproofGates()`
+  read the key count from the cached `state.users`, which is initialised to `[]`
+  and only filled by `loadUsers()` — so a direct entry into Settings saw length 0
+  and blocked the buttons even though keys existed in the DB.
+  - The gate now reads the **live** key count from the backend (`/api/status`
+    `panel.userCount`) instead of the cache, and **fails open** (assumes keys
+    exist) on any request error, so a flaky probe never blocks a configured
+    server.
+  - **"Сбросить каскад" is no longer gated at all** — it is a safe cleanup that
+    must always be available (a stuck cascade + a glitchy gate must never leave
+    the operator unable to reset it). It is also actively re-enabled on every
+    gate pass in case a stale `disabled`/`is-disabled` lingered.
+
+Frontend-only change; no server behaviour altered.
+
+Update with one command:
+
+```
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+---
+
 ## [v1.4.6] — Release-fix 2026-06-10 (mieru users in mita-state, full cascade teardown, foolproofing)
 
 Field-tested 1.2.x→1.4.5 batch. Six items:
