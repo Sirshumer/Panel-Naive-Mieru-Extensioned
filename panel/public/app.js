@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.4.5
+ * Panel Naive + Mieru — Frontend Application v1.4.6
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  * v1.2.5: probe-secret setting, disabled-button+spinner on all submit handlers,
@@ -235,6 +235,9 @@ document.addEventListener('DOMContentLoaded', async () => {
 function handleDelegatedClick(e) {
   const btn = e.target.closest('[data-action]');
   if (!btn) return;
+  // Доработка 2: the delegated handler bypasses the native `disabled` attribute,
+  // so honour it explicitly — a greyed-out (foolproof-gated) button must NOT act.
+  if (btn.disabled || btn.classList.contains('is-disabled')) { e.preventDefault(); return; }
   const action = btn.dataset.action;
 
   switch (action) {
@@ -277,6 +280,7 @@ function handleDelegatedClick(e) {
     case 'apply-probe-mode':     applyProbeMode(); break;
     case 'change-cascade':       changeCascade(); break;
     case 'cascade-status':       checkCascadeStatus(); break;
+    case 'reset-cascade':        resetCascade(); break;
     // ── v1.4.0: external panel access
     case 'gen-web-base-path':    generateWebBasePath(); break;
     case 'save-external-access': saveExternalAccess(); break;
@@ -515,9 +519,42 @@ async function loadUsers() {
   try {
     state.users = await api('GET', '/api/users');
     renderUsersTable(state.users);
+    // Доработка 2: re-evaluate the foolproof gates whenever the key list changes.
+    applyFoolproofGates(state.users.length);
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="10" class="table-empty" style="color:var(--red)">${esc(err.message)}</td></tr>`;
   }
+}
+
+// Доработка 2 (защита от дурака): most service crashes happen because operators
+// enable the cascade or restart mita BEFORE the first key exists (mita then
+// FATALs "no user found"). While there are 0 keys we grey-out and disable the
+// cascade-apply, cascade-reset and service restart/start buttons with an
+// explanatory tooltip. `count` is optional — if omitted we read state.users.
+async function applyFoolproofGates(count) {
+  let n = count;
+  if (n === undefined) {
+    // Best-effort: prefer the cached user list, else ask the server.
+    if (Array.isArray(state.users)) n = state.users.length;
+    else { try { n = (await api('GET', '/api/status')).panel.userCount; } catch { n = 1; } }
+  }
+  const noKeys = (n || 0) === 0;
+  const tip = t('settings.needKeyFirst') || 'Сначала создайте хотя бы один ключ';
+  // Buttons that must be blocked on an empty base.
+  const selectors = [
+    '[data-action="change-cascade"]',
+    '[data-action="reset-cascade"]',
+    '[data-action="svc"][data-svc="mita"][data-svc-action="restart"]',
+    '[data-action="svc"][data-svc="mita"][data-svc-action="start"]'
+  ];
+  selectors.forEach(sel => {
+    document.querySelectorAll(sel).forEach(btn => {
+      btn.disabled = noKeys;
+      btn.classList.toggle('is-disabled', noKeys);
+      if (noKeys) { btn.title = tip; btn.style.opacity = '0.5'; btn.style.cursor = 'not-allowed'; }
+      else        { btn.title = ''; btn.style.opacity = ''; btn.style.cursor = ''; }
+    });
+  });
 }
 
 function renderUsersTable(users) {
@@ -669,7 +706,15 @@ async function deleteUser(id, username) {
   try {
     await api('DELETE', `/api/users/${id}`);
     toast(t('users.deleted', { name: username }), 'success');
-    loadUsers();
+    // BUG-153: the server already regenerated Caddyfile + mita-state.json and
+    // restarted services in the DELETE handler (applyAllConfigs). The UI must
+    // now re-sync from the backend WITHOUT a manual F5: await the user list,
+    // refresh the dashboard service/user-count state, and re-evaluate the
+    // foolproof gates (cascade/restart get disabled again if this was the last
+    // key). Awaited so any failure surfaces instead of leaving a stale list.
+    await loadUsers();
+    if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
+    if (typeof applyFoolproofGates === 'function') { try { await applyFoolproofGates(); } catch {} }
   } catch (err) {
     toast(err.message, 'error');
   }
@@ -890,6 +935,10 @@ async function loadSettings() {
         if (el) el.textContent = verStr;
       });
     }
+
+    // Доработка 2: gate the cascade/restart buttons whenever the settings page
+    // is opened (the user may land here before visiting the keys page).
+    applyFoolproofGates();
   } catch {}
 }
 
@@ -1211,6 +1260,41 @@ async function checkCascadeStatus() {
   try {
     const res = await api('GET', '/api/settings/cascade/status');
     cascadeShowStatus(res.output || (res.ok ? 'OK' : 'no status'));
+  } catch (err) {
+    showMsg('cascade-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// Доработка 1: explicit "Сбросить каскад" — full atomic teardown of every layer
+// (config, Caddyfile/upstream, iptables/redsocks/mieru-client/watchdog, mita
+// rebuilt with native users). Idempotent: pressing it twice is safe.
+async function resetCascade() {
+  if (!confirm(t('settings.resetCascadeConfirm')
+      || 'Полностью сбросить каскад и вернуть сервер в исходное состояние? Egress станет родным IP.'))
+    return;
+  const btn = document.querySelector('[data-action="reset-cascade"]');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('POST', '/api/settings/cascade/reset', {});
+    // Reflect the cleared state locally so the form + checkbox update at once.
+    if (state.config) {
+      state.config.cascadeEnabled = false;
+      state.config.cascadeNaiveUpstream = '';
+      state.config.cascadeMieru = { ...(state.config.cascadeMieru || {}), host: '', user: '', pass: false };
+    }
+    const enabledEl = el('s-cascade-enabled'); if (enabledEl) enabledEl.checked = false;
+    const naiveEl   = el('s-cascade-naive-upstream'); if (naiveEl) naiveEl.value = '';
+    const hostEl    = el('s-cascade-mieru-host'); if (hostEl) hostEl.value = '';
+    const userEl    = el('s-cascade-mieru-user'); if (userEl) userEl.value = '';
+    const passEl    = el('s-cascade-mieru-pass'); if (passEl) { passEl.value = ''; passEl.placeholder = 'password'; }
+    const egress = res.nativeEgress ? ` (egress: ${res.nativeEgress})` : '';
+    showMsg('cascade-msg', (res.message || t('settings.cascadeReset') || 'Каскад сброшен') + egress, true);
+    toast(t('settings.cascadeReset') || 'Каскад сброшен', 'success');
+    if (res.cascadeOutput) cascadeShowStatus(res.cascadeOutput);
+    // Refresh dashboard service state so mita/naive status reflects the reset.
+    if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
   } catch (err) {
     showMsg('cascade-msg', err.message, false);
   } finally {

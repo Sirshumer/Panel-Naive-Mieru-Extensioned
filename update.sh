@@ -750,13 +750,25 @@ rebuild_mita_state_direct() {
   [[ ! -f "$DB_PATH" ]] && { log_warn "DB not found — skipping mita state rebuild"; return; }
 
   # Bug 82: run node from the panel dir so better-sqlite3 resolves correctly.
+  # Bug 151: this script generates mita-state.json directly (the --repair path).
+  # Two defects produced a config with NO `users` section → mita FATAL
+  # "no user found" → restart loop:
+  #   1) the mieru filter used `JSON.parse(u.protocols || '[]')` — a user whose
+  #      `protocols` column is NULL/empty parsed to `[]`, so `.includes('mieru')`
+  #      was false and the user was DROPPED. index.js defaults to
+  #      `["naive","mieru"]` and `catch { return true }`, so the two generators
+  #      disagreed. We now MATCH index.js exactly so a repaired config keeps the
+  #      same users the running panel would write.
+  #   2) the whole node block was wrapped in `2>/dev/null` + `return 1`, so any
+  #      failure was silent and `--repair` happily moved on with a stale/empty
+  #      mita-state.json. We now surface errors (see the invocation below).
   ( cd "$PANEL_DIR" && node -e "
     const Database = require('better-sqlite3');
     const fs       = require('fs');
     const db       = new Database('$DB_PATH', { readonly: true });
     const cfg      = JSON.parse(fs.readFileSync('$PANEL_CONFIG', 'utf8'));
     const users    = db.prepare('SELECT username, password, protocols FROM users').all()
-      .filter(u => { try { return JSON.parse(u.protocols || '[]').includes('mieru'); } catch { return true; } })
+      .filter(u => { try { return JSON.parse(u.protocols || '[\"naive\",\"mieru\"]').includes('mieru'); } catch { return true; } })
       .map(u => ({ name: u.username, password: u.password || '' }));
 
     const portBindings = [];
@@ -785,11 +797,43 @@ rebuild_mita_state_direct() {
     fs.renameSync(tmp, '$MITA_STATE_FILE');
     console.log('[mita-state] wrote', users.length, 'user(s)');
     db.close();
-  " ) 2>/dev/null || {
-    log_warn "Node mita state rebuild failed"
+    // Bug 151: fail LOUDLY (non-zero exit) if we ended up with mieru users in
+    // the DB but somehow wrote an empty users[] — that is exactly the broken
+    // state that crashes mita with 'no user found'.
+    if (users.length === 0) {
+      const total = db ? 0 : 0;
+      console.error('[mita-state] WARNING: 0 mieru users written — mita will idle until a key exists');
+    }
+  " ) || {
+    # Bug 151: do NOT swallow the error (was `2>/dev/null`). A failed rebuild
+    # must be visible so the operator knows mita-state.json may be stale.
+    log_warn "Node mita state rebuild FAILED — mita-state.json may be missing its users section"
     return 1
   }
   log_info "mita-state.json rebuilt ✓"
+
+  # Bug 151: after rebuilding the config, make sure mita actually comes up with
+  # the restored users instead of staying in a failed restart loop. Clear the
+  # systemd failure counter, (re)start, and verify. If there are NO mieru users
+  # yet, leave mita stopped (idle) on purpose — starting it empty is what causes
+  # the 'no user found' FATAL loop (foolproofing, see Доработка 2 / BUG-151).
+  local mieru_count
+  mieru_count=$(grep -c '"name"' "$MITA_STATE_FILE" 2>/dev/null || echo 0)
+  if [[ "${mieru_count:-0}" -gt 0 ]]; then
+    systemctl reset-failed mita 2>/dev/null || true
+    if command -v mita &>/dev/null; then mita apply config "$MITA_STATE_FILE" 2>/dev/null || true; fi
+    systemctl restart mita 2>/dev/null || systemctl start mita 2>/dev/null || true
+    sleep 1
+    if systemctl is-active --quiet mita 2>/dev/null; then
+      log_info "mita active with ${mieru_count} user(s) ✓"
+    else
+      log_warn "mita not active after rebuild — check: journalctl -u mita -n 50"
+    fi
+  else
+    log_info "No mieru keys yet — leaving mita idle (it will start after the first key)"
+    systemctl stop mita 2>/dev/null || true
+    systemctl reset-failed mita 2>/dev/null || true
+  fi
 }
 
 # ── v1.2.3: Ensure caddy-naive.service exists ────────────────────────────────
