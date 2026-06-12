@@ -283,18 +283,31 @@ sync_config_version() {
 # ── v1.4.0: helpers for external panel access (update.sh) ─────────────────────
 gen_web_base_path() { openssl rand -hex 8 2>/dev/null | tr -d '\n'; }
 
+# BUG-155: sieve any hasher output down to a single valid bcrypt token, so
+# package-manager noise can never end up in the hash (see install.sh for the
+# full root-cause writeup).
+extract_bcrypt() {
+  grep -aoE '\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}' 2>/dev/null | head -n1
+}
+
+# BUG-155: keep htpasswd available without capturing apt's stdout into a hash.
+ensure_htpasswd() {
+  command -v htpasswd &>/dev/null && return 0
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2-utils >/dev/null 2>&1 || true
+  command -v htpasswd &>/dev/null
+}
+
 panel_hash_password() {
   local plain="$1" hash="" cb="${CADDY_BIN:-/usr/local/bin/caddy-naive}"
   if [[ -x "$cb" ]]; then
-    hash=$(printf '%s' "$plain" | "$cb" hash-password 2>/dev/null | tr -d '\n') || true
+    hash=$(printf '%s' "$plain" | "$cb" hash-password 2>/dev/null | extract_bcrypt) || true
   fi
   if [[ -z "$hash" ]] && command -v caddy &>/dev/null; then
-    hash=$(printf '%s' "$plain" | caddy hash-password 2>/dev/null | tr -d '\n') || true
+    hash=$(printf '%s' "$plain" | caddy hash-password 2>/dev/null | extract_bcrypt) || true
   fi
   if [[ -z "$hash" ]]; then
-    command -v htpasswd &>/dev/null || \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2-utils 2>/dev/null || true
-    hash=$(htpasswd -bnBC 12 "" "$plain" 2>/dev/null | tr -d ':\n' | sed 's/^[^$]*//')
+    ensure_htpasswd
+    hash=$(htpasswd -bnBC 12 "" "$plain" 2>/dev/null | extract_bcrypt) || true
   fi
   printf '%s' "$hash"
 }
@@ -386,6 +399,46 @@ migrate_config() {
       log_info "Config migrated: external-access fields added (SSH-only default) ✓"
     fi
     rm -f "$tmp2"
+  fi
+
+  # BUG-155 (HIGH): self-heal a polluted panelBasicAuthHash. A pre-fix installer
+  # could capture `apt-get install apache2-utils` stdout (Selecting previously…,
+  # Unpacking…, needrestart banner) into the hash → multi-line value → invalid
+  # Caddyfile → caddy-naive failed-loop, which neither --ssh-only nor --repair
+  # cleaned up. On every update we sieve the stored value down to a single valid
+  # bcrypt token; if none is present we blank it (the operator re-sets the
+  # password from the UI). This makes the failed-loop recoverable by a plain
+  # update with no manual jq/nano edits.
+  sanitize_basic_auth_hash
+}
+
+# BUG-155: keep only a single valid bcrypt token in panelBasicAuthHash. If the
+# stored value is already clean this is a no-op; if it's polluted we extract the
+# embedded hash (last match), and if there is none we blank the field.
+sanitize_basic_auth_hash() {
+  [[ -f "$PANEL_CONFIG" ]] || return 0
+  CFG_FILE="$PANEL_CONFIG" node -e '
+    const fs = require("fs");
+    const file = process.env.CFG_FILE;
+    let cfg;
+    try { cfg = JSON.parse(fs.readFileSync(file, "utf8")); } catch { process.exit(0); }
+    const raw = String(cfg.panelBasicAuthHash || "");
+    const RE  = /^\$2[aby]\$[0-9]{2}\$[.\/A-Za-z0-9]{53}$/;
+    if (RE.test(raw)) process.exit(0);                  // already clean
+    const m = raw.match(/\$2[aby]\$[0-9]{2}\$[.\/A-Za-z0-9]{53}/g);
+    const clean = (m && m.length) ? m[m.length - 1] : "";
+    if (clean === raw) process.exit(0);
+    cfg.panelBasicAuthHash = clean;
+    const tmp = file + ".new";
+    fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2), { mode: 0o600 });
+    fs.renameSync(tmp, file);
+    process.stderr.write(clean ? "healed" : "blanked");
+  ' 2>/tmp/.ba_heal || true
+  local r; r=$(cat /tmp/.ba_heal 2>/dev/null || echo ""); rm -f /tmp/.ba_heal
+  if [[ "$r" == "healed" ]]; then
+    log_info "BUG-155: panelBasicAuthHash sanitized (extracted valid bcrypt from polluted value) ✓"
+  elif [[ "$r" == "blanked" ]]; then
+    log_warn "BUG-155: panelBasicAuthHash was invalid and has been cleared — re-set the panel password in the UI"
   fi
 }
 
@@ -1390,6 +1443,12 @@ do_ssh_only() {
 
   auto_backup >/dev/null
 
+  # BUG-155: clean any polluted panelBasicAuthHash so the rebuilt Caddyfile is
+  # valid even if a pre-fix installer left apt output in the hash. (Without this,
+  # --ssh-only set exposePanel=false but the garbage hash stayed in config.json
+  # and re-broke the Caddyfile on the next regenerate.)
+  sanitize_basic_auth_hash
+
   # exposePanel=false → template/rebuild omits the panel subdomain block.
   cfg_set_json exposePanel "bool:0" panelHost "127.0.0.1" panelPort "int:3000" \
     && log_ok_or_info "config.json updated (exposePanel=false, panelDomain preserved)"
@@ -1460,9 +1519,19 @@ print_panel_credentials() {
 do_repair() {
   log_step "Repair mode — rebuilding configs from SQLite database"
 
+  # BUG-155: make --repair reliable as a one-liner. With `-y` we never prompt.
+  # Without `-y` but with NO usable terminal (the common
+  # `curl … | bash -s -- --repair` case) the old `read` consumed the empty pipe
+  # stdin and always "Aborted" even though the operator clearly asked to repair.
+  # We now (a) honour -y, (b) prompt on /dev/tty when one is available, and
+  # (c) when there is no TTY at all, proceed (an explicit --repair IS consent).
   if ! $YES; then
-    read -rp "Rebuild Caddyfile and mita state from DB? [y/N]: " confirm
-    [[ "${confirm^^}" != "Y" ]] && { log_info "Aborted."; exit 0; }
+    if [[ -r /dev/tty ]]; then
+      read -rp "Rebuild Caddyfile and mita state from DB? [y/N]: " confirm </dev/tty || confirm=""
+      [[ "${confirm^^}" != "Y" ]] && { log_info "Aborted."; exit 0; }
+    else
+      log_info "No interactive terminal — proceeding with repair (use -y to silence this)."
+    fi
   fi
 
   $DRY_RUN && { log_dry "Would rebuild all configs from $DB_PATH"; return; }

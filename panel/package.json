@@ -1,12 +1,12 @@
 {
   "name": "panel-naive-mieru",
-  "version": "1.4.7",
+  "version": "1.4.8",
   "description": "Web management panel for NaiveProxy + Mieru by RIXXX",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
     "dev": "node server/index.js",
-    "test": "node ../tests/migration-bug149.test.js && node ../tests/race-bug149.test.js && node ../tests/version-bug143.test.js"
+    "test": "node ../tests/migration-bug149.test.js && node ../tests/race-bug149.test.js && node ../tests/version-bug143.test.js && node ../tests/bug155-basicauth.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

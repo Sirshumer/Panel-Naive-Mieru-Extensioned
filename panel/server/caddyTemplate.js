@@ -37,6 +37,16 @@
 
 const crypto = require('crypto');
 
+// ── extractBcrypt() — BUG-155 ────────────────────────────────────────────────
+// Return a single valid bcrypt token ($2[aby]$NN$<53 chars>) from arbitrary
+// text. An old installer could capture apt/needrestart stdout into
+// panelBasicAuthHash; this sieves it back down to the one real hash (last match)
+// so the panel basic_auth block is always valid. Returns '' if there is none.
+function extractBcrypt(text) {
+  const m = String(text || '').match(/\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}/g);
+  return m && m.length ? m[m.length - 1] : '';
+}
+
 // ── normalizeUpstream() — Bug 92 ─────────────────────────────────────────────
 // Caddy forward_proxy `upstream` only accepts a clean https:// URL. The panel
 // already normalizes, but render() is also called directly from install.sh /
@@ -122,7 +132,13 @@ function renderPanelBlock(cfg) {
   const panelDomain = String(cfg.panelDomain || '').trim();
   const email       = String(cfg.adminEmail || '').trim();
   const baUser      = String(cfg.panelBasicAuthUser || '').trim();
-  const baHash      = String(cfg.panelBasicAuthHash || '').trim();
+  // BUG-155: a polluted hash (apt output captured by an old installer) must
+  // NEVER reach the Caddyfile — it produced a multi-line basic_auth block that
+  // failed `caddy validate` and dropped caddy-naive into a restart loop. Sieve
+  // the stored value to a single valid bcrypt token; if none is present, emit
+  // no basic_auth line (the operator re-sets the password) rather than a broken
+  // config.
+  const baHash      = extractBcrypt(String(cfg.panelBasicAuthHash || ''));
   const stubFile    = String(cfg.panelStubPage || '/var/www/panel-stub/index.html').trim();
   const webBasePath = sanitizeWebBasePath(cfg.webBasePath);
   const panelPort   = parseInt(cfg.panelPort, 10) || 3000;

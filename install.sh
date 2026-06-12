@@ -640,20 +640,46 @@ STUBHTML
 # change it later in the UI to a custom value.
 gen_web_base_path() { openssl rand -hex 8 2>/dev/null | tr -d '\n'; }
 
+# BUG-155: a single, valid bcrypt token is  $2[aby]$NN$<53 base64-ish chars>.
+# Any hasher (caddy / htpasswd) can be preceded by package-manager noise when it
+# captures stdout, so we ALWAYS sieve the output down to the one line that looks
+# like a bcrypt hash. Returns the matched token or empty.
+extract_bcrypt() {
+  grep -aoE '\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}' 2>/dev/null | head -n1
+}
+
+# BUG-155: keep htpasswd available WITHOUT capturing apt's stdout into a hash.
+# Pre-installing apache2-utils here (stdout+stderr fully redirected to /dev/null)
+# means the hashing step never runs apt inside a $(...) capture.
+ensure_htpasswd() {
+  command -v htpasswd &>/dev/null && return 0
+  DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2-utils >/dev/null 2>&1 || true
+  command -v htpasswd &>/dev/null
+}
+
 # Hash a basic-auth password with `caddy hash-password` (bcrypt). The caddy-naive
 # binary ships the same subcommand. Falls back to htpasswd-style bcrypt if needed.
+#
+# BUG-155 (HIGH): the previous version ran `apt-get install apache2-utils` with
+# only stderr redirected, INSIDE this function which is itself called as
+# `$(panel_hash_password ...)`. On servers where apache2-utils was not yet
+# installed, apt's STDOUT ("Selecting previously unselected package…",
+# "Unpacking…", the needrestart banner, etc.) was captured into the hash, so
+# config.json got a multi-line panelBasicAuthHash and the regenerated Caddyfile
+# became invalid → caddy-naive failed-loop. We now (a) pre-install apache2-utils
+# with stdout fully suppressed, and (b) sieve every hasher's output through
+# extract_bcrypt so ONLY a single valid bcrypt token can ever be returned.
 panel_hash_password() {
   local plain="$1" hash=""
   if [[ -x "$CADDY_BIN" ]]; then
-    hash=$(printf '%s' "$plain" | "$CADDY_BIN" hash-password 2>/dev/null | tr -d '\n') || true
+    hash=$(printf '%s' "$plain" | "$CADDY_BIN" hash-password 2>/dev/null | extract_bcrypt) || true
   fi
   if [[ -z "$hash" ]] && command -v caddy &>/dev/null; then
-    hash=$(printf '%s' "$plain" | caddy hash-password 2>/dev/null | tr -d '\n') || true
+    hash=$(printf '%s' "$plain" | caddy hash-password 2>/dev/null | extract_bcrypt) || true
   fi
   if [[ -z "$hash" ]]; then
-    command -v htpasswd &>/dev/null || \
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2-utils 2>/dev/null || true
-    hash=$(htpasswd -bnBC 12 "" "$plain" 2>/dev/null | tr -d ':\n' | sed 's/^[^$]*//')
+    ensure_htpasswd
+    hash=$(htpasswd -bnBC 12 "" "$plain" 2>/dev/null | extract_bcrypt) || true
   fi
   printf '%s' "$hash"
 }
@@ -1123,11 +1149,11 @@ write_config_json() {
     process.stdout.write(bcrypt.hashSync(pw, 12));
   " 2>/dev/null) || true
   # Fallback: htpasswd (apache2-utils) if Node hashing failed for any reason.
+  # BUG-155: pre-install with stdout suppressed, then sieve output to one bcrypt
+  # token (the old `tr|sed` could leak apt noise captured from this subshell).
   if [[ -z "$bcrypt_hash" ]]; then
-    if ! command -v htpasswd &>/dev/null; then
-      DEBIAN_FRONTEND=noninteractive apt-get install -y -qq apache2-utils 2>/dev/null || true
-    fi
-    bcrypt_hash=$(htpasswd -bnBC 12 "" "$ADMIN_PASS" 2>/dev/null | tr -d ':\n' | sed 's/^[^$]*//')
+    ensure_htpasswd
+    bcrypt_hash=$(htpasswd -bnBC 12 "" "$ADMIN_PASS" 2>/dev/null | extract_bcrypt) || true
   fi
   [[ -z "$bcrypt_hash" ]] && die "$(t 'Не удалось создать bcrypt-хеш пароля' 'Failed to generate bcrypt password hash')"
 
