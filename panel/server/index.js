@@ -85,7 +85,7 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.4.8'
+    language: 'ru', version: '1.4.9'
   };
 }
 
@@ -96,7 +96,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.4.8';
+const VERSION_FALLBACK = '1.4.9';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -609,6 +609,11 @@ function writeCaddyfileAtomic(content) {
 let lastCaddyError = '';
 function getLastCaddyError() { return lastCaddyError; }
 
+// BUG-156: last mita apply/validate error, surfaced to the UI so a rejected
+// config (e.g. a bad trafficPattern) is visible instead of a silent IDLE mita.
+let lastMitaError = '';
+function getLastMitaError() { return lastMitaError; }
+
 // ── applyCaddyConfig() — Bug 91 ──────────────────────────────────────────────
 // Previously the panel applied config via `systemctl reload` (kill -USR1). A
 // graceful reload SILENTLY KEEPS the old in-memory config when the new config
@@ -713,6 +718,54 @@ function countMieruUsers() {
   }).length;
 }
 
+// BUG-156: build a proto-correct mita `trafficPattern` object for a UI preset.
+// `seed` MUST be an int32 (not a boolean). We keep a STABLE per-install seed in
+// cfg.trafficPatternSeed so regenerating the config (key add/delete, toggling
+// obfuscation off and on) does not churn the implicit pattern. Returns null for
+// NOOP / unknown presets (caller then omits trafficPattern entirely).
+function getStableTrafficSeed() {
+  let s = parseInt(cfg.trafficPatternSeed, 10);
+  if (!Number.isInteger(s) || s <= 0 || s > 0x7fffffff) {
+    // 31-bit positive int → always a valid proto int32.
+    s = (crypto.randomBytes(4).readUInt32BE(0) & 0x7fffffff) || 1;
+    cfg.trafficPatternSeed = s;
+    try { saveConfig(); } catch {}
+  }
+  return s;
+}
+
+function buildTrafficPattern(pat, _cfg) {
+  const seed = getStableTrafficSeed();
+  switch (pat) {
+    case 'RANDOM_PADDING':
+      // Conservative: stable seed + limited implicit options, no TCP fragmenting.
+      return {
+        seed,
+        unlockAll: false,
+        tcpFragment: { enable: false, maxSleepMs: 0 },
+        nonce: { type: 'NONCE_TYPE_PRINTABLE', applyToAllUDPPacket: false, minLen: 4, maxLen: 8 }
+      };
+    case 'RANDOM_PADDING_AGGRESSIVE':
+      // Aggressive: unlock all implicit options + TCP fragmentation + nonce on all UDP.
+      return {
+        seed,
+        unlockAll: true,
+        tcpFragment: { enable: true, maxSleepMs: 10 },
+        nonce: { type: 'NONCE_TYPE_PRINTABLE', applyToAllUDPPacket: true, minLen: 6, maxLen: 12 }
+      };
+    case 'CUSTOM':
+      // Honour an operator-supplied object verbatim, but coerce seed to int32.
+      if (_cfg && _cfg.trafficPatternCustom && typeof _cfg.trafficPatternCustom === 'object') {
+        const c = { ..._cfg.trafficPatternCustom };
+        c.seed = Number.isInteger(parseInt(c.seed, 10)) ? parseInt(c.seed, 10) : seed;
+        return c;
+      }
+      return { seed, unlockAll: true };
+    default:
+      return null;
+  }
+}
+
 function buildMitaStateFile() {
   const allUsers = getAllUsers();
   const mieruUsers = allUsers.filter(u => {
@@ -741,14 +794,21 @@ function buildMitaStateFile() {
     mtu: cfg.mtu || 1400
   };
 
+  // BUG-156 (HIGH): the previous patMap wrote `seed: true` (a boolean) into the
+  // mita trafficPattern. In the mita proto `seed` is an INT32 (it seeds stable
+  // implicit pattern generation), and `tcpFragment` / `nonce` are OBJECTS, not
+  // booleans. `mita apply config` rejected the boolean with
+  //   proto: invalid value for int32 type: true  → server config empty → IDLE,
+  // so the Mieru port never opened. We now emit the proto-correct schema
+  // (see https://github.com/enfein/mieru/blob/main/docs/traffic-pattern.md):
+  //   • seed        → int32  (the on/off toggle is `unlockAll`, a bool)
+  //   • unlockAll   → bool   (false = conservative, true = aggressive)
+  //   • tcpFragment → { enable: bool, maxSleepMs: int }
+  //   • nonce       → { type: enum-string, applyToAllUDPPacket: bool, minLen, maxLen }
   const pat = cfg.trafficPattern || 'NOOP';
   if (pat !== 'NOOP') {
-    const patMap = {
-      'RANDOM_PADDING':            { seed: true,  tcpFragment: false, nonce: false },
-      'RANDOM_PADDING_AGGRESSIVE': { seed: true,  tcpFragment: true,  nonce: true  },
-      'CUSTOM':                    { seed: true,  tcpFragment: true,  nonce: true  }
-    };
-    if (patMap[pat]) mieruCfg.trafficPattern = patMap[pat];
+    const tp = buildTrafficPattern(pat, cfg);
+    if (tp) mieruCfg.trafficPattern = tp;
   }
 
   // v1.2.6 cascade (Mieru): Variant B is used instead of mita native egress.
@@ -789,6 +849,43 @@ function resetMitaFailed() {
   try { execSync('systemctl reset-failed mita 2>/dev/null || true', { timeout: 5000 }); } catch {}
 }
 
+// BUG-156: validate mita-state.json BEFORE we apply it, so a malformed config
+// (e.g. the old `seed: true` int32 violation) never reaches mita and drops it
+// into IDLE with an empty server config. Two layers:
+//   1) structural JSON-vs-proto-type check (fast, no mita needed);
+//   2) `mita apply config` is the real validator at apply time — but we capture
+//      its stderr so the caller can surface "invalid value for int32" etc.
+// Returns { ok, error }.
+function validateMitaState(file) {
+  // Layer 1: structural type check of the fields mita is strict about.
+  try {
+    const obj = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const tp = obj.trafficPattern;
+    if (tp && typeof tp === 'object') {
+      if ('seed' in tp && !Number.isInteger(tp.seed))
+        return { ok: false, error: `trafficPattern.seed must be an int32, got ${JSON.stringify(tp.seed)}` };
+      if ('unlockAll' in tp && typeof tp.unlockAll !== 'boolean')
+        return { ok: false, error: 'trafficPattern.unlockAll must be a boolean' };
+      if ('tcpFragment' in tp) {
+        const f = tp.tcpFragment;
+        if (typeof f !== 'object' || f === null)
+          return { ok: false, error: 'trafficPattern.tcpFragment must be an object { enable, maxSleepMs }' };
+        if ('enable' in f && typeof f.enable !== 'boolean')
+          return { ok: false, error: 'trafficPattern.tcpFragment.enable must be a boolean' };
+        if ('maxSleepMs' in f && !Number.isInteger(f.maxSleepMs))
+          return { ok: false, error: 'trafficPattern.tcpFragment.maxSleepMs must be an int' };
+      }
+      if ('nonce' in tp && (typeof tp.nonce !== 'object' || tp.nonce === null))
+        return { ok: false, error: 'trafficPattern.nonce must be an object' };
+    }
+    if (Array.isArray(obj.portBindings) && obj.portBindings.some(b => !Number.isInteger(b.port) && !b.portRange))
+      return { ok: false, error: 'portBindings entries need an int `port` or a `portRange` string' };
+  } catch (e) {
+    return { ok: false, error: 'mita-state.json is not valid JSON: ' + e.message };
+  }
+  return { ok: true, error: '' };
+}
+
 // Bug 96: the mieru server persists its applied state to
 //   ~/.config/mita/server.conf.pb (root's HOME, since mita.service runs as
 //   root). A stale/corrupt server.conf.pb can make a freshly-(re)started mita
@@ -805,7 +902,17 @@ function clearMitaPersistedState() {
 }
 
 function applyMitaConfig() {
+  lastMitaError = '';
   const file = buildMitaStateFile();
+  // BUG-156: structurally validate the config before doing anything with mita.
+  // A bad trafficPattern (e.g. seed as a boolean) used to be applied blindly,
+  // mita rejected it, the server config went empty and mita stayed IDLE with
+  // the Mieru port closed. We now refuse early and record the reason.
+  const v = validateMitaState(file);
+  if (!v.ok) {
+    lastMitaError = 'mita-state.json invalid (not applying): ' + v.error;
+    return false;
+  }
   try {
     // Bug 96: always clear a lingering failed state first so subsequent
     //   start/restart commands are honoured by systemd.
@@ -825,7 +932,15 @@ function applyMitaConfig() {
       return true;   // idle is the correct, healthy state on an empty base
     }
 
-    execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 15000 });
+    // BUG-156: capture apply stderr so a proto rejection surfaces instead of
+    // being silently swallowed by `2>/dev/null`.
+    try {
+      execSync(`mita apply config ${file}`, { timeout: 15000, stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (e) {
+      lastMitaError = 'mita apply config failed: ' +
+        (((e.stderr && e.stderr.toString()) || e.message || '').trim().split('\n').slice(-3).join(' '));
+      return false;
+    }
 
     // Bug 75: a fresh mita install sits in state IDLE (the installer does NOT
     // start it while users[] is empty — Bug 4). `mita reload` only re-reads the
@@ -864,8 +979,26 @@ function applyMitaConfig() {
     }
 
     shredFile(file + '.last');
+
+    // BUG-156: with mieru users present, mita must end up RUNNING (not IDLE) —
+    // an IDLE here means the config was rejected and the Mieru port stays shut.
+    // Give it a moment, then verify; record the reason if it didn't come up.
+    let finalStatus = '';
+    try { finalStatus = execSync('mita status 2>/dev/null', { timeout: 10000 }).toString(); }
+    catch { finalStatus = ''; }
+    if (/RUNNING/i.test(finalStatus)) {
+      lastMitaError = '';
+      return true;
+    }
+    // Not RUNNING despite users — surface a diagnostic but don't hard-fail the
+    // whole apply (the caller may still have applied Caddy etc.).
+    lastMitaError = 'mita is not RUNNING after apply (status: ' +
+      (finalStatus.trim().split('\n')[0] || 'unknown') + '). Check: journalctl -u mita -n 50';
     return true;
-  } catch { return false; }
+  } catch (e) {
+    lastMitaError = 'applyMitaConfig error: ' + (e.message || String(e));
+    return false;
+  }
 }
 
 function restartMieru() {
@@ -1717,7 +1850,10 @@ app.post('/api/settings/traffic-pattern', requireAuth, (req, res) => {
   cfg.trafficPattern = pattern; saveConfig();
   try {
     const ok = applyMitaConfig();
-    res.json({ ok, pattern, mtu: cfg.mtu });
+    // BUG-156: report a config/apply failure (e.g. an invalid trafficPattern)
+    // instead of silently returning ok:false with no reason.
+    const mitaError = getLastMitaError();
+    res.json({ ok, pattern, mtu: cfg.mtu, mitaError: mitaError || undefined });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
