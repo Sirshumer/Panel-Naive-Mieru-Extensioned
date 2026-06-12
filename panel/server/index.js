@@ -85,7 +85,7 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.4.7'
+    language: 'ru', version: '1.4.8'
   };
 }
 
@@ -96,7 +96,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.4.7';
+const VERSION_FALLBACK = '1.4.8';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -503,7 +503,11 @@ function buildCaddyfile(config, users) {
     const expose      = !!config.exposePanel;
     const panelDomain = String(config.panelDomain || '').trim();
     const baUser      = String(config.panelBasicAuthUser || '').trim();
-    const baHash      = String(config.panelBasicAuthHash || '').trim();
+    // BUG-155: NEVER emit a polluted/multi-line hash. Sieve config.panelBasicAuthHash
+    // down to a single valid bcrypt token; if it isn't one, drop it (no basic_auth
+    // line) rather than write a broken Caddyfile that fails-loops caddy-naive.
+    const rawHash     = String(config.panelBasicAuthHash || '');
+    const baHash      = BCRYPT_RE.test(rawHash) ? extractBcrypt(rawHash) : '';
     const stubFile    = String(config.panelStubPage || '/var/www/panel-stub/index.html').trim();
     let   webBasePath = String(config.webBasePath || '').trim().replace(/^\/+|\/+$/g, '').replace(/[^A-Za-z0-9._~-]/g, '');
     const panelPort   = parseInt(config.panelPort, 10) || 3000;
@@ -615,8 +619,30 @@ function getLastCaddyError() { return lastCaddyError; }
 // restart. Therefore we now ALWAYS do a full `systemctl restart` and then verify
 // `systemctl is-active`; on failure we capture the real journal error so the UI
 // can show it instead of a misleading "success".
+// BUG-155: validate the Caddyfile on disk BEFORE we ever (re)start caddy-naive.
+// A previous build could restart with a broken config (e.g. a polluted
+// panelBasicAuthHash) and drop caddy-naive into a "repeated too quickly" loop.
+// Validation up-front means a bad config is rejected without a restart, so the
+// caller can roll back while the running service stays up.
+function validateCaddyfile() {
+  try {
+    execSync(`${resolvedCaddyBin} validate --config '${resolvedCaddyFile}' --adapter caddyfile 2>&1`,
+      { timeout: 15000 });
+    return { ok: true, error: '' };
+  } catch (e) {
+    const out = ((e.stdout && e.stdout.toString()) || (e.stderr && e.stderr.toString()) || e.message || '').trim();
+    return { ok: false, error: out.split('\n').slice(-4).join('\n').trim() };
+  }
+}
+
 function applyCaddyConfig() {
   lastCaddyError = '';
+  // BUG-155: never restart on an invalid config — validate first.
+  const v = validateCaddyfile();
+  if (!v.ok) {
+    lastCaddyError = 'Caddyfile validation failed (not restarting): ' + v.error;
+    return { ok: false, error: lastCaddyError };
+  }
   try {
     // Clear any prior failure storm so the restart isn't blocked by
     // "Start request repeated too quickly".
@@ -1155,15 +1181,35 @@ app.get('/api/panel/webbasepath/generate', requireAuth, (req, res) => {
   res.json({ webBasePath: crypto.randomBytes(8).toString('hex') });
 });
 
+// BUG-155: a valid bcrypt token is exactly  $2[aby]$NN$<53 base64-ish chars>.
+// We use this to (a) sieve a hasher's stdout down to the one valid line and
+// (b) reject any multi-line / package-manager-polluted value before it reaches
+// config.json or the Caddyfile (which is what put caddy-naive in a failed loop).
+const BCRYPT_RE = /\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}/;
+function isValidBcrypt(s) {
+  return typeof s === 'string' && /^\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}$/.test(s);
+}
+// Extract a single valid bcrypt token from arbitrary text (the last match wins,
+// matching how `caddy hash-password` prints the hash on the final line even if
+// something noisy preceded it).
+function extractBcrypt(text) {
+  const m = String(text || '').match(/\$2[aby]\$[0-9]{2}\$[./A-Za-z0-9]{53}/g);
+  return m && m.length ? m[m.length - 1] : '';
+}
+
 // Hash a basic-auth password with `caddy hash-password` (bcrypt). Falls back to
 // bcryptjs so the panel works even if the caddy binary lacks the subcommand.
+// BUG-155: always sieve the output to a single valid bcrypt token so a polluted
+// stdout can never be stored.
 function caddyHashPassword(plain) {
   try {
     const out = execFileSync(resolvedCaddyBin, ['hash-password'],
-      { input: String(plain), timeout: 8000 }).toString().trim();
-    if (out) return out;
+      { input: String(plain), timeout: 8000 }).toString();
+    const tok = extractBcrypt(out);
+    if (tok) return tok;
   } catch (_) { /* fall through */ }
-  return bcrypt.hashSync(String(plain), 12);
+  const fb = bcrypt.hashSync(String(plain), 12);
+  return isValidBcrypt(fb) ? fb : extractBcrypt(fb) || fb;
 }
 
 const WEBBASE_RE = /^[A-Za-z0-9._~-]{1,64}$/;
@@ -1200,14 +1246,19 @@ app.post('/api/panel/external-access', requireAuth, (req, res) => {
 
     // Password: only (re)hash when a new one is provided. Keep the old hash
     // otherwise. Require a hash to exist when first enabling.
-    let baHash = cfg.panelBasicAuthHash || '';
+    // BUG-155: sieve the carried-forward hash to a single valid bcrypt token; a
+    // polluted value (apt output captured by an old installer) is discarded so
+    // it can never reach the Caddyfile and fail-loop caddy-naive.
+    let baHash = isValidBcrypt(cfg.panelBasicAuthHash || '')
+      ? cfg.panelBasicAuthHash
+      : extractBcrypt(cfg.panelBasicAuthHash || '');
     const newPass = body.basicAuthPass != null ? String(body.basicAuthPass) : '';
     if (newPass) {
       if (newPass.length < 6) return res.status(400).json({ error: 'basic-auth password too short (min 6)' });
       baHash = caddyHashPassword(newPass);
     }
-    if (!baHash)
-      return res.status(400).json({ error: 'A basic-auth password is required to enable external access' });
+    if (!isValidBcrypt(baHash))
+      return res.status(400).json({ error: 'A valid basic-auth password is required to enable external access (the stored hash was invalid — set a new password)' });
 
     cfg.exposePanel        = true;
     cfg.panelDomain        = domain;
@@ -2399,6 +2450,14 @@ app.post('/api/service/:name/:action', requireAuth, (req, res) => {
   if (!['start','stop','restart','reload'].includes(action))
     return res.status(400).json({ error: 'Unknown action' });
   try {
+    // BUG-155: never (re)start caddy-naive against an invalid Caddyfile — that's
+    // exactly what put it in a "repeated too quickly" loop. Validate first and
+    // refuse with the reason, leaving the currently-running service untouched.
+    if (svcName === 'caddy-naive' && ['start','restart','reload'].includes(action)) {
+      const v = validateCaddyfile();
+      if (!v.ok)
+        return res.status(409).json({ error: 'Caddyfile is invalid — not ' + action + 'ing caddy-naive: ' + v.error });
+    }
     // Bug 96: before a manual start/restart, clear any lingering systemd
     //   "failed" state so the command is actually honoured (otherwise the
     //   unit can stay failed → "no user found" / mita=failed).

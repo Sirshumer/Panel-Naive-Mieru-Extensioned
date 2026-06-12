@@ -7,6 +7,59 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.8] — Hotfix 2026-06-11 (BUG-155: apt output captured into panelBasicAuthHash → caddy-naive failed-loop)
+
+- **BUG-155 (HIGH):** enabling external panel access on a server where
+  `apache2-utils` was **not yet installed** captured the entire
+  `apt-get install` stdout (`Selecting previously unselected package…`,
+  `Unpacking…`, the `needrestart` banner, …) into `panelBasicAuthHash`, with the
+  real bcrypt token only on the last line. That multi-line value was written to
+  `config.json` and regenerated into the Caddyfile as
+  `basic_auth { admin <many lines> }`, so `caddy validate` failed
+  (`wrong argument count … after 'previously'`) and `caddy-naive` dropped into a
+  `Start request repeated too quickly` failed-loop — taking NaiveProxy down. It
+  only reproduced on hosts where the package was freshly installed during
+  hashing, and was not fixed by `--ssh-only` or `--repair`.
+
+  Fixes (defence in depth):
+  - **Hashers never capture apt noise.** `install.sh` / `update.sh`
+    `panel_hash_password()` now pre-install `apache2-utils` via a new
+    `ensure_htpasswd()` with **stdout fully redirected to /dev/null**, and sieve
+    every hasher's output through `extract_bcrypt` so only a single valid bcrypt
+    token can be returned. The admin-password fallback is hardened the same way.
+  - **Caddyfile generator refuses polluted hashes.** `caddyTemplate.js`
+    (the single source of truth for install/update/panel) and the panel's
+    `buildCaddyfile()` now run `panelBasicAuthHash` through `extractBcrypt()`;
+    a value that isn't a single valid bcrypt token yields **no** `basic_auth`
+    line rather than a broken block.
+  - **Validate before (re)start.** `applyCaddyConfig()` and the manual
+    `/api/service/caddy-naive/{start,restart,reload}` route now run
+    `caddy validate` first and refuse to restart on an invalid config, leaving
+    the running service up (no more failed-loop).
+  - **Panel API validation.** `/api/panel/external-access` sieves the carried
+    hash and rejects enabling when no valid bcrypt is present (clear error:
+    set a new password).
+  - **Self-heal on update.** `migrate_config()` now calls a new
+    `sanitize_basic_auth_hash()` that extracts the embedded bcrypt (or blanks
+    the field) on **every** update, and `--ssh-only` cleans it too — so a server
+    already broken by this bug recovers with a plain
+    `update.sh … | sudo bash -s -- -y`, no manual `jq`/`nano`.
+  - **`--repair` is reliable as a one-liner.** It no longer "Aborts" when run
+    via `curl … | bash -s -- --repair`: with `-y` it never prompts, otherwise it
+    prompts on `/dev/tty` when available and proceeds when there is no terminal
+    (an explicit `--repair` is consent).
+
+Tests: new `tests/bug155-basicauth.test.js` (12 assertions) verifies the
+generator sieves the exact field dump down to one clean `basic_auth` line.
+
+Update with one command:
+
+```
+curl -fsSL https://raw.githubusercontent.com/cwash797-cmd/Panel-Naive-Mieru-by-RIXXX/main/update.sh | sudo bash -s -- -y
+```
+
+---
+
 ## [v1.4.7] — Hotfix 2026-06-10 (BUG-154: cascade foolproof gate falsely blocked buttons)
 
 - **BUG-154 (MEDIUM, cosmetic):** the v1.4.6 foolproof gate falsely disabled the
