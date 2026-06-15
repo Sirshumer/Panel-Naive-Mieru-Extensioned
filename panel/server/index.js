@@ -564,7 +564,20 @@ ${authLines}
 
 ${masqueradeBlock}
 }
-${panelBlock}`;
+${panelBlock}\`;
+
+  // === ТВОЙ КАСТОМНЫЙ КЛОК ДЛЯ МАЛИНЫ ===
+  // 1. Принудительно вырезаем реверс-прокси петлю, если она вдруг пролезла через веб-интерфейс
+  if (caddyfileContent.includes('reverse_proxy https://') || caddyfileContent.includes('reverse_proxy http://')) {
+    // Если в конфиге сидит прокси на самого себя, заменяем его безопасной локальной статикой
+    caddyfileContent = caddyfileContent.replace(/reverse_proxy http[s]?:\/\/[\s\S]*?\n\s*\}/g, `root * ${resolvedFakeSiteDir}\n  file_server\n}`);
+    caddyfileContent = caddyfileContent.replace(/reverse_proxy http[s]?:\/\/.*$/m, `root * ${resolvedFakeSiteDir}\n  file_server`);
+  }
+
+  // 2. В самый конец файла всегда железно дописываем точку входа для твоих аудиокниг
+  const audiobooksBlock = `\n\n# ── Твой кастомный проброс Audiobookshelf на Малину ────────────\nabs.sirjew.ru {\n  tls ${config.adminEmail || ''}\n  reverse_proxy 127.0.0.1:12312 {\n    transport http {\n      versions 1.1\n    }\n  }\n}\n`;
+
+  return caddyfileContent + audiobooksBlock;
 }
 
 // ── writeCaddyfileAtomic() ────────────────────────────────────────────────────
