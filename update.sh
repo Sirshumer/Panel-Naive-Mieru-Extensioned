@@ -837,12 +837,41 @@ rebuild_mita_state_direct() {
     const state = { portBindings, users, loggingLevel: 'INFO', mtu: cfg.mtu || 1400 };
     const pat = cfg.trafficPattern || 'NOOP';
     if (pat !== 'NOOP') {
+      // BUG-156: emit the proto-correct trafficPattern. `seed` is an INT32 (NOT
+      // a boolean — the old 'seed: true' made 'mita apply config' fail with
+      // 'invalid value for int32 type: true' → empty server config → IDLE).
+      // `unlockAll` is the on/off boolean; tcpFragment/nonce are OBJECTS.
+      // Keep a stable numeric seed in cfg.trafficPatternSeed (mirrors index.js).
+      const crypto = require('crypto');
+      let seed = parseInt(cfg.trafficPatternSeed, 10);
+      if (!Number.isInteger(seed) || seed <= 0 || seed > 0x7fffffff) {
+        seed = (crypto.randomBytes(4).readUInt32BE(0) & 0x7fffffff) || 1;
+      }
       const patMap = {
-        RANDOM_PADDING:            { seed: true, tcpFragment: false, nonce: false },
-        RANDOM_PADDING_AGGRESSIVE: { seed: true, tcpFragment: true,  nonce: true  },
-        CUSTOM:                    { seed: true, tcpFragment: true,  nonce: true  }
+        RANDOM_PADDING: {
+          seed, unlockAll: false,
+          tcpFragment: { enable: false, maxSleepMs: 0 },
+          nonce: { type: 'NONCE_TYPE_PRINTABLE', applyToAllUDPPacket: false, minLen: 4, maxLen: 8 }
+        },
+        RANDOM_PADDING_AGGRESSIVE: {
+          seed, unlockAll: true,
+          tcpFragment: { enable: true, maxSleepMs: 10 },
+          nonce: { type: 'NONCE_TYPE_PRINTABLE', applyToAllUDPPacket: true, minLen: 6, maxLen: 12 }
+        },
+        CUSTOM: (cfg.trafficPatternCustom && typeof cfg.trafficPatternCustom === 'object')
+          ? Object.assign({}, cfg.trafficPatternCustom, {
+              seed: Number.isInteger(parseInt((cfg.trafficPatternCustom||{}).seed,10))
+                ? parseInt(cfg.trafficPatternCustom.seed,10) : seed })
+          : { seed, unlockAll: true }
       };
       if (patMap[pat]) state.trafficPattern = patMap[pat];
+      // Persist the stable seed so subsequent regenerations don't churn it.
+      if (cfg.trafficPatternSeed !== seed) {
+        try {
+          cfg.trafficPatternSeed = seed;
+          fs.writeFileSync('$PANEL_CONFIG', JSON.stringify(cfg, null, 2), { mode: 0o600 });
+        } catch (_) {}
+      }
     }
 
     const tmp = '$MITA_STATE_FILE' + '.new';

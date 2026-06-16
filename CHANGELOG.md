@@ -7,6 +7,47 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.4.9] — Hotfix 2026-06-12 (BUG-156: trafficPattern.seed boolean → int32, mita IDLE / Mieru port closed)
+
+- **BUG-156 (HIGH):** enabling Mieru obfuscation (traffic pattern) in the UI made
+  the panel serialize `trafficPattern.seed` as a **boolean** (`seed: true`)
+  instead of an **int32** in `mita-state.json`. `mita apply config` then failed
+  with `proto: (line 57:13): invalid value for int32 type: true` →
+  `ValidateFullServerConfig() failed: server config is empty`, so mita stayed
+  **IDLE**, `mita describe` was empty `{}` and the Mieru port (e.g. 2012) stayed
+  closed — even though UFW allowed 2012–2022 and NaiveProxy kept working. The
+  bad block looked like:
+  `"trafficPattern": { "seed": true, "tcpFragment": false, "nonce": false }`.
+  Root cause: the on/off **toggle** value (a boolean) was written into `seed`,
+  and `tcpFragment` / `nonce` were emitted as bare booleans instead of objects.
+- **Fix (panel `buildMitaStateFile` + `update.sh` `rebuild_mita_state_direct`):**
+  generate the `trafficPattern` block against the authoritative mieru proto
+  schema —
+  `seed` is a **numeric int32** (a stable random 31-bit seed, persisted as
+  `cfg.trafficPatternSeed` so regeneration is deterministic),
+  `unlockAll` is the real boolean toggle, and `tcpFragment` / `nonce` are proper
+  objects (`tcpFragment { enable, maxSleepMs }`,
+  `nonce { type, applyToAllUDPPacket, minLen, maxLen }`). The UI toggle is never
+  written into `seed` again.
+- **Validation before apply:** added `validateMitaState()` — a structural
+  JSON-vs-proto-type check that rejects a non-integer `seed`, non-boolean
+  `unlockAll`, malformed `tcpFragment` / `nonce`, or port bindings missing an int
+  `port` / `portRange`. A broken config is now refused **before** it reaches
+  mita instead of leaving the server silently IDLE.
+- **Apply → start → verify RUNNING:** `applyMitaConfig()` now captures
+  `mita apply config` stderr, and after start/reload it verifies
+  `mita status == RUNNING` (with mieru users present), recording the failure
+  reason in `lastMitaError` (surfaced to the UI via the traffic-pattern API
+  response) instead of leaving mita IDLE with no feedback.
+- **Self-healing:** `cfg.trafficPattern` is only ever a string preset, so
+  regenerating `mita-state.json` (toggle obfuscation, create/delete a key) on an
+  already-broken server now writes a correct numeric seed automatically — no
+  config migration needed.
+- Added `tests/bug156-trafficpattern.test.js` (21 assertions): verifies each
+  preset emits an int32 seed (never a boolean), NOOP/unknown return null, seed
+  reuse is stable, the old `seed: true` shape is rejected by the validator,
+  CUSTOM coerces a boolean seed, and the full state survives a JSON round-trip.
+
 ## [v1.4.8] — Hotfix 2026-06-11 (BUG-155: apt output captured into panelBasicAuthHash → caddy-naive failed-loop)
 
 - **BUG-155 (HIGH):** enabling external panel access on a server where
