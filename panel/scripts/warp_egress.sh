@@ -99,15 +99,79 @@ ensure_profile() {
 #                       needed because wg-quick already excludes the endpoint, but
 #                       we DISABLE the wg-quick DNS push on low-RAM/headless boxes
 #                       only if resolvconf is missing (avoids a hard failure).
+# BUG-161 (v1.5.1): detect whether the host actually has working IPv6. Many VPS
+#   are IPv4-only (IPv6 disabled in the kernel). The wgcf profile always ships an
+#   IPv6 Address + `AllowedIPs = ::/0`; wg-quick then runs `ip -6 address add …`
+#   which fails ("IPv6 is disabled on this device") and rolls the WHOLE interface
+#   back, so the tunnel never comes up. We strip every IPv6 bit from the conf when
+#   the host has no IPv6, bringing WARP up IPv4-only.
+host_has_ipv6() {
+  # Kernel IPv6 fully disabled?
+  if [[ -f /proc/sys/net/ipv6/conf/all/disable_ipv6 ]] \
+     && [[ "$(cat /proc/sys/net/ipv6/conf/all/disable_ipv6 2>/dev/null)" == "1" ]]; then
+    return 1
+  fi
+  # No /proc/net/if_inet6 → no IPv6 stack at all.
+  [[ -e /proc/net/if_inet6 ]] || return 1
+  # Need at least one usable (global or link) IPv6 address on some interface.
+  ip -6 addr show scope global 2>/dev/null | grep -q "inet6" && return 0
+  ip -6 addr show 2>/dev/null | grep -q "inet6" && return 0
+  return 1
+}
+
 build_wg_conf() {
   [[ -f "$WGCF_PROFILE" ]] || die "no wgcf profile to build from"
   mkdir -p /etc/wireguard
-  # Strip any DNS line if resolvconf is unavailable (wg-quick would fail otherwise).
+
+  # 1) start from the wgcf profile, dropping DNS if resolvconf is missing.
   if command -v resolvconf &>/dev/null; then
     cp "$WGCF_PROFILE" "$WG_CONF"
   else
     grep -v -i '^[[:space:]]*DNS' "$WGCF_PROFILE" > "$WG_CONF"
   fi
+
+  # 2) BUG-161: IPv4-only hosts — strip all IPv6 so wg-quick never runs the
+  #    failing `ip -6 address add` step.
+  if host_has_ipv6; then
+    log "IPv6 detected — keeping dual-stack WARP config"
+  else
+    log "no usable IPv6 on host — building IPv4-only WARP config"
+    local tmp="${WG_CONF}.tmp"
+    # Drop IPv6 Address lines (any line whose Address value contains ':'), and
+    # rewrite AllowedIPs to drop the ::/0 (and any other IPv6 CIDR) entries.
+    awk '
+      BEGIN { IGNORECASE = 1 }
+      # Address = 172.16.0.2/32, 2606:4700:...:8652/128  → keep only IPv4 parts
+      /^[[:space:]]*Address[[:space:]]*=/ {
+        line = $0; sub(/^[^=]*=[[:space:]]*/, "", line)
+        n = split(line, parts, /[[:space:]]*,[[:space:]]*/)
+        out = ""
+        for (i = 1; i <= n; i++) {
+          if (index(parts[i], ":") == 0) {
+            out = (out == "" ? parts[i] : out ", " parts[i])
+          }
+        }
+        if (out != "") print "Address = " out
+        next
+      }
+      # AllowedIPs = 0.0.0.0/0, ::/0 → keep only IPv4 CIDRs
+      /^[[:space:]]*AllowedIPs[[:space:]]*=/ {
+        line = $0; sub(/^[^=]*=[[:space:]]*/, "", line)
+        n = split(line, parts, /[[:space:]]*,[[:space:]]*/)
+        out = ""
+        for (i = 1; i <= n; i++) {
+          if (index(parts[i], ":") == 0) {
+            out = (out == "" ? parts[i] : out ", " parts[i])
+          }
+        }
+        if (out == "") out = "0.0.0.0/0"
+        print "AllowedIPs = " out
+        next
+      }
+      { print }
+    ' "$WG_CONF" > "$tmp" && mv "$tmp" "$WG_CONF"
+  fi
+
   chmod 600 "$WG_CONF"
   log "wrote ${WG_CONF}"
 }
@@ -121,7 +185,14 @@ warp_up() {
   systemctl enable "wg-quick@${WG_IFACE}" 2>/dev/null || true
   if ! systemctl start "wg-quick@${WG_IFACE}" 2>/dev/null; then
     # Fall back to a direct wg-quick up if the unit is unavailable.
-    wg-quick up "$WG_IFACE" || die "wg-quick up failed"
+    wg-quick up "$WG_IFACE" 2>/dev/null || true
+  fi
+  # BUG-161: verify the tunnel actually came up (the IPv4-only conf must yield a
+  #   live interface). If wg-quick rolled back (e.g. a stray IPv6 step), tear the
+  #   half-built state down cleanly so we never leave artifacts (BUG-150 lesson).
+  if ! ip link show "$WG_IFACE" &>/dev/null; then
+    warp_down
+    die "wg-quick up failed (interface ${WG_IFACE} not present after start)"
   fi
 }
 

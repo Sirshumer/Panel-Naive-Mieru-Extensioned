@@ -7,6 +7,36 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.1]
+
+### Fixed
+- **BUG-160 (HIGH, regression): traffic accounting zeroed BOTH Naive AND Mieru.**
+  After v1.5.0 every user showed `Naive (МБ) = 0` and `Mieru (МБ) = 0`. Root
+  cause: the `/api/stats/users` aggregator was unguarded — if **either** source
+  (the `mita get users` exec, the Caddy log read, or a malformed `protocols`
+  blob) threw, the whole handler 500'd and the UI fell back to 0.0 for *both*
+  protocols. Fix: each source is now isolated in its own `try/catch`, so one
+  failing source can never zero the other; failures are logged, not silent.
+- **BUG-160: NaiveProxy traffic is now measured from the kernel.** Investigation
+  proved Caddy `forward_proxy` **hijacks** the CONNECT connection: successful
+  tunnels are never written to the access log and the logged handshake reports
+  `bytes_read = size = 0`. Per-user CONNECT byte accounting via the access log
+  is therefore impossible. We now enable `IPAccounting=yes` on
+  `caddy-naive.service` and read `IPIngressBytes/IPEgressBytes` for an accurate
+  server-wide Naive total (survives log rotation — no logs involved), attributed
+  across Naive-capable users. (`update.sh` migrates existing units idempotently.)
+- **BUG-161 (HIGH): WARP would not start on IPv4-only servers.** The wgcf profile
+  always carries an IPv6 `Address` + `AllowedIPs = ::/0`; on hosts with IPv6
+  disabled, `wg-quick` ran `ip -6 address add …` → "IPv6 is disabled on this
+  device" → rolled the whole interface back → tunnel never came up. Fix:
+  `warp_egress.sh` now detects usable IPv6 (`host_has_ipv6`) and, when absent,
+  strips every IPv6 `Address` line and the `::/0` from `AllowedIPs`, bringing the
+  tunnel up IPv4-only. The IPv6 step can no longer hard-fail the bring-up, and a
+  post-start interface check tears down any half-built state cleanly (BUG-150
+  pattern — no leftover routes/rules/interfaces after a failed enable).
+
+---
+
 ## [v1.5.0] — 2026-06-22 (Naive traffic accounting fix + Cloudflare WARP egress mode)
 
 - **TASK 1 (MEDIUM) — NaiveProxy traffic always 0.0:** root cause was the Caddy
