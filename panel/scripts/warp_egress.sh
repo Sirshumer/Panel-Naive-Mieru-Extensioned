@@ -71,6 +71,21 @@ WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-2408 500 1701 4500}"
 #   time we auto-roll-back so the box never sits in a black-hole.
 WARP_HEALTH_TIMEOUT="${WARP_HEALTH_TIMEOUT:-5}"
 
+# BUG-170 (HIGH): with MTU=1280 and NO TCP MSS clamping, clients connect through
+#   WARP but heavy sites/video stall ("connected, nothing loads"). Proven on the
+#   box: `ping -M do -s 1400 -I warp 1.1.1.1` → "message too long, mtu=1280", 100%
+#   loss; `-s 1200` → 0% loss. A real client is DOUBLE-encapsulated
+#   (client → Naive/Mieru → WARP), so the effective MTU is even lower; with DF set
+#   the kernel drops oversized segments and (PMTUD being unreliable across the
+#   proxy/ICMP-filtered paths) the sender never shrinks them → large flows hang.
+#   Fix: clamp TCP MSS on everything that egresses via the warp interface, on BOTH
+#   the FORWARD path (forwarded client egress) and the OUTPUT path (caddy-naive /
+#   mita are LOCAL processes, their packets are OUTPUT not FORWARD).
+#   WARP_MSS: hard MSS ceiling for the doubly-encapsulated path. 1280 - 20 (IPv4)
+#   - 20 (TCP) = 1240. We pin --set-mss 1240 (deterministic, survives broken PMTUD)
+#   AND add --clamp-mss-to-pmtu as a belt-and-suspenders lower bound.
+WARP_MSS="${WARP_MSS:-1240}"
+
 # BUG-162/169 policy-routing constants.
 #
 # BUG-169 (CRITICAL): our v1.5.2–1.5.4 hand-rolled scheme broke the WARP RETURN
@@ -377,6 +392,22 @@ route_up() {
       || iptables -t mangle -A INPUT -p tcp --dport "$PANEL_PORT" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
     iptables -t mangle -C OUTPUT -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null \
       || iptables -t mangle -A OUTPUT -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null || true
+
+    # 2b) BUG-170: TCP MSS clamping for everything egressing via WARP. Without it
+    #     clients connect but heavy traffic stalls (segments > MTU-1280 get DF-
+    #     dropped, PMTUD unreliable through the double Naive/Mieru→WARP wrap). We
+    #     pin a hard MSS (--set-mss WARP_MSS, deterministic) AND add
+    #     --clamp-mss-to-pmtu as a lower bound. Match SYN/SYN-ACK only (where MSS
+    #     is negotiated). Cover BOTH:
+    #       • FORWARD -o warp : forwarded client egress
+    #       • OUTPUT  -o warp : caddy-naive / mita are LOCAL procs → OUTPUT path
+    local chain
+    for chain in FORWARD OUTPUT; do
+      iptables -t mangle -C "$chain" -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_MSS" 2>/dev/null \
+        || iptables -t mangle -A "$chain" -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_MSS" 2>/dev/null || true
+      iptables -t mangle -C "$chain" -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null \
+        || iptables -t mangle -A "$chain" -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+    done
   fi
   # rp_filter: allow locally-generated marked (WireGuard) traffic. wg-quick sets
   #   this exact sysctl; without it the decrypted return packets fail the reverse
@@ -448,13 +479,23 @@ route_down() {
   ip route flush table "$RT_TABLE" 2>/dev/null || true
 
   # 3) remove every mangle rule we installed (conntrack save/restore of the WG
-  #    envelope + SSH/panel control-plane marks). Mirrors route_up() step 2.
+  #    envelope + SSH/panel control-plane marks + BUG-170 MSS clamping). Mirrors
+  #    route_up() step 2/2b. Loop the MSS deletes: each chain may hold >1 copy if
+  #    a prior partial run re-added them.
   if command -v iptables &>/dev/null; then
     iptables -t mangle -D POSTROUTING -m mark --mark "$WG_FWMARK" -p udp -j CONNMARK --save-mark 2>/dev/null || true
     iptables -t mangle -D PREROUTING -p udp -j CONNMARK --restore-mark 2>/dev/null || true
     iptables -t mangle -D OUTPUT -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null || true
     iptables -t mangle -D INPUT -p tcp --dport "${SSH_PORT:-22}"   -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
     iptables -t mangle -D INPUT -p tcp --dport "${PANEL_PORT:-3000}" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
+    # BUG-170: remove the TCP MSS clamping rules from BOTH chains.
+    local c m
+    for c in FORWARD OUTPUT; do
+      for m in 1 2 3 4; do
+        iptables -t mangle -D "$c" -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --set-mss "$WARP_MSS" 2>/dev/null || true
+        iptables -t mangle -D "$c" -o "$dev" -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+      done
+    done
     # legacy (pre-1.5.5) rule shapes — purge so an upgrade leaves no orphans.
     iptables -t mangle -D OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark 2>/dev/null || true
   fi
@@ -678,6 +719,7 @@ do_status() {
   echo "egressIP     : ${egress:-unknown}"
   echo "warp         : ${warp_flag:-unknown}"
   echo "mtu          : ${WARP_MTU}"
+  echo "mss          : ${WARP_MSS}"
   # exit 0 if the interface is up; non-zero otherwise (callers may ignore).
   [[ "$active" == "active" ]]
 }
