@@ -141,29 +141,73 @@ ensure_packages() {
 # ── ensure WARP account + WireGuard profile exist ─────────────────────────────
 # BUG-164: a one-way tunnel (handshake OK but received ≈ 0 B) is frequently caused
 #   by a key that was GENERATED but never actually REGISTERED with Cloudflare. We
-#   make registration robust: the account file must exist AND be non-trivial
-#   (contain the device id / private key). If it looks empty/corrupt we re-register.
+#   make registration robust: the account file must exist AND be non-trivial.
+#
+# BUG-166: a real wgcf-account.toml (wgcf 2.2.x) looks like:
+#     access_token = '…'
+#     device_id    = '…'
+#     private_key  = '…'
+#     license_key  = '…'
+#   The keys can be single/double-quoted and may have leading spaces. We accept
+#   any quoting. The validity gate verifies device_id + private_key + access_token
+#   are all present and non-empty.
 account_is_valid() {
-  [[ -s "$WGCF_ACCOUNT" ]] || return 1
-  # A real wgcf account.toml has both a device_id and a private_key line.
-  grep -qiE '(^|[[:space:]])device_id[[:space:]]*=' "$WGCF_ACCOUNT" 2>/dev/null \
-    && grep -qiE '(^|[[:space:]])private_key[[:space:]]*=' "$WGCF_ACCOUNT" 2>/dev/null
+  local f="${1:-$WGCF_ACCOUNT}"
+  [[ -s "$f" ]] || return 1
+  # Each key must be present AND have a non-empty value after `=`. Accept
+  #   single/double quotes and surrounding whitespace.
+  local k
+  for k in device_id private_key access_token; do
+    grep -qiE "^[[:space:]]*${k}[[:space:]]*=[[:space:]]*['\"]?[^'\"[:space:]]+" "$f" 2>/dev/null \
+      || return 1
+  done
+  return 0
+}
+
+# BUG-166: register the WARP account WITHOUT the `yes |` pipe.
+#   Root cause of the false "wgcf register failed": the script runs under
+#   `set -o pipefail`, and `yes | wgcf register` makes `yes` receive SIGPIPE
+#   (exit 141) the instant wgcf closes its stdin — even on a fully SUCCESSFUL
+#   registration. pipefail then propagates 141 as the pipeline status, so the
+#   `|| die` fired despite "Successfully created Cloudflare Warp account".
+#   We pass `--accept-tos` (no prompt → no pipe needed) and an explicit
+#   `--config` path so the account is always written/read at $WGCF_ACCOUNT
+#   regardless of CWD. We also judge success by the FILE, not the exit code.
+wgcf_register() {
+  rm -f "$WGCF_ACCOUNT"
+  # --accept-tos answers the only interactive prompt; no `yes` pipe required.
+  # Run from $WGCF_DIR and pass --config so both CWD-relative and absolute
+  # resolutions land on the same file (belt and suspenders for BUG-166).
+  ( cd "$WGCF_DIR" && wgcf --config "$WGCF_ACCOUNT" register --accept-tos ) \
+    >/dev/null 2>&1 || true
+  # Some wgcf builds ignore --config for register and write ./wgcf-account.toml.
+  if [[ ! -s "$WGCF_ACCOUNT" && -s "${WGCF_DIR}/wgcf-account.toml" ]]; then
+    mv -f "${WGCF_DIR}/wgcf-account.toml" "$WGCF_ACCOUNT" 2>/dev/null || true
+  fi
+  # Success is judged by the account file Cloudflare actually wrote — NOT by the
+  # pipeline exit code (BUG-166).
+  account_is_valid "$WGCF_ACCOUNT"
 }
 
 ensure_profile() {
   mkdir -p "$WGCF_DIR"
   chmod 700 "$WGCF_DIR"
-  if ! account_is_valid; then
-    log "registering a free Cloudflare WARP account (no valid account on disk)…"
-    rm -f "$WGCF_ACCOUNT"
-    ( cd "$WGCF_DIR" && WGCF_LICENSE_KEY="" yes | wgcf register --accept-tos ) \
-      || die "wgcf register failed"
-    account_is_valid || die "wgcf register produced no valid account (registration with Cloudflare failed)"
-  else
+  if account_is_valid "$WGCF_ACCOUNT"; then
     log "existing WARP account looks valid — reusing it"
+  else
+    log "registering a free Cloudflare WARP account (no valid account on disk)…"
+    if ! wgcf_register; then
+      die "wgcf register did not produce a valid account (registration with Cloudflare failed)"
+    fi
+    log "WARP account registered"
   fi
   log "generating WireGuard profile…"
-  ( cd "$WGCF_DIR" && wgcf generate ) || die "wgcf generate failed"
+  # Generate against the explicit account path; tolerate a SIGPIPE-style false
+  #   non-zero by re-checking the produced profile file.
+  ( cd "$WGCF_DIR" && wgcf --config "$WGCF_ACCOUNT" generate --profile "$WGCF_PROFILE" ) >/dev/null 2>&1 || true
+  if [[ ! -s "$WGCF_PROFILE" && -s "${WGCF_DIR}/wgcf-profile.conf" ]]; then
+    mv -f "${WGCF_DIR}/wgcf-profile.conf" "$WGCF_PROFILE" 2>/dev/null || true
+  fi
   [[ -s "$WGCF_PROFILE" ]] || die "wgcf profile not generated"
 }
 
@@ -400,7 +444,10 @@ warp_up() {
   # BUG-162: never persist before we know the tunnel works.
   systemctl disable "wg-quick@${WG_IFACE}" 2>/dev/null || true
 
+  # BUG-168: track the BEST outcome across all port attempts so we can classify
+  #   the failure for the operator (provider block vs no connectivity vs success).
   local ok="" egress="" port first=1
+  local any_handshake=0 best_rx=0 best_tx=0
   for port in $WARP_ENDPOINT_PORTS; do
     if [[ "$first" != "1" ]]; then
       log "healthcheck failed — retrying with WARP endpoint port ${port}…"
@@ -421,13 +468,32 @@ warp_up() {
       ok=1
       break
     fi
+
+    # Failed on this port — record diagnostics for classification.
+    local hs rx tx
+    hs="$(wg show "$WG_IFACE" latest-handshakes 2>/dev/null | awk '{print $2; exit}')"
+    rx="$(wg show "$WG_IFACE" transfer 2>/dev/null | awk '{print $2; exit}')"
+    tx="$(wg show "$WG_IFACE" transfer 2>/dev/null | awk '{print $3; exit}')"
+    [[ "${hs:-0}" =~ ^[0-9]+$ && "${hs:-0}" -gt 0 ]] && any_handshake=1
+    [[ "${rx:-0}" =~ ^[0-9]+$ && "${rx:-0}" -gt "$best_rx" ]] && best_rx="$rx"
+    [[ "${tx:-0}" =~ ^[0-9]+$ && "${tx:-0}" -gt "$best_tx" ]] && best_tx="$tx"
   done
 
   if [[ "$ok" != "1" ]]; then
     # BUG-164: do NOT leave a black-holed tunnel up. Roll everything back so the
     # operator keeps native access; surfaces as a clear error to the panel.
     warp_down
-    die "WARP tunnel is one-way / unreachable on all endpoint ports (${WARP_ENDPOINT_PORTS}); rolled back — server access preserved"
+    # BUG-168: emit a STRUCTURED, machine-readable classification line the panel
+    #   parses to show a friendly (non-error) explanation. The two failure modes:
+    #     • handshake OK but no return data  → provider blocks WARP return traffic
+    #     • no handshake on any port         → provider blocks UDP / no reachability
+    if [[ "$any_handshake" == "1" ]]; then
+      echo "WARP_RESULT=blocked_return handshake=ok rx=${best_rx} tx=${best_tx} ports=${WARP_ENDPOINT_PORTS}"
+      die "WARP handshake succeeded but no return traffic on any port (provider blocks Cloudflare WARP/WireGuard return); rolled back — server access preserved (rx=${best_rx}B tx=${best_tx}B)"
+    else
+      echo "WARP_RESULT=no_handshake handshake=none rx=${best_rx} tx=${best_tx} ports=${WARP_ENDPOINT_PORTS}"
+      die "WARP could not connect to Cloudflare on any port (${WARP_ENDPOINT_PORTS}) — provider likely blocks UDP; rolled back — server access preserved"
+    fi
   fi
 
   # Healthy tunnel → now it is safe to (optionally) enable autostart.
@@ -437,6 +503,8 @@ warp_up() {
   else
     log "autostart DISABLED (default) — WARP will NOT survive reboot"
   fi
+  # BUG-168: structured success line for the panel (shows the CF egress IP green).
+  echo "WARP_RESULT=ok egressIP=${egress} port=${port}"
   log "WARP egress is UP and verified (egress IP ${egress})"
 }
 

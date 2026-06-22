@@ -113,8 +113,10 @@ console.log('\n[6] autostart enabled ONLY after a healthy tunnel');
 {
   const src = fs.readFileSync(SCRIPT, 'utf8');
   const upStart  = src.indexOf('warp_up() {');
-  const upBody   = src.slice(upStart, upStart + 2500);
-  const okIdx    = upBody.indexOf('ok="1"') >= 0 ? upBody.indexOf('"1" ]]') : upBody.search(/ok"?\s*!=\s*"1"/);
+  // Bound the body at the NEXT function definition so growth (BUG-168 classify)
+  //   never truncates the window before the guarded enable.
+  const after    = src.indexOf('\nwarp_iface_down_soft()', upStart);
+  const upBody    = src.slice(upStart, after > upStart ? after : upStart + 4000);
   const enableIdx = upBody.indexOf('systemctl enable "wg-quick@');
   // The enable must appear AFTER the rollback/ok check, inside the persist branch.
   ok(enableIdx > -1, 'warp_up still has a guarded enable');
@@ -128,7 +130,9 @@ console.log('\n[7] wgcf registration is robust (re-register on invalid account)'
   const src = fs.readFileSync(SCRIPT, 'utf8');
   ok(/account_is_valid\s*\(\)/.test(src), 'account_is_valid() gate defined');
   ok(/device_id/.test(src) && /private_key/.test(src), 'validity gate checks device_id + private_key');
-  ok(/if\s+!\s+account_is_valid/.test(src), 'ensure_profile re-registers when account invalid');
+  // v1.5.4 (BUG-166): ensure_profile registers when the account is NOT valid.
+  ok(/if\s+account_is_valid[\s\S]{0,400}else[\s\S]{0,200}wgcf_register/.test(src)
+     || /if\s+!\s+wgcf_register/.test(src), 'ensure_profile (re)registers when account invalid');
   ok(/registration with Cloudflare failed|no valid account/.test(src), 'hard-fail if registration did not produce a valid account');
 }
 

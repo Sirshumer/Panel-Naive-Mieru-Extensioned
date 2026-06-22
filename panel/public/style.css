@@ -713,6 +713,15 @@ select option { background: var(--bg-card); color: var(--text); }
 }
 .msg-inline.ok  { border-color: var(--green); color: var(--green); }
 .msg-inline.err { border-color: var(--red);   color: var(--red); }
+/* BUG-168: WARP provider-block is a host limitation, NOT a panel error — show it
+   yellow (warning), with comfortable wrapping for the longer explanatory text. */
+.msg-inline.warn {
+  border-color: var(--yellow);
+  color: var(--yellow);
+  background: var(--yellow-dim);
+  line-height: 1.5;
+  white-space: normal;
+}
 
 /* ── Table ───────────────────────────────────────────────────── */
 .table-wrap { overflow-x: auto; }

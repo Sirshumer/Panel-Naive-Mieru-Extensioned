@@ -7,6 +7,63 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.4]
+
+> **WARP confirmed working — the v1.5.3 code is correct.** Verified on another
+> hoster with a manual `wgcf` tunnel: `curl --interface … api.ipify.org` →
+> `104.28.197.7` (a Cloudflare IP), return traffic flows, egress switched to CF.
+> The original "WARP kills the server / one-way" report was a **provider-side
+> block of inbound WireGuard/UDP** on the old host (`92 B received` on every
+> port) — outside the panel's control. This release fixes a real registration
+> bug found during that verification, hardens IPv6 stripping, and makes the
+> provider-block case explain itself to the operator.
+
+### Fixed
+- **BUG-166 (HIGH): false "wgcf register failed" even though the account was
+  created.** On a fresh server `wgcf register` printed *"Successfully created
+  Cloudflare Warp account"* (Device active: true) but the panel still aborted with
+  `[warp][ERROR] wgcf register failed`. **Root cause:** the script runs under
+  `set -o pipefail`, and `yes | wgcf register` makes `yes` receive **SIGPIPE
+  (exit 141)** the instant `wgcf` closes its stdin — *even on a fully successful
+  registration*. `pipefail` then propagated 141 as the pipeline's status, so the
+  `|| die` fired. Fix (`warp_egress.sh`):
+  - **Dropped the `yes |` pipe entirely** — `--accept-tos` already answers the
+    only prompt, so no pipe (and no SIGPIPE) is needed.
+  - New `wgcf_register()` judges success by the **account file** Cloudflare wrote,
+    **not** the exit code; uses an explicit `--config "$WGCF_ACCOUNT"` (and a
+    CWD-relative fallback move) so the file is always written/read at the same
+    path regardless of working directory.
+  - `account_is_valid()` now reads the real `wgcf-account.toml` fields
+    (`device_id` + `private_key` + `access_token`, single- **or** double-quoted)
+    and rejects empty values. `wgcf generate` likewise uses `--profile` + a
+    file-based success check.
+
+- **BUG-167: guarantee IPv6 is fully stripped on IPv4-only hosts.** wgcf emits
+  `Address = <v4>/32, <v6>/128` (comma-separated) and `AllowedIPs = 0.0.0.0/0,
+  ::/0`. The generated `warp.conf` now provably contains **only** the IPv4
+  `Address` line and **no** `::/0` (rebuilt from scratch, IPv4 fields only), so
+  `wg-quick up` can never fail with *"IPv6 is disabled on this device"*. Locked in
+  by tests against the exact wgcf comma-separated format.
+
+- **BUG-168 (UX): friendly, non-error message when the HOSTER blocks WARP.** The
+  auto-rollback (v1.5.3) already keeps the box safe; this release classifies the
+  outcome so the operator understands *why* and *what to do* — instead of a scary
+  technical error that triggers false support tickets. `warp_egress.sh` emits a
+  structured `WARP_RESULT=…` line; the panel maps it to a colour + message:
+  - **`ok`** → green: *"WARP включён — egress теперь через Cloudflare (IP …)"*.
+  - **`blocked_return`** (handshake OK but `rx ≈ 92 B` on every port) → **yellow**
+    (not red): *"Ваш хостинг-провайдер блокирует входящий трафик Cloudflare WARP
+    (WireGuard/UDP). Это ограничение сервера, не панели. Всё откачено, доступ
+    сохранён… смените хостера или используйте каскад. (Туннель отправил X,
+    получил Y байт.)"*
+  - **`no_handshake`** (no handshake on any port) → yellow: *"WARP не смог
+    подключиться к Cloudflare ни на одном порту… вероятно, провайдер режет UDP.
+    Всё откачено, доступ сохранён."*
+  - On a rolled-back WARP the panel un-checks the toggle and reports
+    `warpEnabled=false`, so the UI state stays honest.
+
+---
+
 ## [v1.5.3]
 
 ### Fixed

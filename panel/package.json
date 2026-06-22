@@ -1,12 +1,12 @@
 {
   "name": "panel-naive-mieru",
-  "version": "1.5.3",
+  "version": "1.5.4",
   "description": "Web management panel for NaiveProxy + Mieru by RIXXX",
   "main": "server/index.js",
   "scripts": {
     "start": "node server/index.js",
     "dev": "node server/index.js",
-    "test": "node ../tests/migration-bug149.test.js && node ../tests/race-bug149.test.js && node ../tests/version-bug143.test.js && node ../tests/bug155-basicauth.test.js && node ../tests/bug156-trafficpattern.test.js && node ../tests/bug-naive-caddylog.test.js && node ../tests/bug-naive-traffic.test.js && node ../tests/bug162-warp-routing.test.js && node ../tests/bug164-warp-oneway.test.js"
+    "test": "node ../tests/migration-bug149.test.js && node ../tests/race-bug149.test.js && node ../tests/version-bug143.test.js && node ../tests/bug155-basicauth.test.js && node ../tests/bug156-trafficpattern.test.js && node ../tests/bug-naive-caddylog.test.js && node ../tests/bug-naive-traffic.test.js && node ../tests/bug162-warp-routing.test.js && node ../tests/bug164-warp-oneway.test.js && node ../tests/bug166-warp-register.test.js"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",

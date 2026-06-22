@@ -93,7 +93,7 @@ try {
     // BUG-162: boot-persistence is OFF by default. Only set true when the
     //   operator explicitly confirms autostart (protects against reboot lock-out).
     warpPersist: false,
-    language: 'ru', version: '1.5.3'
+    language: 'ru', version: '1.5.4'
   };
 }
 
@@ -104,7 +104,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.5.3';
+const VERSION_FALLBACK = '1.5.4';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -1094,6 +1094,31 @@ function runWarpEgress(action, opts = {}) {
   } catch (e) {
     return { ok: false, output: (e.stdout ? e.stdout.toString() : '') + (e.stderr ? e.stderr.toString() : e.message) };
   }
+}
+
+// BUG-168: classify the WARP setup outcome from the script's structured
+//   `WARP_RESULT=…` line, so the panel can show a FRIENDLY explanation instead
+//   of a raw technical error. The auto-rollback already kept the server safe;
+//   the operator just needs to know WHY and what to do.
+//   Codes:
+//     ok             → tunnel verified, egress is the Cloudflare IP (green)
+//     blocked_return → handshake OK but no return data on any port → the HOSTING
+//                      PROVIDER blocks Cloudflare WARP return traffic (yellow,
+//                      NOT a panel error). Suggest: change host or use cascade.
+//     no_handshake   → no handshake on any port → provider likely blocks UDP.
+//     unknown        → couldn't classify (fall back to the raw output).
+function parseWarpResult(output) {
+  const text = String(output || '');
+  const line = (text.split('\n').reverse().find(l => /^WARP_RESULT=/.test(l.trim())) || '').trim();
+  const out = { code: 'unknown', egressIP: null, rx: null, tx: null, raw: text };
+  if (!line) return out;
+  const get = (k) => { const m = line.match(new RegExp(k + '=([^\\s]+)')); return m ? m[1] : null; };
+  out.code = get('WARP_RESULT') || 'unknown';
+  out.egressIP = get('egressIP');
+  const rx = get('rx'), tx = get('tx');
+  if (rx != null) out.rx = parseInt(rx, 10);
+  if (tx != null) out.tx = parseInt(tx, 10);
+  return out;
 }
 
 // Total RAM in MiB (for the low-RAM warning around the extra WARP network layer).
@@ -2260,26 +2285,68 @@ app.post('/api/settings/warp', requireAuth, (req, res) => {
     ? runWarpEgress('setup', { persist })
     : runWarpEgress('teardown');
 
+  // BUG-168: classify the outcome so the UI can show a friendly explanation.
+  const wr = parseWarpResult(r.output);
+
+  // If WARP was requested but the script rolled back (blocked / no handshake),
+  //   the tunnel is DOWN — reflect that in config so the panel state is honest.
+  const rolledBack = enabled && (!r.ok || wr.code === 'blocked_return' || wr.code === 'no_handshake');
+  if (rolledBack) {
+    cfg.warpEnabled = false;
+    cfg.warpPersist = false;
+    saveConfig();
+  }
+
   // Report the egress IP so the operator can confirm it changed to Cloudflare.
-  let egress = '';
-  try { egress = execSync('curl -s --max-time 8 https://api.ipify.org 2>/dev/null', { timeout: 10000 }).toString().trim(); }
-  catch { egress = ''; }
+  let egress = wr.egressIP || '';
+  if (!egress) {
+    try { egress = execSync('curl -s --max-time 8 https://api.ipify.org 2>/dev/null', { timeout: 10000 }).toString().trim(); }
+    catch { egress = ''; }
+  }
+
+  // BUG-168: build a classified result {severity, code, message} for the panel.
+  //   severity: 'success' (green) | 'warning' (yellow, NOT a panel error).
+  const fmtBytes = (n) => (n == null ? '?' : (n >= 1024 ? (n / 1024).toFixed(1) + ' KiB' : n + ' B'));
+  let warpResult;
+  if (!enabled) {
+    warpResult = { severity: 'success', code: 'disabled',
+      message: 'WARP выключен. Возврат к родному IP сервера.' };
+  } else if (wr.code === 'ok' || (r.ok && !rolledBack)) {
+    warpResult = { severity: 'success', code: 'ok', egressIP: egress || '(unknown)',
+      message: (cascadeTorn
+        ? `WARP включён — egress теперь через Cloudflare (IP ${egress || '?'}). Каскад был автоматически отключён. SSH и панель доступны напрямую.`
+        : (persist
+            ? `WARP включён и добавлен в автозагрузку — egress через Cloudflare (IP ${egress || '?'}). В туннель идёт только исходящий прокси-трафик; SSH и панель доступны напрямую.`
+            : `WARP включён — egress через Cloudflare (IP ${egress || '?'}). В туннель идёт только исходящий прокси-трафик; SSH и панель доступны напрямую. Автозагрузка ВЫКЛЮЧЕНА (после ребута WARP не поднимется автоматически).`)) };
+  } else if (wr.code === 'blocked_return') {
+    // Handshake OK but no return traffic → the HOSTING PROVIDER blocks WARP.
+    warpResult = { severity: 'warning', code: 'blocked_return',
+      message: 'WARP не удалось включить: ваш хостинг-провайдер блокирует входящий трафик Cloudflare WARP (WireGuard/UDP). '
+        + 'Это ограничение сервера, не панели. Всё откачено, доступ к серверу сохранён, текущая работа не нарушена. '
+        + 'Если нужен WARP — смените хостера на не блокирующего WireGuard, либо используйте каскад (chain). '
+        + `(Туннель отправил ${fmtBytes(wr.tx)}, получил ${fmtBytes(wr.rx)} — обратный трафик заблокирован.)` };
+  } else if (wr.code === 'no_handshake') {
+    warpResult = { severity: 'warning', code: 'no_handshake',
+      message: 'WARP не смог подключиться к Cloudflare ни на одном порту (2408/500/1701/4500). '
+        + 'Вероятно, провайдер режет UDP. Всё откачено, доступ сохранён. Попробуйте другой сервер или каскад.' };
+  } else {
+    // Unknown failure — surface a safe generic message; rollback already ran.
+    warpResult = { severity: 'warning', code: 'unknown',
+      message: 'WARP включить не удалось. Всё откачено, доступ к серверу сохранён. '
+        + 'Подробности в технических логах ниже.' };
+  }
 
   res.json({
-    ok: r.ok,
+    ok: enabled ? (!rolledBack) : r.ok,
     warpEnabled: cfg.warpEnabled,
     warpPersist: cfg.warpPersist,
+    rolledBack: rolledBack || undefined,
     cascadeDisabled: cascadeTorn || undefined,
     cascadeOutput: cascadeOut || undefined,
     egressIP: egress || '(unknown)',
     output: r.output,
-    message: enabled
-      ? (cascadeTorn
-          ? 'WARP включён (SSH и панель остаются доступны напрямую). Каскад был автоматически отключён и снят.'
-          : (persist
-              ? 'WARP включён и добавлен в автозагрузку. В туннель идёт только исходящий прокси-трафик; SSH и панель доступны напрямую.'
-              : 'WARP включён. В туннель идёт только исходящий прокси-трафик; SSH и панель доступны напрямую. Автозагрузка ВЫКЛЮЧЕНА (после ребута WARP не поднимется автоматически).'))
-      : 'WARP выключен. Возврат к родному IP сервера.'
+    warpResult,                       // BUG-168: classified {severity, code, message}
+    message: warpResult.message       // back-compat: plain message string
   });
 });
 
