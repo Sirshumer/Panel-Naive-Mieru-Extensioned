@@ -1414,15 +1414,28 @@ async function applyWarp() {
   try {
     const res = await api('POST', '/api/settings/warp', { warpEnabled: enabled, persist });
     if (state.config) {
+      // BUG-168: trust the server's (possibly rolled-back) state, not the toggle.
       state.config.warpEnabled = res.warpEnabled === true;
       if (res.cascadeDisabled) state.config.cascadeEnabled = false;
+    }
+    // If WARP rolled back (provider block), reflect it in the toggle so the UI
+    //   doesn't pretend WARP is on.
+    if (res.rolledBack) {
+      const we = el('s-warp-enabled'); if (we) we.checked = false;
     }
     if (res.cascadeDisabled) {
       const ce = el('s-cascade-enabled'); if (ce) ce.checked = false;
     }
-    const egress = res.egressIP ? ` (egress IP: ${res.egressIP})` : '';
-    showMsg('warp-msg', (res.message || 'WARP применён') + egress, res.ok !== false);
-    toast(res.ok !== false ? 'WARP применён' : 'WARP: ошибка', res.ok !== false ? 'success' : 'error');
+    // BUG-168: prefer the classified result {severity, message}. severity maps
+    //   to green (success) / yellow (warning — provider block, NOT a panel error).
+    const wr = res.warpResult || {};
+    const severity = wr.severity || (res.ok !== false ? 'success' : 'error');
+    const message  = wr.message || res.message || 'WARP применён';
+    showMsg('warp-msg', message, severity);
+    // Toast: success = green; provider-block warnings are informational, not errors.
+    if (severity === 'success') toast('WARP применён', 'success');
+    else if (severity === 'warning') toast('WARP: ограничение хостинга (всё откачено, доступ сохранён)', 'info');
+    else toast('WARP: ошибка', 'error');
     if (res.output) { const pre = el('warp-status'); if (pre) { pre.textContent = res.output; pre.classList.remove('hidden'); } }
     if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
   } catch (err) {
@@ -1769,13 +1782,23 @@ function setProgress(id, pct) {
   el2.classList.toggle('danger', p > 85);
 }
 
+// BUG-168: `ok` may be a boolean (legacy ok/err) OR a severity string
+//   ('success' | 'warning' | 'error'). A 'warning' renders yellow and stays
+//   longer (the WARP provider-block explanation is long and important).
 function showMsg(id, text, ok) {
   const el2 = document.getElementById(id);
   if (!el2) return;
+  let cls, ttl = 6000;
+  if (ok === 'warning' || ok === 'warn') { cls = 'warn'; ttl = 16000; }
+  else if (ok === 'success' || ok === true) { cls = 'ok'; }
+  else if (ok === 'error' || ok === false) { cls = 'err'; }
+  else { cls = ok ? 'ok' : 'err'; }
   el2.textContent = text;
-  el2.className = `msg-inline ${ok ? 'ok' : 'err'}`;
+  el2.className = `msg-inline ${cls}`;
   el2.classList.remove('hidden');
-  setTimeout(() => el2.classList.add('hidden'), 6000);
+  // Allow long, persistent warnings to be dismissed manually; auto-hide others.
+  if (el2._hideTimer) clearTimeout(el2._hideTimer);
+  el2._hideTimer = setTimeout(() => el2.classList.add('hidden'), ttl);
 }
 
 function fmtDate(iso) {
