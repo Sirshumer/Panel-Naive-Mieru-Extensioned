@@ -975,6 +975,21 @@ SVCCADDY
     rm -f /etc/systemd/system/naive.service
     log_info "Legacy naive.service removed (replaced by caddy-naive.service)"
   fi
+
+  # BUG-160 (v1.5.1): enable kernel IP accounting on the caddy-naive unit so the
+  #   panel can report real NaiveProxy traffic (the access log can't — CONNECT
+  #   tunnels are hijacked and never logged). Idempotent: only adds the line if
+  #   missing, then daemon-reload + restart so the cgroup counters start.
+  if [[ -f /etc/systemd/system/caddy-naive.service ]] \
+     && ! grep -q '^IPAccounting=' /etc/systemd/system/caddy-naive.service; then
+    log_step "Enabling IPAccounting on caddy-naive.service (Naive traffic accounting)"
+    sed -i '/^AmbientCapabilities=CAP_NET_BIND_SERVICE/a IPAccounting=yes' \
+      /etc/systemd/system/caddy-naive.service 2>/dev/null \
+      || printf '\n[Service]\nIPAccounting=yes\n' >> /etc/systemd/system/caddy-naive.service
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart caddy-naive 2>/dev/null || true
+    log_info "IPAccounting=yes enabled ✓"
+  fi
 }
 
 # ── Bug 79: fix caddy-naive config permissions ───────────────────────────────

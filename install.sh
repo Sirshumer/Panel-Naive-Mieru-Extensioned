@@ -981,6 +981,13 @@ Environment=XDG_DATA_HOME=/var/lib/caddy
 Environment=XDG_CONFIG_HOME=/var/lib/caddy
 ReadWritePaths=/var/log/caddy-naive /etc/caddy-naive /var/lib/caddy
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+# BUG-160 (v1.5.1): NaiveProxy traffic accounting. Caddy forward_proxy hijacks
+# the CONNECT connection, so the HTTP access log NEVER records the tunnelled
+# byte volume (bytes_read/size = 0, and successful tunnels are not logged at
+# all). The only reliable source for Naive traffic is the kernel: systemd's
+# per-unit IP accounting (cgroup net counters). The panel reads
+# IPIngressBytes / IPEgressBytes from `systemctl show caddy-naive`.
+IPAccounting=yes
 
 [Install]
 WantedBy=multi-user.target

@@ -90,7 +90,7 @@ try {
     // WARP. WARP and cascade are MUTUALLY EXCLUSIVE (enabling one disables the
     // other). Orchestrated by scripts/warp_egress.sh (wgcf + wg-quick).
     warpEnabled: false,
-    language: 'ru', version: '1.5.0'
+    language: 'ru', version: '1.5.1'
   };
 }
 
@@ -101,7 +101,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.5.0';
+const VERSION_FALLBACK = '1.5.1';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -2474,21 +2474,79 @@ app.get('/api/status', requireAuth, async (req, res) => {
 // User traffic stats
 app.get('/api/stats/users', requireAuth, (req, res) => {
   const exec_ = cmd => { try { return execSync(cmd, { timeout: 8000 }).toString(); } catch { return ''; } };
+  // BUG-160 (regression, v1.5.1): in v1.5.0 BOTH the «Naive (МБ)» and
+  //   «Mieru (МБ)» columns dropped to 0.0 for every user. Mieru worked before
+  //   the v1.5.0 refactor, so the failure was in the COMMON aggregator — if
+  //   either source (mita exec OR the Caddy log read) threw, the unguarded
+  //   handler 500'd and the UI rendered its 0.0 fallback for BOTH sources.
+  //   Fix: isolate each source in its own try/catch so one failing source can
+  //   NEVER zero the other, and log the failure so it is diagnosable instead of
+  //   silently returning zeros.
+
+  // ── Mieru source (mita get users) — fully isolated ──────────────────────────
   // Bug 78: the real mieru server command is `mita get users` (NOT the
   //   non-existent `mita describe users`, which always returned '' → traffic 0).
   //   Output is a table: User  LastActive  1DayDownload  1DayUpload  30DaysDownload  30DaysUpload
-  const raw   = exec_('mita get users 2>/dev/null');
-  const live  = parseMitaUsers(raw);
+  let live = [];
+  try {
+    const raw = exec_('mita get users 2>/dev/null');
+    live = parseMitaUsers(raw) || [];
+  } catch (e) {
+    live = [];
+    try { console.error('[stats/users] mieru source failed:', e && e.message); } catch {}
+  }
+
+  // ── Naive source (Caddy access log) — fully isolated ────────────────────────
   // Bug 97: also account NaiveProxy traffic from the Caddy access log so
   //   naive-only users no longer show 0.0. Mieru + Naive figures are summed.
-  const naive = parseCaddyTraffic(LOG_CADDY);
-  const users = getAllUsers().map(u => {
+  // BUG-160: the access log only captures the RARE plain-HTTP request — it does
+  //   NOT capture CONNECT tunnels (forward_proxy hijacks the connection, so a
+  //   successful tunnel is never logged and bytes_read/size are 0). So this is
+  //   best-effort per-user data; the authoritative Naive total comes from the
+  //   kernel via systemd IP accounting (naiveTotalMB below).
+  let naive = {};
+  try {
+    naive = parseCaddyTraffic(LOG_CADDY) || {};
+  } catch (e) {
+    naive = {};
+    try { console.error('[stats/users] naive source failed:', e && e.message); } catch {}
+  }
+
+  // BUG-160: authoritative server-wide NaiveProxy traffic from the kernel
+  //   (systemd IPAccounting on caddy-naive.service). Per-user is impossible for
+  //   hijacked CONNECT tunnels, so we report the accurate server total and (when
+  //   the log gives no per-user split) attribute it across naive-capable users.
+  let naiveTotalMB = 0;
+  try { naiveTotalMB = readNaiveTotalMB(); } catch { naiveTotalMB = 0; }
+
+  // BUG-160: how many users can use Naive — used to spread the kernel-measured
+  //   server-wide Naive total when the access log gives no per-user breakdown.
+  const allUsers = getAllUsers();
+  const naiveCapable = allUsers.filter(u => {
+    try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
+    catch { return true; }
+  });
+  // Bytes the access log DID attribute per-user (rare plain-HTTP requests).
+  const loggedNaiveMB = Object.values(naive)
+    .reduce((acc, n) => acc + ((n.uploadMB || 0) + (n.downloadMB || 0)), 0);
+  // Remaining (tunnel) bytes spread evenly across naive-capable users.
+  const spreadMB = (naiveTotalMB > loggedNaiveMB && naiveCapable.length)
+    ? (naiveTotalMB - loggedNaiveMB) / naiveCapable.length
+    : 0;
+  const isNaiveUser = u => {
+    try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
+    catch { return true; }
+  };
+
+  const users = allUsers.map(u => {
     const s = live.find(x => x.username === u.username) || {};
     const n = naive[u.username] || {};
     const mieruUp   = s.uploadMB   || 0;
     const mieruDown = s.downloadMB || 0;
     const naiveUp   = n.uploadMB   || 0;
     const naiveDown = n.downloadMB || 0;
+    // Per-user Naive = logged bytes + this user's share of the kernel total.
+    const naiveShareMB = isNaiveUser(u) ? spreadMB : 0;
     const uploadMB   = mieruUp   + naiveUp;
     const downloadMB = mieruDown + naiveDown;
     // Combined used: prefer live mita "usedMB" when present, plus naive bytes;
@@ -2506,18 +2564,40 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
       username:   u.username,
       email:      u.email,
       expiry:     u.expiry,
-      protocols:  JSON.parse(u.protocols || '[]'),
+      // BUG-160: never let a single malformed protocols blob 500 the whole
+      //   stats endpoint (which would zero EVERY user's counters).
+      protocols:  (() => { try { return JSON.parse(u.protocols || '[]'); } catch { return []; } })(),
       quotaMB:    u.quotaMB,
       usedMB,
       uploadMB,
       downloadMB,
-      naiveMB:    naiveUp + naiveDown,
+      naiveMB:    naiveUp + naiveDown + naiveShareMB,
       mieruMB:    mieruUp + mieruDown,
       lastSeen
     };
   });
   res.json(users);
 });
+
+// BUG-160: read the kernel-measured server-wide NaiveProxy traffic from
+//   systemd IPAccounting on caddy-naive.service. Returns total MB (in+out), or
+//   0 if accounting is unavailable. This is the only reliable Naive figure
+//   because forward_proxy hijacks CONNECT tunnels (never logged).
+function readNaiveTotalMB() {
+  let out = '';
+  try {
+    out = execSync(
+      'systemctl show caddy-naive -p IPIngressBytes -p IPEgressBytes 2>/dev/null',
+      { timeout: 5000 }
+    ).toString();
+  } catch { return 0; }
+  let bytes = 0;
+  for (const line of out.split('\n')) {
+    const m = line.match(/^IP(?:Ingress|Egress)Bytes=(\d+)$/);
+    if (m) bytes += Number(m[1]) || 0;
+  }
+  return bytes / 1048576;
+}
 
 // Bug 78: parse the `mita get users` table.
 //   User  LastActive            1DayDownload  1DayUpload  30DaysDownload  30DaysUpload
