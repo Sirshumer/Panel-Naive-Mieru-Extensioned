@@ -520,13 +520,52 @@ async function loadUsers() {
   const tbody = el('users-tbody');
   tbody.innerHTML = `<tr><td colspan="11" class="table-empty">${t('users.loading')}</td></tr>`;
   try {
-    state.users = await api('GET', '/api/users');
+    // BUG-163: the Users table showed 0 in «Naive (МБ)»/«Mieru (МБ)» because
+    //   /api/users carries NO traffic fields — the per-key figures live in
+    //   /api/stats/users. Fetch both and merge the Mieru per-key numbers in.
+    //   (Naive is server-wide only — shown in a banner above the table.)
+    const [users, stats] = await Promise.all([
+      api('GET', '/api/users'),
+      api('GET', '/api/stats/users').catch(() => ({ users: [], naiveServerTotalMB: 0 })),
+    ]);
+    // Support both the new {users,…} object and a legacy bare array.
+    const statRows = Array.isArray(stats) ? stats : (stats.users || []);
+    const naiveServerTotalMB = Array.isArray(stats) ? 0 : (stats.naiveServerTotalMB || 0);
+    const byName = {};
+    statRows.forEach(s => { byName[s.username] = s; });
+    state.users = users.map(u => {
+      const s = byName[u.username] || {};
+      return Object.assign({}, u, {
+        naiveMB: s.naiveMB != null ? s.naiveMB : 0,
+        mieruMB: s.mieruMB != null ? s.mieruMB : 0,
+      });
+    });
+    renderNaiveServerBanner(naiveServerTotalMB);
     renderUsersTable(state.users);
     // Доработка 2: re-evaluate the foolproof gates whenever the key list changes.
     applyFoolproofGates(state.users.length);
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="10" class="table-empty" style="color:var(--red)">${esc(err.message)}</td></tr>`;
   }
+}
+
+// BUG-163: a small honest banner above the Users table — Naive traffic is a
+//   server-wide total (per-key Naive is impossible; forward_proxy hijacks
+//   CONNECT). Mieru remains per-key in the table.
+function renderNaiveServerBanner(naiveServerTotalMB) {
+  let host = el('naive-server-total');
+  if (!host) {
+    const table = el('users-tbody') && el('users-tbody').closest('table');
+    if (!table || !table.parentNode) return;
+    host = document.createElement('div');
+    host.id = 'naive-server-total';
+    host.style.cssText = 'margin:8px 0;font-size:13px;color:var(--text-muted)';
+    table.parentNode.insertBefore(host, table);
+  }
+  const mb = Number(naiveServerTotalMB || 0);
+  host.innerHTML = `<span class="badge badge-blue">Naive</span> `
+    + `${t('users.naiveServerTotal') || 'Naive (сервер, суммарно)'}: <strong>${fmtNum(mb)}</strong> `
+    + `${t('users.naiveServerHint') || '— по ключам Naive не делится (учёт по серверу). Mieru — по ключам.'}`;
 }
 
 // Доработка 2 (защита от дурака): most service crashes happen because operators
@@ -909,6 +948,8 @@ async function loadSettings() {
     // WARP egress (mutually exclusive with cascade)
     const warpEl = el('s-warp-enabled');
     if (warpEl) warpEl.checked = cfg.warpEnabled === true;
+    const warpPersistEl = el('s-warp-persist');
+    if (warpPersistEl) warpPersistEl.checked = cfg.warpPersist === true;
     refreshWarpUiState(cfg.cascadeEnabled === true);
     try {
       const w = await api('GET', '/api/settings/warp');
@@ -917,6 +958,8 @@ async function loadSettings() {
         if (w && w.lowRam && w.lowRamWarning) { lr.textContent = '⚠ ' + w.lowRamWarning; lr.classList.remove('hidden'); }
         else lr.classList.add('hidden');
       }
+      // BUG-162: reflect the real persist (autostart) state from the server.
+      if (warpPersistEl && w && typeof w.warpPersist === 'boolean') warpPersistEl.checked = w.warpPersist;
       refreshWarpUiState(!!(w && w.cascadeEnabled));
     } catch {}
     const cascadeNaiveEl = el('s-cascade-naive-upstream');
@@ -1360,9 +1403,28 @@ function refreshWarpUiState(cascadeOn) {
 async function applyWarp() {
   const enabled = el('s-warp-enabled')?.checked || false;
   const btn = el('btn-apply-warp');
+
+  // BUG-162: autostart is opt-in. When enabling WARP, explicitly ask whether to
+  //   persist across reboots — and warn that a bad tunnel could otherwise lock
+  //   the box on every boot. Default answer = NO (do not persist).
+  let persist = false;
+  if (enabled) {
+    const persistEl = el('s-warp-persist');
+    if (persistEl) {
+      persist = !!persistEl.checked;
+    } else {
+      persist = window.confirm(
+        'Добавить WARP в автозагрузку (поднимать после перезагрузки)?\n\n' +
+        'ОК — да, прописать в автозапуск.\n' +
+        'Отмена — нет (безопаснее: после ребута WARP не поднимется автоматически, ' +
+        'доступ к серверу гарантированно сохранится).'
+      );
+    }
+  }
+
   setBtnBusy(btn, true);
   try {
-    const res = await api('POST', '/api/settings/warp', { warpEnabled: enabled });
+    const res = await api('POST', '/api/settings/warp', { warpEnabled: enabled, persist });
     if (state.config) {
       state.config.warpEnabled = res.warpEnabled === true;
       if (res.cascadeDisabled) state.config.cascadeEnabled = false;
@@ -1456,6 +1518,9 @@ async function refreshStats() {
 
 function renderTrafficTable(stats) {
   const tbody = el('traffic-tbody');
+  // BUG-163: /api/stats/users now returns { users, naiveServerTotalMB }. Accept
+  //   both the new object shape and the legacy bare array.
+  if (!Array.isArray(stats)) stats = (stats && stats.users) || [];
   if (!stats.length) {
     tbody.innerHTML = `<tr><td colspan="8" class="table-empty">${t('monitoring.noUsers')}</td></tr>`;
     return;
