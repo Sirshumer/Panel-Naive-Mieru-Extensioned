@@ -728,12 +728,13 @@ if (fs.existsSync(TEMPLATE_JS)) {
     '  }',
     '  email ' + (cfg.adminEmail || ''),
     '  admin off',
+    // Global = runtime logger only (stderr/journald). Access logs are a
+    // per-site directive (below) — a global log block never writes per-request
+    // user_id / byte counters, so Naive traffic was always 0.0.
     '  log {',
-    '    output file /var/log/caddy-naive/access.log {',
-    '      roll_size     50mb',
-    '      roll_keep_for 720h',
-    '    }',
-    '    format json',
+    '    output stderr',
+    '    format console',
+    '    level ERROR',
     '  }',
     '}',
     '',
@@ -744,6 +745,16 @@ if (fs.existsSync(TEMPLATE_JS)) {
     // Bug 83: ':<port>, <domain>' listener + explicit tls + no route{} wrapper
     ':' + (cfg.naivePort || 443) + ', ' + (cfg.domain || 'localhost') + ' {',
     '  tls ' + (cfg.adminEmail || ''),
+    '',
+    // Traffic accounting: per-site ACCESS log → JSON line per request with
+    // request.user_id + byte counters parseCaddyTraffic() sums per user.
+    '  log {',
+    '    output file /var/log/caddy-naive/access.log {',
+    '      roll_size     50mb',
+    '      roll_keep_for 720h',
+    '    }',
+    '    format json',
+    '  }',
     '',
     '  forward_proxy {',
     authLines,

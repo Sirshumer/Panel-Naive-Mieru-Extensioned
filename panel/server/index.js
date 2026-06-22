@@ -85,7 +85,12 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.4.9'
+    // FEATURE (egress): Cloudflare WARP as a server-wide egress mode. Exactly one
+    // of three egress modes is active at any time: native IP / Mieru cascade /
+    // WARP. WARP and cascade are MUTUALLY EXCLUSIVE (enabling one disables the
+    // other). Orchestrated by scripts/warp_egress.sh (wgcf + wg-quick).
+    warpEnabled: false,
+    language: 'ru', version: '1.5.0'
   };
 }
 
@@ -96,7 +101,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.4.9';
+const VERSION_FALLBACK = '1.5.0';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -1049,6 +1054,31 @@ function runCascadeMieru(action, opts = {}) {
   }
 }
 
+// ── Cloudflare WARP egress — scripts/warp_egress.sh orchestrator ─────────────
+// WARP routes ALL of the server's OUTBOUND traffic through Cloudflare so the
+// real server IP is hidden. It is a server-wide mode and MUTUALLY EXCLUSIVE with
+// the Mieru cascade (the API guarantees only one egress mode is ever active).
+const WARP_SCRIPT = path.join(__dirname, '../scripts/warp_egress.sh');
+
+// Run warp_egress.sh {setup|teardown|status|egress-ip}. Returns { ok, output }.
+function runWarpEgress(action) {
+  try {
+    const out = execFileSync('bash', [WARP_SCRIPT, action], { timeout: 180000 }).toString();
+    return { ok: true, output: out };
+  } catch (e) {
+    return { ok: false, output: (e.stdout ? e.stdout.toString() : '') + (e.stderr ? e.stderr.toString() : e.message) };
+  }
+}
+
+// Total RAM in MiB (for the low-RAM warning around the extra WARP network layer).
+// Read /proc/meminfo to avoid pulling in the `os` module.
+function totalRamMB() {
+  try {
+    const m = fs.readFileSync('/proc/meminfo', 'utf8').match(/MemTotal:\s*(\d+)\s*kB/);
+    return m ? Math.round(parseInt(m[1], 10) / 1024) : 0;
+  } catch { return 0; }
+}
+
 function shredFile(fp) {
   if (!fp || !fs.existsSync(fp)) return;
   try { execSync(`shred -u "${fp}" 2>/dev/null`, { timeout: 5000 }); }
@@ -1992,6 +2022,14 @@ app.get('/api/settings/cascade/status', requireAuth, (req, res) => {
 app.post('/api/settings/cascade', requireAuth, (req, res) => {
   const { cascadeEnabled, cascadeNaiveUpstream, cascadeMieru } = req.body;
   const enabled = !!cascadeEnabled;
+
+  // MUTUAL EXCLUSION: enabling the cascade must first fully disable + tear down
+  // WARP (only one egress mode active at a time; BUG-150 clean-teardown rule).
+  if (enabled && cfg.warpEnabled) {
+    cfg.warpEnabled = false;
+    try { runWarpEgress('teardown'); } catch {}
+  }
+
   cfg.cascadeEnabled = enabled;
   if (cascadeNaiveUpstream !== undefined) {
     // Bug 92: normalize on store too (defense in depth) — strip "naive+" etc. so
@@ -2125,6 +2163,103 @@ app.post('/api/settings/cascade/reset', requireAuth, (req, res) => {
              + 'mita пересобрана с родными ключами.'
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Cloudflare WARP egress (server-wide) ─────────────────────────────────────
+// Exactly one egress mode is active: native IP / Mieru cascade / WARP. WARP and
+// cascade are MUTUALLY EXCLUSIVE — enabling WARP force-disables the cascade (and
+// tears its relay down), and the cascade endpoints likewise disable WARP. The
+// UI also blocks enabling both, but the server enforces it as the source of truth.
+
+// Current WARP settings + a low-RAM advisory.
+app.get('/api/settings/warp', requireAuth, (req, res) => {
+  const ram = totalRamMB();
+  res.json({
+    warpEnabled:    !!cfg.warpEnabled,
+    cascadeEnabled: !!cfg.cascadeEnabled,   // so the UI can show the lockout
+    ramMB:          ram,
+    // The extra WireGuard layer adds memory/CPU pressure on tiny VPS.
+    lowRam:         ram > 0 && ram <= 1024,
+    lowRamWarning:  (ram > 0 && ram <= 1024)
+      ? 'На VPS с ≤1 ГБ RAM дополнительный сетевой слой WARP (WireGuard) нагружает память — включайте только при необходимости.'
+      : ''
+  });
+});
+
+// Live WARP status incl. the measured public egress IP (should be Cloudflare).
+app.get('/api/settings/warp/status', requireAuth, (req, res) => {
+  const r = runWarpEgress('status');
+  res.json({ ok: r.ok, enabled: !!cfg.warpEnabled, output: r.output });
+});
+
+// Toggle WARP egress on/off.
+app.post('/api/settings/warp', requireAuth, (req, res) => {
+  const enabled = !!(req.body && req.body.warpEnabled);
+
+  // MUTUAL EXCLUSION: enabling WARP must first fully disable + tear down the
+  // Mieru cascade (BUG-150 lesson: a clean teardown, no leftover routes).
+  let cascadeTorn = false, cascadeOut = '';
+  if (enabled && cfg.cascadeEnabled) {
+    cfg.cascadeEnabled       = false;
+    cfg.cascadeNaiveUpstream = '';
+    const prevMieru = cfg.cascadeMieru || {};
+    cfg.cascadeMieru = {
+      host: '', portStart: prevMieru.portStart || 2012,
+      portEnd: prevMieru.portEnd || 2022, user: '', pass: '',
+      mtu: prevMieru.mtu || cfg.mtu || 1400
+    };
+    cfg.cascadeMieruEgress = {};
+    // Naive leg back to direct (no upstream) + Mieru relay torn down.
+    try {
+      const content = buildCaddyfile(cfg, getAllUsers());
+      writeCaddyfileAtomic(content);
+      applyCaddyConfig();
+    } catch {}
+    const td = runCascadeMieru('teardown');
+    cascadeTorn = td.ok; cascadeOut = td.output;
+    try { applyMitaConfig(); } catch {}
+  }
+
+  cfg.warpEnabled = enabled;
+  saveConfig();
+
+  // Apply the WARP layer.
+  const r = enabled ? runWarpEgress('setup') : runWarpEgress('teardown');
+
+  // Report the egress IP so the operator can confirm it changed to Cloudflare.
+  let egress = '';
+  try { egress = execSync('curl -s --max-time 8 https://api.ipify.org 2>/dev/null', { timeout: 10000 }).toString().trim(); }
+  catch { egress = ''; }
+
+  res.json({
+    ok: r.ok,
+    warpEnabled: cfg.warpEnabled,
+    cascadeDisabled: cascadeTorn || undefined,
+    cascadeOutput: cascadeOut || undefined,
+    egressIP: egress || '(unknown)',
+    output: r.output,
+    message: enabled
+      ? (cascadeTorn
+          ? 'WARP включён. Каскад был автоматически отключён и снят (режимы взаимоисключающие).'
+          : 'WARP включён. Весь исходящий трафик идёт через Cloudflare.')
+      : 'WARP выключен. Возврат к родному IP сервера.'
+  });
+});
+
+// Explicit idempotent WARP reset — full teardown regardless of the toggle.
+app.post('/api/settings/warp/reset', requireAuth, (req, res) => {
+  cfg.warpEnabled = false;
+  saveConfig();
+  const r = runWarpEgress('teardown');
+  let egress = '';
+  try { egress = execSync('curl -s --max-time 8 https://api.ipify.org 2>/dev/null', { timeout: 10000 }).toString().trim(); }
+  catch { egress = ''; }
+  res.json({
+    ok: r.ok, warpEnabled: false,
+    nativeEgress: egress || '(unknown)',
+    output: r.output,
+    message: 'WARP полностью снят: интерфейс/маршруты/правила удалены, возврат к родному IP.'
+  });
 });
 
 // ── Client configs ────────────────────────────────────────────────────────────
@@ -2447,15 +2582,16 @@ function toMB(v, unit) {
 // the Mieru figure for users that have both protocols.
 //
 // Returns: { username: { uploadMB, downloadMB, usedMB, lastSeen } }
-function parseCaddyTraffic(logPath) {
-  const out = {};
-  const file = logPath || LOG_CADDY;
+// Read one Caddy access-log file (capped tail) and fold its per-user byte
+// counters into `out`. Returns nothing; mutates `out`.
+function foldCaddyLogFile(file, out) {
   let raw;
   try {
-    if (!fs.existsSync(file)) return out;
+    if (!fs.existsSync(file)) return;
     // Cap how much we read so a large log never blocks the event loop /
     // exhausts memory. 32 MiB tail is plenty for a 50mb-rolled file.
     const stat = fs.statSync(file);
+    if (stat.size === 0) return;
     const MAX = 32 * 1024 * 1024;
     if (stat.size > MAX) {
       const fd = fs.openSync(file, 'r');
@@ -2469,7 +2605,7 @@ function parseCaddyTraffic(logPath) {
     } else {
       raw = fs.readFileSync(file, 'utf8');
     }
-  } catch { return out; }
+  } catch { return; }
 
   for (const line of raw.split('\n')) {
     const s = line.trim();
@@ -2488,6 +2624,35 @@ function parseCaddyTraffic(logPath) {
     out[user].downloadB += down;
     if (typeof ts === 'number' && ts > out[user].lastTs) out[user].lastTs = ts;
   }
+}
+
+// Traffic accounting: survive log rotation. Caddy rolls the access log to a
+// sibling file in the same directory named like `access-2025-06-22T01-02-03.000.log`
+// (older ones may be gzipped to `.log.gz`). The previous parser only read the
+// single current file, so every roll silently reset Naive usage to 0. We now
+// sum the current log PLUS all plain (un-gzipped) rolled siblings, so the figure
+// is stable across rotations. (.gz files are skipped to avoid blocking the event
+// loop on decompression — a best-effort, same character as mita's window.)
+function parseCaddyTraffic(logPath) {
+  const out = {};
+  const file = logPath || LOG_CADDY;
+
+  // 1) the current (live) access log
+  foldCaddyLogFile(file, out);
+
+  // 2) rolled siblings in the same directory: `<base>-<ts>.log`
+  try {
+    const dir  = path.dirname(file);
+    const base = path.basename(file).replace(/\.log$/i, '');
+    const rollRe = new RegExp('^' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-.*\\.log$', 'i');
+    if (fs.existsSync(dir)) {
+      for (const name of fs.readdirSync(dir)) {
+        if (name === path.basename(file)) continue;   // already counted
+        if (!rollRe.test(name)) continue;             // not a rolled sibling
+        foldCaddyLogFile(path.join(dir, name), out);
+      }
+    }
+  } catch { /* best-effort: rolled files are a bonus, never fatal */ }
 
   const result = {};
   for (const [user, v] of Object.entries(out)) {
