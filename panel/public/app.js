@@ -520,17 +520,15 @@ async function loadUsers() {
   const tbody = el('users-tbody');
   tbody.innerHTML = `<tr><td colspan="11" class="table-empty">${t('users.loading')}</td></tr>`;
   try {
-    // BUG-163: the Users table showed 0 in «Naive (МБ)»/«Mieru (МБ)» because
+    // BUG-163/165: the Users table showed 0 in «Naive (МБ)»/«Mieru (МБ)» because
     //   /api/users carries NO traffic fields — the per-key figures live in
-    //   /api/stats/users. Fetch both and merge the Mieru per-key numbers in.
-    //   (Naive is server-wide only — shown in a banner above the table.)
+    //   /api/stats/users. Fetch both and merge the per-key numbers in.
     const [users, stats] = await Promise.all([
       api('GET', '/api/users'),
-      api('GET', '/api/stats/users').catch(() => ({ users: [], naiveServerTotalMB: 0 })),
+      api('GET', '/api/stats/users').catch(() => ({ users: [] })),
     ]);
     // Support both the new {users,…} object and a legacy bare array.
     const statRows = Array.isArray(stats) ? stats : (stats.users || []);
-    const naiveServerTotalMB = Array.isArray(stats) ? 0 : (stats.naiveServerTotalMB || 0);
     const byName = {};
     statRows.forEach(s => { byName[s.username] = s; });
     state.users = users.map(u => {
@@ -540,7 +538,7 @@ async function loadUsers() {
         mieruMB: s.mieruMB != null ? s.mieruMB : 0,
       });
     });
-    renderNaiveServerBanner(naiveServerTotalMB);
+    removeNaiveServerBanner();   // BUG-165: drop any stale server-wide banner
     renderUsersTable(state.users);
     // Доработка 2: re-evaluate the foolproof gates whenever the key list changes.
     applyFoolproofGates(state.users.length);
@@ -549,23 +547,13 @@ async function loadUsers() {
   }
 }
 
-// BUG-163: a small honest banner above the Users table — Naive traffic is a
-//   server-wide total (per-key Naive is impossible; forward_proxy hijacks
-//   CONNECT). Mieru remains per-key in the table.
-function renderNaiveServerBanner(naiveServerTotalMB) {
-  let host = el('naive-server-total');
-  if (!host) {
-    const table = el('users-tbody') && el('users-tbody').closest('table');
-    if (!table || !table.parentNode) return;
-    host = document.createElement('div');
-    host.id = 'naive-server-total';
-    host.style.cssText = 'margin:8px 0;font-size:13px;color:var(--text-muted)';
-    table.parentNode.insertBefore(host, table);
-  }
-  const mb = Number(naiveServerTotalMB || 0);
-  host.innerHTML = `<span class="badge badge-blue">Naive</span> `
-    + `${t('users.naiveServerTotal') || 'Naive (сервер, суммарно)'}: <strong>${fmtNum(mb)}</strong> `
-    + `${t('users.naiveServerHint') || '— по ключам Naive не делится (учёт по серверу). Mieru — по ключам.'}`;
+// BUG-165: the «Naive (сервер, суммарно)» banner was removed. In v1.5.2+ Naive
+//   traffic is shown PER KEY in the Users table, so the server-wide banner was
+//   both incorrect and confusing. We also remove any banner left in the DOM by a
+//   previously-loaded (cached) build.
+function removeNaiveServerBanner() {
+  const host = el('naive-server-total');
+  if (host && host.parentNode) host.parentNode.removeChild(host);
 }
 
 // Доработка 2 (защита от дурака): most service crashes happen because operators
