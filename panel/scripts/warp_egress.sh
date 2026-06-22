@@ -111,7 +111,9 @@ WG_FWMARK="51820"           # BUG-169: WireGuard's own envelope fwmark (== table
 PRIO_EXCEPT_BASE="9000"     # management-plane exception rules (evaluated first)
 PRIO_SUPPRESS="9400"        # `suppress_prefixlength 0` (let specific main routes win)
 PRIO_DEFAULT="9500"         # "not fwmark <WG_FWMARK> → WARP table" rule
-MARK_CONN="0x5152"          # conntrack mark for SSH/panel inbound (keep native)
+MARK_CONN="0x5152"          # connmark for ANY locally-terminated inbound TCP
+                            # connection (client→caddy/mita, SSH, panel) so its
+                            # replies stay on the native route — BUG-171.
 
 # Management ports to keep on the native route (overridable via env from panel).
 SSH_PORT="${WARP_SSH_PORT:-}"
@@ -384,14 +386,40 @@ route_up() {
       || iptables -t mangle -A POSTROUTING -m mark --mark "$WG_FWMARK" -p udp -j CONNMARK --save-mark 2>/dev/null || true
     iptables -t mangle -C PREROUTING -p udp -j CONNMARK --restore-mark 2>/dev/null \
       || iptables -t mangle -A PREROUTING -p udp -j CONNMARK --restore-mark 2>/dev/null || true
-    # SSH + panel inbound → connmark so their replies are forced to the native
-    #   route even though the default for "everything else" goes via WARP.
-    iptables -t mangle -C INPUT -p tcp --dport "$SSH_PORT" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null \
-      || iptables -t mangle -A INPUT -p tcp --dport "$SSH_PORT" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
-    iptables -t mangle -C INPUT -p tcp --dport "$PANEL_PORT" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null \
-      || iptables -t mangle -A INPUT -p tcp --dport "$PANEL_PORT" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
-    iptables -t mangle -C OUTPUT -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null \
-      || iptables -t mangle -A OUTPUT -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null || true
+
+    # 2a) BUG-171 (CRITICAL): keep the REPLY path of every locally-terminated
+    #     inbound connection on the NATIVE route. Previously we only excepted
+    #     SSH/panel by --dport, so SYN-ACKs from caddy-naive (:443) and mita
+    #     (:2012/:443) to ARBITRARY client IPs were swallowed by the default
+    #     `not fwmark → WARP table` rule and sent into Cloudflare instead of back
+    #     to the client → every client TCP session stuck in SYN-RECV, nothing
+    #     loads. The proxies' OWN outbound dials (egress) must still go via WARP.
+    #
+    #     Distinguish by CONNECTION ORIGIN, not by port: mark every NEW inbound
+    #     TCP connection that ENTERS from a non-WARP interface (a client/SSH/panel
+    #     hitting one of OUR listening sockets), save it onto the conntrack entry,
+    #     and restore that mark on OUTPUT so the SYN-ACK/replies carry it. The
+    #     `fwmark MARK_CONN → main` ip rule (below) then routes those replies
+    #     natively. Connections the proxy ORIGINATES outbound start at OUTPUT (no
+    #     inbound PREROUTING/NEW), never get the mark, and fall through to WARP.
+    #     `! -i <warp>` so decrypted traffic returning via the tunnel is exempt.
+    #
+    #   ⚠ BUG-171 v2 (the fix that ACTUALLY unsticks SYN-RECV): the OUTPUT restore
+    #     MUST be unconditional. The previous shape matched `-m connmark --mark
+    #     MARK_CONN` on the OUTPUT rule — but that matches the *packet nfmark*,
+    #     which on a freshly-generated local SYN-ACK is still 0 (the conntrack
+    #     mark hasn't been copied onto the packet yet — that's literally what this
+    #     rule is supposed to do). So the restore NEVER fired, the SYN-ACK stayed
+    #     unmarked, and rule 9500 (`not fwmark 0xca6c → WARP`) swallowed it into
+    #     Cloudflare → client stuck in SYN-RECV. We restore on EVERY locally-
+    #     generated TCP packet: `CONNMARK --restore-mark` is a no-op when the
+    #     conntrack entry carries no mark (proxy-originated egress dials), so it
+    #     only ever marks replies of inbound (client/SSH/panel) connections.
+    #     This is the canonical wg-quick / sshuttle return-path recipe.
+    iptables -t mangle -C PREROUTING ! -i "$dev" -p tcp -m conntrack --ctstate NEW -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null \
+      || iptables -t mangle -A PREROUTING ! -i "$dev" -p tcp -m conntrack --ctstate NEW -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
+    iptables -t mangle -C OUTPUT -p tcp -j CONNMARK --restore-mark 2>/dev/null \
+      || iptables -t mangle -A OUTPUT -p tcp -j CONNMARK --restore-mark 2>/dev/null || true
 
     # 2b) BUG-170: TCP MSS clamping for everything egressing via WARP. Without it
     #     clients connect but heavy traffic stalls (segments > MTU-1280 get DF-
@@ -416,9 +444,14 @@ route_up() {
 
   # 3) HIGH-PRIORITY management exceptions (evaluated FIRST) → main table.
   local p="$PRIO_EXCEPT_BASE"
-  # 3a. fwmark of SSH/panel established replies → main
+  # 3a. BUG-171: replies of ANY locally-terminated inbound connection (the SYN-ACK
+  #     from caddy-naive/mita/SSH/panel back to the client) carry MARK_CONN via
+  #     the conntrack restore above → route them natively, NOT into WARP. THIS is
+  #     the rule that unsticks SYN-RECV: without it the SYN-ACK to an arbitrary
+  #     client IP fell through to the default `not fwmark → WARP` rule.
   ip rule add prio "$p" fwmark "$MARK_CONN" lookup main 2>/dev/null || true; p=$((p+1))
-  # 3b. locally-originated SSH/panel server replies (sport) → main
+  # 3b. belt-and-suspenders: locally-originated SSH/panel server replies (sport) →
+  #     main even before conntrack is established (covers the very first packets).
   ip rule add prio "$p" ipproto tcp sport "$SSH_PORT"   lookup main 2>/dev/null || true; p=$((p+1))
   ip rule add prio "$p" ipproto tcp sport "$PANEL_PORT" lookup main 2>/dev/null || true; p=$((p+1))
   # 3c. local subnet + default gateway → main (never tunnel LAN/gw)
@@ -478,13 +511,20 @@ route_down() {
   # 2) drop the WARP route table.
   ip route flush table "$RT_TABLE" 2>/dev/null || true
 
-  # 3) remove every mangle rule we installed (conntrack save/restore of the WG
-  #    envelope + SSH/panel control-plane marks + BUG-170 MSS clamping). Mirrors
-  #    route_up() step 2/2b. Loop the MSS deletes: each chain may hold >1 copy if
-  #    a prior partial run re-added them.
+  # 3) remove every mangle rule we installed (WG envelope conntrack save/restore +
+  #    BUG-171 inbound-connection connmark + BUG-170 MSS clamping). Mirrors
+  #    route_up() step 2/2a/2b. Loop the MSS deletes: each chain may hold >1 copy
+  #    if a prior partial run re-added them.
   if command -v iptables &>/dev/null; then
     iptables -t mangle -D POSTROUTING -m mark --mark "$WG_FWMARK" -p udp -j CONNMARK --save-mark 2>/dev/null || true
     iptables -t mangle -D PREROUTING -p udp -j CONNMARK --restore-mark 2>/dev/null || true
+    # BUG-171: inbound-connection mark (PREROUTING) + its unconditional OUTPUT
+    #   restore (the v2 shape that actually fires — no `-m connmark --mark` match).
+    iptables -t mangle -D PREROUTING ! -i "$dev" -p tcp -m conntrack --ctstate NEW -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p tcp -j CONNMARK --restore-mark 2>/dev/null || true
+    # legacy BUG-171 v1 (broken, ≤ first 1.5.7 build) + ≤v1.5.6 per-port shapes —
+    #   purge so an upgrade from any prior build leaves no orphan mangle rules.
+    iptables -t mangle -D OUTPUT -p tcp -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null || true
     iptables -t mangle -D OUTPUT -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null || true
     iptables -t mangle -D INPUT -p tcp --dport "${SSH_PORT:-22}"   -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
     iptables -t mangle -D INPUT -p tcp --dport "${PANEL_PORT:-3000}" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true

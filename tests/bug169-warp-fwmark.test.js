@@ -90,12 +90,14 @@ console.log('\n[3] BUG-169: route_up installs the full add_default() return-path
      'route_up: suppress_prefixlength 0 (specific main routes incl. endpoint win)');
 }
 
-console.log('\n[4] BUG-162 preserved: SSH/panel control plane stays on the native route');
+console.log('\n[4] BUG-162 preserved: control-plane / inbound replies stay native');
 {
-  ok(/--dport "\$SSH_PORT" -j CONNMARK --set-mark "\$MARK_CONN"/.test(routeUp),
-     'route_up: SSH inbound connmarked to native route');
-  ok(/--dport "\$PANEL_PORT" -j CONNMARK --set-mark "\$MARK_CONN"/.test(routeUp),
-     'route_up: panel inbound connmarked to native route');
+  // v1.5.7/BUG-171 generalized the per-port SSH/panel marking into a single
+  // "any NEW inbound TCP connection" connmark (covers SSH, panel AND clients).
+  ok(/-m conntrack --ctstate NEW -j CONNMARK --set-mark "\$MARK_CONN"/.test(routeUp),
+     'route_up: NEW inbound TCP connmarked to native route (covers SSH/panel/clients)');
+  ok(/-A OUTPUT -p tcp -j CONNMARK --restore-mark/.test(routeUp),
+     'route_up: inbound-connection replies restored UNCONDITIONALLY on OUTPUT (kept native)');
   ok(/ip rule add prio "\$p" fwmark "\$MARK_CONN" lookup main/.test(routeUp),
      'route_up: connmarked replies routed to main (never tunneled)');
   ok(/Table = off/.test(src), 'still uses `Table = off` (BUG-162 preserved)');
