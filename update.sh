@@ -1007,8 +1007,11 @@ migrate_warp_safety() {
     log_warn "WARP autostart disabled (BUG-162: prevents reboot lock-out) / автозагрузка WARP отключена"
   fi
   # If a stale warp.conf still has the broken blanket-route layout (Table=auto or
-  # no Table=off, AllowedIPs ::/0 / 0.0.0.0/0 as default), tear the tunnel down so
-  # the operator is not stuck behind a control-plane-eating route after update.
+  # no Table=off, AllowedIPs ::/0 / 0.0.0.0/0 as default), OR is a v1.5.2 conf
+  # WITHOUT the MTU=1280 fix (BUG-164: one-way tunnel — handshake OK but no return
+  # traffic), tear the tunnel down so the panel regenerates the fixed conf on the
+  # next enable, and the operator is not stuck behind a black-hole/control-plane-
+  # eating route after the update.
   if [[ -f /etc/wireguard/warp.conf ]]; then
     if ! grep -qiE '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off' /etc/wireguard/warp.conf; then
       log_warn "Tearing down old unsafe WARP tunnel (missing Table=off) / снимаю старый небезопасный WARP"
@@ -1016,6 +1019,13 @@ migrate_warp_safety() {
       wg-quick down warp 2>/dev/null || true
       ip link del warp 2>/dev/null || true
       # remove the old broken conf so the panel regenerates the safe one on enable
+      rm -f /etc/wireguard/warp.conf
+      changed=1
+    elif ! grep -qiE '^[[:space:]]*MTU[[:space:]]*=[[:space:]]*1280' /etc/wireguard/warp.conf; then
+      log_warn "Tearing down one-way WARP tunnel (missing MTU=1280, BUG-164) / снимаю односторонний WARP без MTU 1280"
+      systemctl stop wg-quick@warp 2>/dev/null || true
+      wg-quick down warp 2>/dev/null || true
+      ip link del warp 2>/dev/null || true
       rm -f /etc/wireguard/warp.conf
       changed=1
     fi

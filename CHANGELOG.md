@@ -7,6 +7,54 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.3]
+
+### Fixed
+- **BUG-164 (HIGH): WARP tunnel was ONE-WAY — egress black-holed.** After v1.5.2
+  the WARP tunnel handshaked correctly but `wg show` reported `received ≈ 92 B`
+  against `sent ≈ 425 MiB`: Cloudflare's return traffic never arrived. Everything
+  routed into the WARP table (table 51820) went into a black hole — `curl ipify`
+  on the server hung, key clients got no response, and from outside it looked like
+  the panel had crashed. The BUG-162 control-plane exceptions were correct and are
+  untouched; the breakage was purely the one-way data path. Fixes
+  (`warp_egress.sh`):
+  - **`MTU = 1280`** in the generated `warp.conf` (cause #1). With the default
+    1420/1500 the encapsulated reply packets exceed the path MTU and are silently
+    dropped — the classic "sent MiB / received ~0 B" symptom.
+  - **Robust wgcf registration.** A key that is *generated* but never actually
+    *registered* with Cloudflare gives the same picture. `account_is_valid()` now
+    checks the account file really contains a `device_id` + `private_key`; an
+    empty/corrupt account is re-registered, and setup hard-fails if registration
+    does not produce a valid account.
+  - **Endpoint-port fallback.** Some hosters block inbound UDP/2408. If the tunnel
+    is unhealthy we retry across `2408 / 500 / 1701 / 4500`.
+  - **Post-up healthcheck with AUTO-ROLLBACK.** After bring-up we probe the egress
+    IP **through the warp interface** (`curl --interface warp … api.ipify.org`,
+    timeout 5s). If no Cloudflare IP comes back on any endpoint port, we
+    automatically `warp_down` (full teardown) and surface a clear error — the box
+    is **never left in a black hole**, so the panel and SSH stay reachable on the
+    native route even when WARP can't be brought up on a given host.
+  - **Autostart enabled only after a healthy tunnel** (and only when
+    `WARP_PERSIST=1`): a bad tunnel is never persisted into the boot path.
+  - `do_status` now reports `rxBytes/txBytes/mtu`, and a `healthcheck` CLI action
+    was added, so a one-way tunnel is immediately observable.
+  - `update.sh` `migrate_warp_safety` now also tears down v1.5.2 confs **missing
+    `MTU = 1280`**, so the panel regenerates the fixed conf on the next enable.
+
+  **Acceptance:** after "Применить WARP", `wg show` shows non-zero `received`;
+  `curl --interface warp` returns a Cloudflare IP in < 5s; a key client checking
+  its IP sees the Cloudflare IP, not the server IP. Panel + SSH stay reachable
+  throughout; if the tunnel can't be brought up healthy, it auto-rolls-back and
+  access is preserved.
+
+- **BUG-165 (cosmetic): removed the misleading "Naive (сервер, суммарно)" banner.**
+  Since v1.5.2 Naive traffic is shown per key in the Users table, so the
+  server-wide banner above the table was both incorrect and confusing. The banner
+  (`renderNaiveServerBanner`) is removed; `removeNaiveServerBanner()` also strips
+  any stale banner left in the DOM by a previously-cached build.
+
+---
+
 ## [v1.5.2]
 
 ### Fixed
