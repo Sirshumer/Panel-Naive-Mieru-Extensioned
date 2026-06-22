@@ -71,14 +71,32 @@ WARP_ENDPOINT_PORTS="${WARP_ENDPOINT_PORTS:-2408 500 1701 4500}"
 #   time we auto-roll-back so the box never sits in a black-hole.
 WARP_HEALTH_TIMEOUT="${WARP_HEALTH_TIMEOUT:-5}"
 
-# BUG-162 policy-routing constants. We pick fixed, high (=evaluated-first) priority
-# ip-rule numbers for the management-plane exceptions, and a single low-priority
-# rule that finally sends everything else into the WARP table.
-RT_TABLE="51820"            # dedicated route table id for WARP default route
+# BUG-162/169 policy-routing constants.
+#
+# BUG-169 (CRITICAL): our v1.5.2–1.5.4 hand-rolled scheme broke the WARP RETURN
+#   path (rx≈92B handshake-only, tx huge). A bare Table=off tunnel with NO policy
+#   routing works perfectly on the same host/endpoint — so the breakage was OURS,
+#   not the provider's. Root cause: we never adopted the kernel mechanism that
+#   makes WireGuard-over-policy-routing actually carry return traffic:
+#     1. WireGuard must fwmark its OWN encrypted envelope packets (`wg set fwmark`)
+#        so they can be kept OUT of the tunnel table (else a routing loop).
+#     2. `ip rule add not fwmark <T> table <T>` sends everything EXCEPT the
+#        envelope into the tunnel table.
+#     3. conntrack save/restore of that fwmark on the UDP envelope
+#        (POSTROUTING --save-mark / PREROUTING --restore-mark) so the RETURN
+#        encrypted packets are associated and delivered back to the wg socket.
+#     4. `sysctl net.ipv4.conf.all.src_valid_mark=1` so marked packets survive
+#        reverse-path filtering.
+#   This is exactly what wg-quick's own `add_default()` does with Table=auto. We
+#   now replicate it (table = fwmark = 51820) and ADD our management-plane
+#   exceptions on top (suppress_prefixlength + SSH/panel sport → main).
+RT_TABLE="51820"            # dedicated route table id == WireGuard fwmark
 RT_NAME="warp"
-PRIO_EXCEPT_BASE="9000"     # exception rules (lower number = higher priority)
-PRIO_DEFAULT="9500"         # "everything else → WARP table" rule
-MARK_CONN="0x5152"          # conntrack mark for inbound/established (keep native)
+WG_FWMARK="51820"           # BUG-169: WireGuard's own envelope fwmark (== table)
+PRIO_EXCEPT_BASE="9000"     # management-plane exception rules (evaluated first)
+PRIO_SUPPRESS="9400"        # `suppress_prefixlength 0` (let specific main routes win)
+PRIO_DEFAULT="9500"         # "not fwmark <WG_FWMARK> → WARP table" rule
+MARK_CONN="0x5152"          # conntrack mark for SSH/panel inbound (keep native)
 
 # Management ports to keep on the native route (overridable via env from panel).
 SSH_PORT="${WARP_SSH_PORT:-}"
@@ -234,8 +252,15 @@ host_has_ipv6() {
   # No /proc/net/if_inet6 → no IPv6 stack at all.
   [[ -e /proc/net/if_inet6 ]] || return 1
   # Need at least one usable (global or link) IPv6 address on some interface.
-  ip -6 addr show scope global 2>/dev/null | grep -q "inet6" && return 0
-  ip -6 addr show 2>/dev/null | grep -q "inet6" && return 0
+  # NB: snapshot into a var then match in pure bash — piping into `grep -q` under
+  #     `set -o pipefail` can yield 141 (SIGPIPE when grep closes the pipe early)
+  #     and produce a FALSE "no IPv6" verdict (which would wrongly strip ::/0 on a
+  #     dual-stack host — see BUG-167). Same SIGPIPE/pipefail class as BUG-166.
+  local v6
+  v6="$(ip -6 addr show scope global 2>/dev/null || true)"
+  [[ "$v6" == *inet6* ]] && return 0
+  v6="$(ip -6 addr show 2>/dev/null || true)"
+  [[ "$v6" == *inet6* ]] && return 0
   return 1
 }
 
@@ -310,68 +335,130 @@ warp_endpoint_ip() {
   else getent hosts "$host" 2>/dev/null | awk '{print $1; exit}'; fi
 }
 
-# ── BUG-162: install scoped policy routing — only egress via WARP, control plane
-#    (SSH/panel/local/gateway/established) stays on the native route. ───────────
+# ── BUG-169: install policy routing that ACTUALLY carries WARP return traffic ──
+#   This mirrors wg-quick's proven `add_default()` (the bare Table=off tunnel that
+#   the operator confirmed works) and layers our management-plane exceptions on
+#   top. The pieces that were missing in v1.5.2–1.5.4 (and broke the return path):
+#     • WireGuard fwmarks its own envelope (`wg set <iface> fwmark <T>`)
+#     • `not fwmark <T> table <T>` (envelope stays native; everything else tunnels)
+#     • conntrack save/restore of the UDP envelope mark (return packets delivered)
+#     • src_valid_mark=1 (marked packets pass reverse-path filtering)
+#   Management exceptions (HIGHER priority, evaluated first): SSH/panel sport →
+#   main, local subnet/gateway → main, and `suppress_prefixlength 0` so specific
+#   main routes (incl. the on-link endpoint route) win.
 route_up() {
   local dev="${1:-$WG_IFACE}"
   [[ -z "$SSH_PORT" ]] && SSH_PORT="$(detect_ssh_port)"
 
-  # 1) WARP default route lives ONLY in our dedicated table.
+  # 0) Tell WireGuard to fwmark its OWN encrypted envelope packets. This is THE
+  #    key piece: it lets us keep the envelope OUT of the tunnel table (no loop)
+  #    and lets conntrack tag the return packets so they reach the wg socket.
+  wg set "$dev" fwmark "$WG_FWMARK" 2>/dev/null || true
+
+  # 1) WARP default route lives ONLY in our dedicated table (== the fwmark).
   ip route replace default dev "$dev" table "$RT_TABLE" 2>/dev/null \
     || ip route add default dev "$dev" table "$RT_TABLE" 2>/dev/null || true
 
-  # 2) Keep replies to INBOUND/ESTABLISHED connections on the native route, so
-  #    active SSH/panel/proxy-client sessions are never hijacked into the tunnel.
-  #    Mark such packets with conntrack and steer the mark to main.
+  # 2) conntrack save/restore of the envelope mark on the UDP carrier. THIS is
+  #    the return-path fix: the outgoing encrypted UDP carries WG_FWMARK; we save
+  #    it onto the conntrack entry (POSTROUTING) and restore it on the incoming
+  #    reply UDP (PREROUTING) so the kernel routes the reply back to the wg
+  #    socket instead of dropping it. Plus src_valid_mark so it survives rp_filter.
   if command -v iptables &>/dev/null; then
-    iptables -t mangle -C OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark 2>/dev/null \
-      || iptables -t mangle -A OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark 2>/dev/null || true
-    # SSH + panel inbound → save a connmark so their replies stay native.
+    iptables -t mangle -C POSTROUTING -m mark --mark "$WG_FWMARK" -p udp -j CONNMARK --save-mark 2>/dev/null \
+      || iptables -t mangle -A POSTROUTING -m mark --mark "$WG_FWMARK" -p udp -j CONNMARK --save-mark 2>/dev/null || true
+    iptables -t mangle -C PREROUTING -p udp -j CONNMARK --restore-mark 2>/dev/null \
+      || iptables -t mangle -A PREROUTING -p udp -j CONNMARK --restore-mark 2>/dev/null || true
+    # SSH + panel inbound → connmark so their replies are forced to the native
+    #   route even though the default for "everything else" goes via WARP.
     iptables -t mangle -C INPUT -p tcp --dport "$SSH_PORT" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null \
       || iptables -t mangle -A INPUT -p tcp --dport "$SSH_PORT" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
     iptables -t mangle -C INPUT -p tcp --dport "$PANEL_PORT" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null \
       || iptables -t mangle -A INPUT -p tcp --dport "$PANEL_PORT" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
+    iptables -t mangle -C OUTPUT -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null \
+      || iptables -t mangle -A OUTPUT -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null || true
   fi
+  # rp_filter: allow locally-generated marked (WireGuard) traffic. wg-quick sets
+  #   this exact sysctl; without it the decrypted return packets fail the reverse
+  #   path check on the warp interface and are dropped (the rx≈92B symptom).
+  sysctl -q net.ipv4.conf.all.src_valid_mark=1 2>/dev/null || true
 
-  # 3) HIGH-PRIORITY exception rules (evaluated before the WARP rule) → main table.
+  # 3) HIGH-PRIORITY management exceptions (evaluated FIRST) → main table.
   local p="$PRIO_EXCEPT_BASE"
-  # 3a. fwmark of established/inbound replies → main
+  # 3a. fwmark of SSH/panel established replies → main
   ip rule add prio "$p" fwmark "$MARK_CONN" lookup main 2>/dev/null || true; p=$((p+1))
   # 3b. locally-originated SSH/panel server replies (sport) → main
   ip rule add prio "$p" ipproto tcp sport "$SSH_PORT"   lookup main 2>/dev/null || true; p=$((p+1))
   ip rule add prio "$p" ipproto tcp sport "$PANEL_PORT" lookup main 2>/dev/null || true; p=$((p+1))
   # 3c. local subnet + default gateway → main (never tunnel LAN/gw)
-  local sub gw ep
-  sub="$(local_subnet)"; gw="$(default_gw)"; ep="$(warp_endpoint_ip)"
+  local sub gw
+  sub="$(local_subnet)"; gw="$(default_gw)"
   [[ -n "$sub" ]] && { ip rule add prio "$p" to "$sub" lookup main 2>/dev/null || true; p=$((p+1)); }
   [[ -n "$gw"  ]] && { ip rule add prio "$p" to "${gw}/32" lookup main 2>/dev/null || true; p=$((p+1)); }
-  # 3d. WARP endpoint itself → main (anti-loop: the tunnel packets must exit native)
-  [[ -n "$ep"  ]] && { ip rule add prio "$p" to "${ep}/32" lookup main 2>/dev/null || true; p=$((p+1)); }
 
-  # 4) FINALLY: everything else → WARP table (lowest of our priorities).
-  ip rule add prio "$PRIO_DEFAULT" lookup "$RT_TABLE" 2>/dev/null || true
+  # 4) `suppress_prefixlength 0` on main: consult main for any SPECIFIC (non-
+  #    default) route first — this is how wg-quick keeps the on-link route to the
+  #    WARP endpoint (and any other specific routes) working, so the envelope
+  #    exits via the native NIC. The endpoint no longer needs an explicit rule.
+  ip rule add prio "$PRIO_SUPPRESS" table main suppress_prefixlength 0 2>/dev/null || true
+
+  # 5) FINALLY: everything EXCEPT WireGuard's own envelope → WARP table. The
+  #    `not fwmark` is what prevents the encrypted packets from looping back into
+  #    the tunnel (they go out native to the endpoint instead).
+  ip rule add prio "$PRIO_DEFAULT" not fwmark "$WG_FWMARK" lookup "$RT_TABLE" 2>/dev/null || true
 
   ip route flush cache 2>/dev/null || true
-  log "policy routing installed (control plane preserved: SSH ${SSH_PORT}, panel ${PANEL_PORT}, subnet ${sub:-?}, gw ${gw:-?})"
+  log "policy routing installed (wg-quick-style fwmark=${WG_FWMARK}; control plane preserved: SSH ${SSH_PORT}, panel ${PANEL_PORT}, subnet ${sub:-?}, gw ${gw:-?})"
 }
 
 # ── remove every policy-routing artifact we added (idempotent) ────────────────
+# BUG-169 + BUG-150 lesson: teardown MUST mirror route_up() exactly and be safe to
+# call repeatedly even on a partially-applied state, so we never strand fwmark/
+# rules/mangle entries that would silently break the next tunnel's return path.
 route_down() {
-  # Delete our ip rules by priority (covers any leftover from prior runs).
-  local p
-  for p in $(seq "$PRIO_EXCEPT_BASE" $((PRIO_EXCEPT_BASE+10))) "$PRIO_DEFAULT"; do
-    while ip rule show 2>/dev/null | grep -qE "^${p}:"; do
-      ip rule del prio "$p" 2>/dev/null || break
+  local dev="${WG_IFACE}"
+  # 0) clear WireGuard's own envelope fwmark (no-op if iface already gone).
+  wg set "$dev" fwmark 0 2>/dev/null || true
+
+  # 1) delete our ip rules by priority. Covers management exceptions (9000-9010),
+  #    suppress_prefixlength (PRIO_SUPPRESS) and the `not fwmark` default
+  #    (PRIO_DEFAULT). Loop because several rules can share a priority slot.
+  #    NB1: do NOT pipe `ip rule show | grep -q` as the loop condition — under
+  #         `set -o pipefail` (active in this script) `grep -q` closes the pipe
+  #         on first match, `ip rule show` gets SIGPIPE (141), pipefail makes the
+  #         pipeline non-zero, and the `while` wrongly evaluates FALSE so the
+  #         rule is never deleted (same SIGPIPE/pipefail class as BUG-166;
+  #         observed live to strand prio 9000). We snapshot the table into a var
+  #         and grep that instead.
+  #    NB2: `|| true` (NOT `|| break`) + a bounded counter — a transient del
+  #         hiccup must not abort cleanup, and the counter prevents infinite spin.
+  local p n rules
+  for p in $(seq "$PRIO_EXCEPT_BASE" $((PRIO_EXCEPT_BASE+10))) "$PRIO_SUPPRESS" "$PRIO_DEFAULT"; do
+    n=0
+    rules="$(ip rule show 2>/dev/null || true)"
+    # pure-bash substring match (no pipe → no SIGPIPE/pipefail trap at all)
+    while [[ $'\n'"$rules" == *$'\n'"${p}:"* ]]; do
+      ip rule del prio "$p" 2>/dev/null || true
+      n=$((n+1)); [ "$n" -ge 16 ] && break
+      rules="$(ip rule show 2>/dev/null || true)"
     done
   done
-  # Drop the WARP route table.
+
+  # 2) drop the WARP route table.
   ip route flush table "$RT_TABLE" 2>/dev/null || true
-  # Remove our mangle marks.
+
+  # 3) remove every mangle rule we installed (conntrack save/restore of the WG
+  #    envelope + SSH/panel control-plane marks). Mirrors route_up() step 2.
   if command -v iptables &>/dev/null; then
-    iptables -t mangle -D OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark 2>/dev/null || true
+    iptables -t mangle -D POSTROUTING -m mark --mark "$WG_FWMARK" -p udp -j CONNMARK --save-mark 2>/dev/null || true
+    iptables -t mangle -D PREROUTING -p udp -j CONNMARK --restore-mark 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null || true
     iptables -t mangle -D INPUT -p tcp --dport "${SSH_PORT:-22}"   -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
     iptables -t mangle -D INPUT -p tcp --dport "${PANEL_PORT:-3000}" -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
+    # legacy (pre-1.5.5) rule shapes — purge so an upgrade leaves no orphans.
+    iptables -t mangle -D OUTPUT -m conntrack --ctstate ESTABLISHED,RELATED -j CONNMARK --restore-mark 2>/dev/null || true
   fi
+
   ip route flush cache 2>/dev/null || true
   log "policy routing removed"
 }
@@ -530,9 +617,12 @@ warp_down() {
   ip link del "$WG_IFACE" 2>/dev/null || true
   # Legacy cleanup: v1.5.1 used wg-quick Table=auto with fwmark 0xca6c — remove
   # any lingering rule/table from a box that ran the old (broken) version.
-  local legacy="0xca6c"
-  while ip rule show 2>/dev/null | grep -q "fwmark ${legacy}"; do
-    ip rule del fwmark "${legacy}" 2>/dev/null || break
+  local legacy="0xca6c" lrules ln=0
+  lrules="$(ip rule show 2>/dev/null || true)"
+  while [[ "$lrules" == *"fwmark ${legacy}"* ]]; do
+    ip rule del fwmark "${legacy}" 2>/dev/null || true
+    ln=$((ln+1)); [ "$ln" -ge 16 ] && break
+    lrules="$(ip rule show 2>/dev/null || true)"
   done
   ip route flush table "$((16#ca6c))" 2>/dev/null || true
   # Remove the generated interface config so a stale conf can't be re-applied.

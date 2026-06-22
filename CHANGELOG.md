@@ -7,6 +7,82 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.5]
+
+> **BUG-169 (CRITICAL) — the panel's own policy routing was breaking WARP's
+> return path, not the provider.** Proven on a *clean* hoster (server 192187):
+> a **bare** `wgcf` tunnel (`Table = off`, no policy routing) reached a
+> Cloudflare egress IP (`curl --interface wgtest` → `104.28.197.7`), but the
+> **panel** setup on the *same server, same endpoint, fresh account* returned
+> `WARP_RESULT=blocked_return` with `rx=92 tx=4.8 GB` (handshake only). The only
+> difference was the fwmark + `ip rule table 51820` the panel layered over
+> `Table = off`. That layer was **missing the canonical wg-quick `add_default()`
+> return-path mechanism**, so the encrypted reply UDP from Cloudflare never made
+> it back to the WireGuard socket. This also means the `blocked_return` verdict
+> was **false on clean hosters** — the scary "provider blocks WARP" banner could
+> fire even when the provider was fine.
+
+### Fixed
+- **BUG-169 (CRITICAL): WARP return traffic dropped by the panel's fwmark/policy
+  routing → false `blocked_return`.** `route_up()` now mirrors wg-quick's
+  `add_default()` exactly:
+  1. `wg set <iface> fwmark 51820` — WireGuard fwmarks its **own** encrypted
+     envelope UDP (the missing key piece).
+  2. `ip rule add not fwmark 51820 lookup 51820` — everything **except** the
+     envelope is sent into the tunnel table (the envelope exits native, no loop).
+  3. **conntrack save/restore of the envelope mark** — the return-path fix:
+     `POSTROUTING -m mark --mark 51820 -p udp -j CONNMARK --save-mark` stamps the
+     mark onto the outgoing envelope's conntrack entry, and
+     `PREROUTING -p udp -j CONNMARK --restore-mark` restores it on the **incoming
+     reply UDP** so the kernel delivers it back to the wg socket instead of
+     dropping it (the `rx≈92 B` symptom).
+  4. `sysctl net.ipv4.conf.all.src_valid_mark=1` — marked / locally-generated
+     packets pass reverse-path filtering, so decrypted return packets survive.
+  5. `ip rule add table main suppress_prefixlength 0` — specific routes in
+     `main` (incl. the on-link route to the WARP endpoint) win, so the envelope
+     leaves via the native NIC.
+  - **Acceptance:** on a server where the bare `wgcf` tunnel yields a CF egress
+    IP, the **panel** WARP now yields the same CF egress (`WARP_RESULT=ok`), not
+    `blocked_return`.
+- **BUG-169 regression (SIGPIPE/pipefail — same class as BUG-166):** the
+  `route_down()` rule-cleanup loop used `while ip rule show | grep -q "^<prio>:"`
+  as its condition. Under `set -o pipefail`, `grep -q` closes the pipe on the
+  first match → `ip rule show` gets SIGPIPE (141) → pipefail makes the pipeline
+  non-zero → the `while` wrongly evaluates **false** → the rule is **never
+  deleted** (observed live to strand `ip rule` prio 9000). Fixed by snapshotting
+  the table into a variable and matching in pure bash (no pipe). The same
+  pattern in `has_ipv6()` (`ip -6 addr show | grep -q inet6 && return 0`) was
+  fixed too — it could produce a false "no IPv6" verdict and wrongly strip
+  `::/0` on a dual-stack host (touches BUG-167).
+
+### Changed
+- `route_down()` now tears down **every** new artifact idempotently (BUG-150
+  guarantee): clears the WireGuard fwmark (`wg set <iface> fwmark 0`), removes
+  the new mangle rules (POSTROUTING save-mark, PREROUTING restore-mark, OUTPUT
+  connmark restore), and deletes the `suppress_prefixlength` (9400) and
+  `not fwmark` default (9500) rules — plus the management exceptions (9000-9010)
+  and the WARP route table. Verified live: `route_up` installs the policy rules,
+  `route_down` removes **all** of them (0 left).
+- The previous explicit `to <endpoint>/32 → main` exception is no longer needed
+  — `suppress_prefixlength 0` covers the on-link endpoint route generically.
+
+### Preserved (unchanged guarantees)
+- **BUG-162:** SSH and the panel are still pinned to the native route via
+  connmark + high-priority `ip rule … lookup main`; they are **never** tunneled.
+- `Table = off`, `MTU = 1280`, IPv4-only Address/`AllowedIPs` (BUG-164/167).
+- Healthcheck + auto-rollback + outcome classification (BUG-164/168).
+
+### Tests
+- New `tests/bug169-warp-fwmark.test.js` (31 assertions): asserts the
+  `wg set fwmark`, `not fwmark`, conntrack save/restore, `src_valid_mark`, and
+  `suppress_prefixlength` pieces in `route_up()`; the full idempotent teardown in
+  `route_down()`; the SIGPIPE-free loop conditions; and — when run as root — a
+  **live** `route_up → route_down` cycle proving the rule table ends up empty.
+- Full suite: **207 passed, 0 failed** without root (the live route_up/route_down
+  block skips when not root); **210 passed** as root (was 179; +28/+31).
+
+---
+
 ## [v1.5.4]
 
 > **WARP confirmed working — the v1.5.3 code is correct.** Verified on another
