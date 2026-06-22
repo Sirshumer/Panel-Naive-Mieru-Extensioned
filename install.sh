@@ -852,12 +852,11 @@ write_caddyfile() {
   }
   email ${ADMIN_EMAIL}
   admin off
+  # Global = runtime logger only (stderr/journald). NOT access logs.
   log {
-    output file /var/log/caddy-naive/access.log {
-      roll_size     50mb
-      roll_keep_for 720h
-    }
-    format json
+    output stderr
+    format console
+    level ERROR
   }
 }
 
@@ -874,6 +873,16 @@ write_caddyfile() {
   # would close the string and a colon-redirect would be parsed as a file
   # ('line 665: port: No such file or directory' was Bug 88).
   tls ${ADMIN_EMAIL}
+
+  # Traffic accounting: per-site ACCESS log -> JSON line per request with
+  # request.user_id + byte counters that parseCaddyTraffic() sums per user.
+  log {
+    output file /var/log/caddy-naive/access.log {
+      roll_size     50mb
+      roll_keep_for 720h
+    }
+    format json
+  }
 
   forward_proxy {
 ${auth_lines}

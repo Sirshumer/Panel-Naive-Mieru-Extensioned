@@ -301,13 +301,17 @@ function render(cfg, naiveUsers) {
   }
   email ${email}
   admin off
+  # BUG (traffic accounting): the log directive in the GLOBAL options block only
+  # configures Caddy's runtime (diagnostic) logger — it does NOT enable HTTP
+  # access logging, so it never emits per-request user_id / byte counters. That is
+  # why NaiveProxy traffic was always 0.0: parseCaddyTraffic() reads access.log,
+  # but only runtime lines (no user_id, no bytes_read/size) were ever written
+  # there. Access logging MUST be a log directive INSIDE the site block (below).
+  # Keep the global logger on stderr (journald) so it never pollutes access.log.
   log {
-    # Bug 38: 30-day retention by age instead of a fixed file count
-    output file ${logFile} {
-      roll_size 50mb
-      roll_keep_for 720h
-    }
-    format json
+    output stderr
+    format console
+    level ERROR
   }
 }
 
@@ -324,6 +328,20 @@ function render(cfg, naiveUsers) {
   #   - no route{} wrapper — forward_proxy/file_server directly in the site block
   #     (ordering comes from the global "order forward_proxy first")
   tls ${email}
+
+  # Traffic accounting: per-site ACCESS log — THIS is what writes a JSON line
+  # per handled request with request.user_id (the basic_auth username of the
+  # authenticated CONNECT) and the byte counters (bytes_read = upload,
+  # size = download). parseCaddyTraffic() sums these per user. Without this
+  # site-level directive Naive traffic is never recorded.
+  log {
+    # Bug 38: 30-day retention by age instead of a fixed file count
+    output file ${logFile} {
+      roll_size 50mb
+      roll_keep_for 720h
+    }
+    format json
+  }
 
   forward_proxy {
     # Bug 23: no bare "basic_auth" token; each line IS the credential directive

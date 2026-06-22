@@ -7,6 +7,39 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.0] — 2026-06-22 (Naive traffic accounting fix + Cloudflare WARP egress mode)
+
+- **TASK 1 (MEDIUM) — NaiveProxy traffic always 0.0:** root cause was the Caddy
+  `log` directive living in the GLOBAL options block, which only configures
+  Caddy's runtime logger and never writes HTTP access logs — so `access.log` had
+  no per-request `user_id` / byte counters for `parseCaddyTraffic()` to sum.
+  - Moved the access `log` directive INSIDE the `:port, domain` site block in all
+    generators: `caddyTemplate.js` (primary) + the inline fallbacks in
+    `install.sh` and `update.sh`. The global logger now writes only runtime errors
+    to stderr/journald so it never pollutes `access.log`.
+  - `parseCaddyTraffic()` now survives log rotation: it sums the current
+    `access.log` PLUS all rolled siblings (`access-<ts>.log`), so a Caddy roll no
+    longer resets Naive usage to 0. (.gz rolls are skipped to avoid blocking.)
+  - **UI:** the single "Used (MB)" column is split into two — **Naive (MB)** and
+    **Mieru (MB)** — backed by the existing `naiveMB` / `mieruMB` fields.
+  - Tests: `bug-naive-caddylog.test.js` (9) verifies the access log is in the site
+    block; `bug-naive-traffic.test.js` (17) verifies per-user attribution and
+    rotation survival.
+- **TASK 2 (FEATURE) — Cloudflare WARP egress mode:** optional server-wide egress
+  through Cloudflare WARP so the server's real IP is never exposed.
+  - New `scripts/warp_egress.sh` (wgcf + wg-quick) with idempotent
+    `setup` / `teardown` / `status` / `egress-ip`; reboot-persistent via
+    `wg-quick@warp` systemd unit; full teardown removes the interface, routes,
+    fwmark rules and conf (BUG-150 clean-teardown lesson).
+  - New API: `GET/POST /api/settings/warp`, `GET /api/settings/warp/status`,
+    `POST /api/settings/warp/reset`. The POST reports the measured egress IP so
+    the operator can confirm it switched to Cloudflare.
+  - **Mutual exclusion:** exactly one egress mode is active (native IP / cascade /
+    WARP). Enabling WARP force-tears-down the cascade and vice-versa — enforced
+    server-side AND in the UI (the WARP toggle is locked while the cascade is on).
+  - **Low-RAM advisory:** on VPS with ≤1 GB RAM the UI warns that the extra
+    WireGuard layer adds memory pressure.
+
 ## [v1.4.9] — Hotfix 2026-06-12 (BUG-156: trafficPattern.seed boolean → int32, mita IDLE / Mieru port closed)
 
 - **BUG-156 (HIGH):** enabling Mieru obfuscation (traffic pattern) in the UI made

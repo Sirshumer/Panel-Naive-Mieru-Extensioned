@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.4.9
+ * Panel Naive + Mieru — Frontend Application v1.5.0
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  * v1.2.5: probe-secret setting, disabled-button+spinner on all submit handlers,
@@ -281,6 +281,9 @@ function handleDelegatedClick(e) {
     case 'change-cascade':       changeCascade(); break;
     case 'cascade-status':       checkCascadeStatus(); break;
     case 'reset-cascade':        resetCascade(); break;
+    case 'apply-warp':           applyWarp(); break;
+    case 'warp-status':          checkWarpStatus(); break;
+    case 'reset-warp':           resetWarp(); break;
     // ── v1.4.0: external panel access
     case 'gen-web-base-path':    generateWebBasePath(); break;
     case 'save-external-access': saveExternalAccess(); break;
@@ -515,7 +518,7 @@ async function loadDashboard() {
 
 async function loadUsers() {
   const tbody = el('users-tbody');
-  tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${t('users.loading')}</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="11" class="table-empty">${t('users.loading')}</td></tr>`;
   try {
     state.users = await api('GET', '/api/users');
     renderUsersTable(state.users);
@@ -582,7 +585,7 @@ async function applyFoolproofGates(count) {
 function renderUsersTable(users) {
   const tbody = el('users-tbody');
   if (!users.length) {
-    tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${t('users.noUsers')}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" class="table-empty">${t('users.noUsers')}</td></tr>`;
     return;
   }
   tbody.innerHTML = users.map(u => {
@@ -608,7 +611,8 @@ function renderUsersTable(users) {
       <td>${expBadge}</td>
       <td>${hasNaive ? '<span class="badge badge-blue">✓</span>' : '<span class="badge badge-gray">—</span>'}</td>
       <td>${hasMieru ? '<span class="badge badge-blue">✓</span>' : '<span class="badge badge-gray">—</span>'}</td>
-      <td>${fmtNum(u.usedMB)}</td>
+      <td>${fmtNum(u.naiveMB != null ? u.naiveMB : 0)}</td>
+      <td>${fmtNum(u.mieruMB != null ? u.mieruMB : 0)}</td>
       <td>${u.quotaMB > 0 ? fmtNum(u.quotaMB) : '∞'}</td>
       <td>${quotaStr}</td>
       <td>${fmtLastSeen(u.lastSeen)}</td>
@@ -902,6 +906,19 @@ async function loadSettings() {
     const casc = cfg.cascadeMieru || {};
     const cascadeEnabledEl = el('s-cascade-enabled');
     if (cascadeEnabledEl) cascadeEnabledEl.checked = cfg.cascadeEnabled === true;
+    // WARP egress (mutually exclusive with cascade)
+    const warpEl = el('s-warp-enabled');
+    if (warpEl) warpEl.checked = cfg.warpEnabled === true;
+    refreshWarpUiState(cfg.cascadeEnabled === true);
+    try {
+      const w = await api('GET', '/api/settings/warp');
+      const lr = el('warp-lowram');
+      if (lr) {
+        if (w && w.lowRam && w.lowRamWarning) { lr.textContent = '⚠ ' + w.lowRamWarning; lr.classList.remove('hidden'); }
+        else lr.classList.add('hidden');
+      }
+      refreshWarpUiState(!!(w && w.cascadeEnabled));
+    } catch {}
     const cascadeNaiveEl = el('s-cascade-naive-upstream');
     if (cascadeNaiveEl) cascadeNaiveEl.value = cfg.cascadeNaiveUpstream || '';
     const cascadeMieruHostEl = el('s-cascade-mieru-host');
@@ -1319,6 +1336,81 @@ async function resetCascade() {
     if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
   } catch (err) {
     showMsg('cascade-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ── WARP egress (mutually exclusive with cascade) ────────────────────────────
+function refreshWarpUiState(cascadeOn) {
+  const lock = el('warp-cascade-lock');
+  const warpEl = el('s-warp-enabled');
+  const applyBtn = el('btn-apply-warp');
+  if (cascadeOn) {
+    if (lock) lock.classList.remove('hidden');
+    if (warpEl) { warpEl.checked = false; warpEl.disabled = true; }
+    if (applyBtn) applyBtn.disabled = true;
+  } else {
+    if (lock) lock.classList.add('hidden');
+    if (warpEl) warpEl.disabled = false;
+    if (applyBtn) applyBtn.disabled = false;
+  }
+}
+
+async function applyWarp() {
+  const enabled = el('s-warp-enabled')?.checked || false;
+  const btn = el('btn-apply-warp');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('POST', '/api/settings/warp', { warpEnabled: enabled });
+    if (state.config) {
+      state.config.warpEnabled = res.warpEnabled === true;
+      if (res.cascadeDisabled) state.config.cascadeEnabled = false;
+    }
+    if (res.cascadeDisabled) {
+      const ce = el('s-cascade-enabled'); if (ce) ce.checked = false;
+    }
+    const egress = res.egressIP ? ` (egress IP: ${res.egressIP})` : '';
+    showMsg('warp-msg', (res.message || 'WARP применён') + egress, res.ok !== false);
+    toast(res.ok !== false ? 'WARP применён' : 'WARP: ошибка', res.ok !== false ? 'success' : 'error');
+    if (res.output) { const pre = el('warp-status'); if (pre) { pre.textContent = res.output; pre.classList.remove('hidden'); } }
+    if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
+  } catch (err) {
+    showMsg('warp-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+async function checkWarpStatus() {
+  const btn = document.querySelector('[data-action="warp-status"]');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('GET', '/api/settings/warp/status');
+    const pre = el('warp-status');
+    if (pre) { pre.textContent = res.output || '(нет данных)'; pre.classList.remove('hidden'); }
+  } catch (err) {
+    showMsg('warp-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+async function resetWarp() {
+  if (!confirm('Полностью снять WARP и вернуть родной IP сервера?')) return;
+  const btn = el('btn-reset-warp');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('POST', '/api/settings/warp/reset', {});
+    if (state.config) state.config.warpEnabled = false;
+    const warpEl = el('s-warp-enabled'); if (warpEl) warpEl.checked = false;
+    const egress = res.nativeEgress ? ` (egress: ${res.nativeEgress})` : '';
+    showMsg('warp-msg', (res.message || 'WARP снят') + egress, true);
+    toast('WARP снят', 'success');
+    if (res.output) { const pre = el('warp-status'); if (pre) { pre.textContent = res.output; pre.classList.remove('hidden'); } }
+    if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
+  } catch (err) {
+    showMsg('warp-msg', err.message, false);
   } finally {
     setBtnBusy(btn, false);
   }
