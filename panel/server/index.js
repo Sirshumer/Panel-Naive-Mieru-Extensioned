@@ -90,7 +90,10 @@ try {
     // WARP. WARP and cascade are MUTUALLY EXCLUSIVE (enabling one disables the
     // other). Orchestrated by scripts/warp_egress.sh (wgcf + wg-quick).
     warpEnabled: false,
-    language: 'ru', version: '1.5.1'
+    // BUG-162: boot-persistence is OFF by default. Only set true when the
+    //   operator explicitly confirms autostart (protects against reboot lock-out).
+    warpPersist: false,
+    language: 'ru', version: '1.5.2'
   };
 }
 
@@ -101,7 +104,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.5.1';
+const VERSION_FALLBACK = '1.5.2';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -1060,10 +1063,33 @@ function runCascadeMieru(action, opts = {}) {
 // the Mieru cascade (the API guarantees only one egress mode is ever active).
 const WARP_SCRIPT = path.join(__dirname, '../scripts/warp_egress.sh');
 
-// Run warp_egress.sh {setup|teardown|status|egress-ip}. Returns { ok, output }.
-function runWarpEgress(action) {
+// Detect the active SSH port (sshd_config Port, then listening sockets, then 22).
+// BUG-162: passed to warp_egress.sh so the SSH control channel is NEVER tunnelled.
+function detectSshPort() {
   try {
-    const out = execFileSync('bash', [WARP_SCRIPT, action], { timeout: 180000 }).toString();
+    const cfgTxt = fs.readFileSync('/etc/ssh/sshd_config', 'utf8');
+    const m = cfgTxt.match(/^\s*Port\s+(\d+)/m);
+    if (m) return m[1];
+  } catch {}
+  try {
+    const ss = execSync("ss -tlnp 2>/dev/null | awk '/sshd/{n=split($4,a,\":\"); print a[n]}' | head -1", { timeout: 4000 })
+      .toString().trim();
+    if (ss) return ss;
+  } catch {}
+  return '22';
+}
+
+// Run warp_egress.sh {setup|teardown|status|egress-ip}. Returns { ok, output }.
+// BUG-162: inject management-plane env so the script can keep SSH + panel on the
+//   native route, and only enable boot-persistence when explicitly confirmed.
+function runWarpEgress(action, opts = {}) {
+  try {
+    const env = Object.assign({}, process.env, {
+      WARP_SSH_PORT:   String(opts.sshPort   || detectSshPort()),
+      WARP_PANEL_PORT: String(opts.panelPort || cfg.panelPort || 3000),
+      WARP_PERSIST:    opts.persist ? '1' : '0',
+    });
+    const out = execFileSync('bash', [WARP_SCRIPT, action], { timeout: 180000, env }).toString();
     return { ok: true, output: out };
   } catch (e) {
     return { ok: false, output: (e.stdout ? e.stdout.toString() : '') + (e.stderr ? e.stderr.toString() : e.message) };
@@ -2176,6 +2202,7 @@ app.get('/api/settings/warp', requireAuth, (req, res) => {
   const ram = totalRamMB();
   res.json({
     warpEnabled:    !!cfg.warpEnabled,
+    warpPersist:    !!cfg.warpPersist,
     cascadeEnabled: !!cfg.cascadeEnabled,   // so the UI can show the lockout
     ramMB:          ram,
     // The extra WireGuard layer adds memory/CPU pressure on tiny VPS.
@@ -2220,11 +2247,18 @@ app.post('/api/settings/warp', requireAuth, (req, res) => {
     try { applyMitaConfig(); } catch {}
   }
 
+  // BUG-162: boot-persistence (autostart) only when the operator EXPLICITLY
+  //   opts in via `persist: true`. Default = NOT persistent, so a faulty tunnel
+  //   can never silently re-down the box on reboot — a restart restores access.
+  const persist = !!(req.body && req.body.persist);
   cfg.warpEnabled = enabled;
+  cfg.warpPersist = enabled ? persist : false;
   saveConfig();
 
-  // Apply the WARP layer.
-  const r = enabled ? runWarpEgress('setup') : runWarpEgress('teardown');
+  // Apply the WARP layer (passing the management ports + persist flag).
+  const r = enabled
+    ? runWarpEgress('setup', { persist })
+    : runWarpEgress('teardown');
 
   // Report the egress IP so the operator can confirm it changed to Cloudflare.
   let egress = '';
@@ -2234,14 +2268,17 @@ app.post('/api/settings/warp', requireAuth, (req, res) => {
   res.json({
     ok: r.ok,
     warpEnabled: cfg.warpEnabled,
+    warpPersist: cfg.warpPersist,
     cascadeDisabled: cascadeTorn || undefined,
     cascadeOutput: cascadeOut || undefined,
     egressIP: egress || '(unknown)',
     output: r.output,
     message: enabled
       ? (cascadeTorn
-          ? 'WARP включён. Каскад был автоматически отключён и снят (режимы взаимоисключающие).'
-          : 'WARP включён. Весь исходящий трафик идёт через Cloudflare.')
+          ? 'WARP включён (SSH и панель остаются доступны напрямую). Каскад был автоматически отключён и снят.'
+          : (persist
+              ? 'WARP включён и добавлен в автозагрузку. В туннель идёт только исходящий прокси-трафик; SSH и панель доступны напрямую.'
+              : 'WARP включён. В туннель идёт только исходящий прокси-трафик; SSH и панель доступны напрямую. Автозагрузка ВЫКЛЮЧЕНА (после ребута WARP не поднимется автоматически).'))
       : 'WARP выключен. Возврат к родному IP сервера.'
   });
 });
@@ -2512,41 +2549,28 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
     try { console.error('[stats/users] naive source failed:', e && e.message); } catch {}
   }
 
-  // BUG-160: authoritative server-wide NaiveProxy traffic from the kernel
-  //   (systemd IPAccounting on caddy-naive.service). Per-user is impossible for
-  //   hijacked CONNECT tunnels, so we report the accurate server total and (when
-  //   the log gives no per-user split) attribute it across naive-capable users.
-  let naiveTotalMB = 0;
-  try { naiveTotalMB = readNaiveTotalMB(); } catch { naiveTotalMB = 0; }
+  // BUG-163 (honest accounting): authoritative server-wide NaiveProxy traffic
+  //   from the kernel (systemd IPAccounting on caddy-naive.service). Per-user
+  //   Naive is IMPOSSIBLE: forward_proxy hijacks the CONNECT connection, so the
+  //   access log records nothing for a live tunnel and there is no per-key byte
+  //   signal anywhere. Earlier (v1.5.1) we spread the server total evenly across
+  //   users — that was MISLEADING (it invented per-user numbers). We now report
+  //   Naive ONLY as an accurate server-wide total, and keep Mieru per-key.
+  let naiveServerTotalMB = 0;
+  try { naiveServerTotalMB = readNaiveTotalMB(); } catch { naiveServerTotalMB = 0; }
 
-  // BUG-160: how many users can use Naive — used to spread the kernel-measured
-  //   server-wide Naive total when the access log gives no per-user breakdown.
   const allUsers = getAllUsers();
-  const naiveCapable = allUsers.filter(u => {
-    try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
-    catch { return true; }
-  });
-  // Bytes the access log DID attribute per-user (rare plain-HTTP requests).
-  const loggedNaiveMB = Object.values(naive)
-    .reduce((acc, n) => acc + ((n.uploadMB || 0) + (n.downloadMB || 0)), 0);
-  // Remaining (tunnel) bytes spread evenly across naive-capable users.
-  const spreadMB = (naiveTotalMB > loggedNaiveMB && naiveCapable.length)
-    ? (naiveTotalMB - loggedNaiveMB) / naiveCapable.length
-    : 0;
-  const isNaiveUser = u => {
-    try { return JSON.parse(u.protocols || '["naive","mieru"]').includes('naive'); }
-    catch { return true; }
-  };
 
   const users = allUsers.map(u => {
     const s = live.find(x => x.username === u.username) || {};
     const n = naive[u.username] || {};
     const mieruUp   = s.uploadMB   || 0;
     const mieruDown = s.downloadMB || 0;
+    // Per-user Naive = only what the access log actually attributed (rare plain
+    //   HTTP requests). CONNECT tunnels are never logged → this is usually 0.
+    //   The real Naive figure is server-wide (naiveServerTotalMB), shown apart.
     const naiveUp   = n.uploadMB   || 0;
     const naiveDown = n.downloadMB || 0;
-    // Per-user Naive = logged bytes + this user's share of the kernel total.
-    const naiveShareMB = isNaiveUser(u) ? spreadMB : 0;
     const uploadMB   = mieruUp   + naiveUp;
     const downloadMB = mieruDown + naiveDown;
     // Combined used: prefer live mita "usedMB" when present, plus naive bytes;
@@ -2571,12 +2595,21 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
       usedMB,
       uploadMB,
       downloadMB,
-      naiveMB:    naiveUp + naiveDown + naiveShareMB,
+      // BUG-163: per-user Naive is only the (rare) logged HTTP bytes — usually
+      //   0. The real Naive number is server-wide (see naiveServerTotalMB).
+      naiveMB:    naiveUp + naiveDown,
       mieruMB:    mieruUp + mieruDown,
       lastSeen
     };
   });
-  res.json(users);
+  // BUG-163: return an object so the UI can show the honest server-wide Naive
+  //   total separately from the per-key Mieru figures. `users` keeps the same
+  //   shape; `naiveServerTotalMB` is the kernel-measured caddy-naive total.
+  res.json({
+    users,
+    naiveServerTotalMB,
+    naivePerUser: false,   // explicit: Naive cannot be broken down per key
+  });
 });
 
 // BUG-160: read the kernel-measured server-wide NaiveProxy traffic from

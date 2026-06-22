@@ -639,6 +639,13 @@
               <input type="checkbox" id="s-warp-enabled" />
               <span data-i18n="settings.warpEnable">Включить WARP (egress)</span>
             </label>
+            <label class="checkbox" style="margin-top:6px">
+              <input type="checkbox" id="s-warp-persist" />
+              <span data-i18n="settings.warpPersist">Добавить в автозагрузку (поднимать после перезагрузки). По умолчанию ВЫКЛ — безопаснее: после ребута WARP не поднимется сам, доступ к серверу гарантирован.</span>
+            </label>
+            <div class="msg-inline" style="margin-top:8px">
+              <strong>ℹ</strong> <span data-i18n="settings.warpSafeNote">SSH и порт панели НЕ заворачиваются в туннель — доступ к серверу сохраняется. В WARP идёт только исходящий прокси-трафик.</span>
+            </div>
             <div id="warp-cascade-lock" class="msg-inline hidden" style="margin-top:8px">
               <strong>⚠</strong> <span data-i18n="settings.warpCascadeLock">Каскад включён — сначала отключите каскад. WARP и каскад нельзя использовать одновременно.</span>
             </div>

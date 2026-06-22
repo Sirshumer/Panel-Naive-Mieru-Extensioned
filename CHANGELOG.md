@@ -7,6 +7,43 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.2]
+
+### Fixed
+- **BUG-162 (CRITICAL): WARP locked the server out + re-downed it on every reboot.**
+  In v1.5.1 enabling WARP routed EVERYTHING (`AllowedIPs 0.0.0.0/0`, wg-quick
+  `Table=auto`) into the tunnel — including the SSH and panel management channels
+  — so the operator lost all access (only the hoster console recovered the box).
+  The unit was also `systemctl enable`d, so a reboot brought the server down
+  again automatically. Fix (`warp_egress.sh`):
+  - **`Table = off`** — wg-quick no longer installs ANY routes. We install our own
+    **scoped policy routing**: a dedicated route table (51820) carries the WARP
+    default, while **high-priority `ip rule` exceptions keep the control plane on
+    the native route**: SSH port, panel port, local subnet, default gateway, the
+    WARP endpoint itself, and replies to inbound/ESTABLISHED connections
+    (conntrack mark). Only locally-originated egress (proxy upstream traffic) goes
+    via WARP. **If the tunnel dies, SSH/panel access survives.**
+  - **Autostart is now opt-in** (`WARP_PERSIST=1`, set only on explicit operator
+    confirmation). By default WARP does NOT come back after a reboot — a bad
+    tunnel can never silently re-down the box.
+  - **`update.sh` recovery migration** (`migrate_warp_safety`): disables the old
+    auto-enabled `wg-quick@warp` unit and tears down any stale unsafe tunnel
+    (missing `Table=off`) so boxes already hit by v1.5.1 regain native access on
+    update. Teardown leaves NO artifacts (ip rules, route table, conntrack marks,
+    legacy `0xca6c` fwmark all cleaned — BUG-150 pattern).
+  - UI: explicit "add to autostart" checkbox (default off) + a note that SSH/panel
+    stay reachable.
+- **BUG-163 (honest per-key accounting).** Confirmed: `IPAccounting` gives the
+  **server-wide** caddy-naive total, NOT per-user — per-key Naive is impossible
+  (forward_proxy hijacks CONNECT, access.log is empty for live tunnels). v1.5.1
+  spread that total evenly across users, which **invented** per-user numbers.
+  Now: **Mieru is per-key** (from mita), **Naive is shown as an accurate
+  server-wide total** in a banner above the Users table, clearly labelled. Also
+  fixed the Users table showing 0/0: it never fetched `/api/stats/users` — it now
+  merges the Mieru per-key figures from there into the rows.
+
+---
+
 ## [v1.5.1]
 
 ### Fixed

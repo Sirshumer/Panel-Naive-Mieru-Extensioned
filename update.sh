@@ -976,6 +976,8 @@ SVCCADDY
     log_info "Legacy naive.service removed (replaced by caddy-naive.service)"
   fi
 
+  # BUG-162 placeholder kept inline below in migrate_warp_safety().
+
   # BUG-160 (v1.5.1): enable kernel IP accounting on the caddy-naive unit so the
   #   panel can report real NaiveProxy traffic (the access log can't — CONNECT
   #   tunnels are hijacked and never logged). Idempotent: only adds the line if
@@ -990,6 +992,40 @@ SVCCADDY
     systemctl restart caddy-naive 2>/dev/null || true
     log_info "IPAccounting=yes enabled ✓"
   fi
+}
+
+# ── BUG-162: recover boxes from the broken v1.5.1 WARP (lock-out on reboot) ──
+migrate_warp_safety() {
+  # If the old wg-quick@warp unit is enabled (v1.5.1 auto-enabled it), the box
+  # would tunnel SSH/panel and lose access on every reboot. ALWAYS disable the
+  # autostart on update so a reboot is safe. We do NOT silently bring WARP back —
+  # the operator re-enables it from the panel (now with scoped, safe routing).
+  local changed=0
+  if systemctl is-enabled wg-quick@warp &>/dev/null; then
+    systemctl disable wg-quick@warp 2>/dev/null || true
+    changed=1
+    log_warn "WARP autostart disabled (BUG-162: prevents reboot lock-out) / автозагрузка WARP отключена"
+  fi
+  # If a stale warp.conf still has the broken blanket-route layout (Table=auto or
+  # no Table=off, AllowedIPs ::/0 / 0.0.0.0/0 as default), tear the tunnel down so
+  # the operator is not stuck behind a control-plane-eating route after update.
+  if [[ -f /etc/wireguard/warp.conf ]]; then
+    if ! grep -qiE '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off' /etc/wireguard/warp.conf; then
+      log_warn "Tearing down old unsafe WARP tunnel (missing Table=off) / снимаю старый небезопасный WARP"
+      systemctl stop wg-quick@warp 2>/dev/null || true
+      wg-quick down warp 2>/dev/null || true
+      ip link del warp 2>/dev/null || true
+      # remove the old broken conf so the panel regenerates the safe one on enable
+      rm -f /etc/wireguard/warp.conf
+      changed=1
+    fi
+  fi
+  # Clean up the v1.5.1 wg-quick fwmark policy artifacts if they linger.
+  while ip rule show 2>/dev/null | grep -q "fwmark 0xca6c"; do
+    ip rule del fwmark 0xca6c 2>/dev/null || break
+  done
+  ip route flush table "$((16#ca6c))" 2>/dev/null || true
+  [[ "$changed" == "1" ]] && systemctl daemon-reload 2>/dev/null || true
 }
 
 # ── Bug 79: fix caddy-naive config permissions ───────────────────────────────
@@ -1760,6 +1796,14 @@ do_update() {
 
   # Ensure service is present and legacy naive is gone
   ensure_caddy_service
+
+  # BUG-162 (CRITICAL migration): v1.5.1 brought WARP up with a blanket default
+  #   route (AllowedIPs 0.0.0.0/0 + Table=auto) AND `systemctl enable`d the unit.
+  #   That tunnelled SSH/panel and re-downed the box on every reboot. Recover any
+  #   such box: disable autostart + tear down the old broken tunnel/routes so the
+  #   operator regains native access. The new (safe) WARP is only re-enabled when
+  #   the operator explicitly toggles it again in the panel.
+  migrate_warp_safety
 
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
 
