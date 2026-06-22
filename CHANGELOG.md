@@ -7,6 +7,76 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.7]
+
+> **BUG-171 (CRITICAL) — WARP: client keys never establish (stuck in SYN-RECV).**
+> On a clean host (server 192187) with WARP egress fully healthy
+> (`curl --interface warp` → `104.28.197.7`, 21 MB/s, 0 % loss), a client
+> connects with a Naive or Mieru key but **no site loads**. `ss -tunap` shows
+> every inbound client session frozen in **`SYN-RECV`**, never reaching `ESTAB`:
+> `tcp SYN-RECV [::ffff:138.124.66.84]:443 [client]` (caddy-naive) and `:2012`
+> (mita/mieru).
+>
+> **Root cause:** the policy-routing default rule `9500 not from all fwmark
+> 0xca6c lookup 51820` pushes **all** outgoing server traffic into WARP —
+> including the **SYN-ACK replies** our locally-terminated listening sockets
+> (caddy-naive :443, mita :2012/:443) send back to clients. The existing `ip
+> rule` exceptions (`9003 to <subnet>/24`, `9004 to <gw>`) only cover the local
+> subnet/gateway, **not** reply packets headed to arbitrary external client IPs.
+> So the SYN-ACK was routed into Cloudflare instead of back to the client and the
+> TCP handshake never completed.
+>
+> v1.5.7 keeps the reply traffic of every locally-terminated inbound connection
+> on the **native** route, while still tunnelling the proxies' own outbound
+> (egress) dials through WARP — so the client connects, sites load, and the
+> client's public IP still shows the Cloudflare egress (104.x).
+
+### Fixed
+- **BUG-171 (CRITICAL): SYN-ACK replies to clients were swallowed by WARP →
+  handshake stuck in SYN-RECV.** `route_up()` now marks connections by their
+  **origin** rather than by port (the old SSH/panel `--dport` exceptions could
+  never cover arbitrary client IPs):
+  - `iptables -t mangle -A PREROUTING ! -i warp -p tcp -m conntrack --ctstate NEW
+    -j CONNMARK --set-mark 0x5152` — every **NEW inbound** TCP connection that
+    enters from a non-WARP interface (a client/SSH/panel hitting one of our
+    listening sockets) is tagged onto its conntrack entry.
+  - `iptables -t mangle -A OUTPUT -p tcp -j CONNMARK --restore-mark` —
+    **unconditionally** restores that mark onto the reply (SYN-ACK …). The
+    existing `ip rule … fwmark 0x5152 lookup main` (prio 9000) then routes those
+    replies **natively** back to the client instead of into WARP.
+  - Connections the proxies **originate outbound** (the actual egress) start at
+    `OUTPUT` with no inbound conntrack, get no mark, and fall through to the WARP
+    table — so the client's checked IP still shows the Cloudflare egress (104.x).
+- **The restore is UNCONDITIONAL — and that is the whole fix.** The first attempt
+  matched `-m connmark --mark 0x5152` on the `OUTPUT` rule, but that matches the
+  *packet* mark, which on a freshly-generated local SYN-ACK is still `0` (the
+  restore is precisely what copies the conntrack mark onto the packet). So the
+  rule never fired, the SYN-ACK stayed unmarked, and rule 9500 swallowed it into
+  Cloudflare → SYN-RECV persisted. `CONNMARK --restore-mark` is a no-op when the
+  conntrack carries no mark, so restoring on every local TCP packet only ever
+  marks the replies of inbound connections. This is the canonical
+  wg-quick / sshuttle / serverfault return-path recipe.
+
+### Changed
+- `route_down()` removes the new PREROUTING inbound-mark + the unconditional
+  OUTPUT restore, and **also purges** the legacy v1 conditional `OUTPUT … -m
+  connmark --mark 0x5152` shape and the older per-port `--dport` INPUT marks, so
+  upgrading from any prior build leaves **no orphan mangle rules** (BUG-150
+  idempotency preserved). SSH/panel and WARP-return-path guarantees from
+  BUG-162/BUG-169 are unchanged; MSS clamping from BUG-170 is unchanged.
+
+### Tests
+- `tests/bug171-warp-inbound-reply.test.js` (20 assertions): asserts the
+  mark-by-connection-origin shape, the **unconditional** OUTPUT restore (and that
+  the never-firing `-m connmark --mark` match is gone), the `fwmark → main` rule,
+  that proxy egress is still tunneled, idempotent install, and a live
+  mock-kernel `route_up ×2 → route_down` run (8 rules installed without
+  duplicates, 0 left after teardown).
+- `tests/bug169-warp-fwmark.test.js` updated to the unconditional OUTPUT-restore
+  shape (31 assertions, still green).
+
+---
+
 ## [v1.5.6]
 
 > **BUG-170 (HIGH) — WARP: "connect OK, nothing loads."** With `v1.5.5` the WARP
