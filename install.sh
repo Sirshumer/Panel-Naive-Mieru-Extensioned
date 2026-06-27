@@ -852,12 +852,11 @@ write_caddyfile() {
   }
   email ${ADMIN_EMAIL}
   admin off
+  # Global = runtime logger only (stderr/journald). NOT access logs.
   log {
-    output file /var/log/caddy-naive/access.log {
-      roll_size     50mb
-      roll_keep_for 720h
-    }
-    format json
+    output stderr
+    format console
+    level ERROR
   }
 }
 
@@ -874,6 +873,16 @@ write_caddyfile() {
   # would close the string and a colon-redirect would be parsed as a file
   # ('line 665: port: No such file or directory' was Bug 88).
   tls ${ADMIN_EMAIL}
+
+  # Traffic accounting: per-site ACCESS log -> JSON line per request with
+  # request.user_id + byte counters that parseCaddyTraffic() sums per user.
+  log {
+    output file /var/log/caddy-naive/access.log {
+      roll_size     50mb
+      roll_keep_for 720h
+    }
+    format json
+  }
 
   forward_proxy {
 ${auth_lines}
@@ -972,6 +981,13 @@ Environment=XDG_DATA_HOME=/var/lib/caddy
 Environment=XDG_CONFIG_HOME=/var/lib/caddy
 ReadWritePaths=/var/log/caddy-naive /etc/caddy-naive /var/lib/caddy
 AmbientCapabilities=CAP_NET_BIND_SERVICE
+# BUG-160 (v1.5.1): NaiveProxy traffic accounting. Caddy forward_proxy hijacks
+# the CONNECT connection, so the HTTP access log NEVER records the tunnelled
+# byte volume (bytes_read/size = 0, and successful tunnels are not logged at
+# all). The only reliable source for Naive traffic is the kernel: systemd's
+# per-unit IP accounting (cgroup net counters). The panel reads
+# IPIngressBytes / IPEgressBytes from `systemctl show caddy-naive`.
+IPAccounting=yes
 
 [Install]
 WantedBy=multi-user.target

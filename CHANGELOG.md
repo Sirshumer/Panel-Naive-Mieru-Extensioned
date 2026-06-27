@@ -7,6 +7,459 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.7]
+
+> **BUG-171 (CRITICAL) — WARP: client keys never establish (stuck in SYN-RECV).**
+> On a clean host (server 192187) with WARP egress fully healthy
+> (`curl --interface warp` → `104.28.197.7`, 21 MB/s, 0 % loss), a client
+> connects with a Naive or Mieru key but **no site loads**. `ss -tunap` shows
+> every inbound client session frozen in **`SYN-RECV`**, never reaching `ESTAB`:
+> `tcp SYN-RECV [::ffff:138.124.66.84]:443 [client]` (caddy-naive) and `:2012`
+> (mita/mieru).
+>
+> **Root cause:** the policy-routing default rule `9500 not from all fwmark
+> 0xca6c lookup 51820` pushes **all** outgoing server traffic into WARP —
+> including the **SYN-ACK replies** our locally-terminated listening sockets
+> (caddy-naive :443, mita :2012/:443) send back to clients. The existing `ip
+> rule` exceptions (`9003 to <subnet>/24`, `9004 to <gw>`) only cover the local
+> subnet/gateway, **not** reply packets headed to arbitrary external client IPs.
+> So the SYN-ACK was routed into Cloudflare instead of back to the client and the
+> TCP handshake never completed.
+>
+> v1.5.7 keeps the reply traffic of every locally-terminated inbound connection
+> on the **native** route, while still tunnelling the proxies' own outbound
+> (egress) dials through WARP — so the client connects, sites load, and the
+> client's public IP still shows the Cloudflare egress (104.x).
+
+### Fixed
+- **BUG-171 (CRITICAL): SYN-ACK replies to clients were swallowed by WARP →
+  handshake stuck in SYN-RECV.** `route_up()` now marks connections by their
+  **origin** rather than by port (the old SSH/panel `--dport` exceptions could
+  never cover arbitrary client IPs):
+  - `iptables -t mangle -A PREROUTING ! -i warp -p tcp -m conntrack --ctstate NEW
+    -j CONNMARK --set-mark 0x5152` — every **NEW inbound** TCP connection that
+    enters from a non-WARP interface (a client/SSH/panel hitting one of our
+    listening sockets) is tagged onto its conntrack entry.
+  - `iptables -t mangle -A OUTPUT -p tcp -j CONNMARK --restore-mark` —
+    **unconditionally** restores that mark onto the reply (SYN-ACK …). The
+    existing `ip rule … fwmark 0x5152 lookup main` (prio 9000) then routes those
+    replies **natively** back to the client instead of into WARP.
+  - Connections the proxies **originate outbound** (the actual egress) start at
+    `OUTPUT` with no inbound conntrack, get no mark, and fall through to the WARP
+    table — so the client's checked IP still shows the Cloudflare egress (104.x).
+- **The restore is UNCONDITIONAL — and that is the whole fix.** The first attempt
+  matched `-m connmark --mark 0x5152` on the `OUTPUT` rule, but that matches the
+  *packet* mark, which on a freshly-generated local SYN-ACK is still `0` (the
+  restore is precisely what copies the conntrack mark onto the packet). So the
+  rule never fired, the SYN-ACK stayed unmarked, and rule 9500 swallowed it into
+  Cloudflare → SYN-RECV persisted. `CONNMARK --restore-mark` is a no-op when the
+  conntrack carries no mark, so restoring on every local TCP packet only ever
+  marks the replies of inbound connections. This is the canonical
+  wg-quick / sshuttle / serverfault return-path recipe.
+
+### Changed
+- `route_down()` removes the new PREROUTING inbound-mark + the unconditional
+  OUTPUT restore, and **also purges** the legacy v1 conditional `OUTPUT … -m
+  connmark --mark 0x5152` shape and the older per-port `--dport` INPUT marks, so
+  upgrading from any prior build leaves **no orphan mangle rules** (BUG-150
+  idempotency preserved). SSH/panel and WARP-return-path guarantees from
+  BUG-162/BUG-169 are unchanged; MSS clamping from BUG-170 is unchanged.
+
+### Tests
+- `tests/bug171-warp-inbound-reply.test.js` (20 assertions): asserts the
+  mark-by-connection-origin shape, the **unconditional** OUTPUT restore (and that
+  the never-firing `-m connmark --mark` match is gone), the `fwmark → main` rule,
+  that proxy egress is still tunneled, idempotent install, and a live
+  mock-kernel `route_up ×2 → route_down` run (8 rules installed without
+  duplicates, 0 left after teardown).
+- `tests/bug169-warp-fwmark.test.js` updated to the unconditional OUTPUT-restore
+  shape (31 assertions, still green).
+
+---
+
+## [v1.5.6]
+
+> **BUG-170 (HIGH) — WARP: "connect OK, nothing loads."** With `v1.5.5` the WARP
+> tunnel is fully healthy on server 192187 (egress = Cloudflare, DNS OK, return
+> traffic flows), but clients connect and heavy sites/video stall. Proven with
+> `ping -M do` through the warp interface:
+> `-s 1400` → *message too long, mtu=1280*, **100 % loss**; `-s 1200`/`-s 1000`
+> → **0 % loss**. Packets larger than the 1280 MTU are dropped (DF set,
+> fragmentation forbidden). A real client is **double-encapsulated**
+> (client → Naive/Mieru → WARP), so the effective MTU is even lower; with PMTUD
+> unreliable across the proxy / ICMP-filtered path, the sender never shrinks its
+> segments → large TCP flows hang. **MTU 1280 alone is not enough — TCP MSS must
+> be clamped.**
+
+### Fixed
+- **BUG-170 (HIGH): no TCP MSS clamping → large flows stall through WARP.**
+  `route_up()` now clamps the TCP MSS on every connection that egresses via the
+  warp interface, on **both** paths:
+  - `iptables -t mangle -A FORWARD -o warp -p tcp --tcp-flags SYN,RST SYN -j TCPMSS …`
+    — forwarded client egress.
+  - `iptables -t mangle -A OUTPUT  -o warp -p tcp --tcp-flags SYN,RST SYN -j TCPMSS …`
+    — **required** because `caddy-naive` / `mita` egress is generated by LOCAL
+    processes (OUTPUT path), not only forwarded.
+  We pin a deterministic hard ceiling **`--set-mss 1240`** (`1280 − 20` IPv4 `− 20`
+  TCP — sized for the doubly-encapsulated path, survives broken PMTUD) **and**
+  add **`--clamp-mss-to-pmtu`** as a belt-and-suspenders lower bound. Rules match
+  SYN/SYN-ACK only (where MSS is negotiated) and are installed idempotently
+  (`-C` before `-A`). Tunable via `WARP_MSS` (default `1240`).
+
+### Changed
+- `route_down()` removes the MSS clamping symmetrically from **both** FORWARD and
+  OUTPUT (looped delete, so a partial prior run leaves no orphan rules — BUG-150
+  idempotency). Verified live: install ×2 → 1 rule per chain; teardown → 0 left.
+- `do_status` now also reports `mss : <WARP_MSS>` next to `mtu`.
+
+### Preserved (unchanged guarantees)
+- BUG-169 return-path routing (wg fwmark + conntrack save/restore +
+  `src_valid_mark` + `not fwmark` + `suppress_prefixlength`).
+- BUG-162: SSH/panel never tunneled. `Table = off`, `MTU = 1280`, IPv4-only.
+- Healthcheck + auto-rollback + outcome classification.
+
+### Acceptance criteria (from the report)
+> До фикса: `ping -M do -s 1400 -I warp 1.1.1.1` падает (mtu=1280). После фикса:
+> клиент по ключу (Naive и Mieru) при включённом WARP открывает тяжёлые
+> сайты/видео без зависаний; проверка IP с клиента = CF-egress (104.x); скорость
+> приемлемая.
+
+✅ MSS is now clamped to 1240 on every WARP egress (forwarded **and** local), so
+oversized segments are never emitted; the verified-CF egress from v1.5.5 stays
+intact.
+
+### Tests
+- New `tests/bug170-warp-mss.test.js` (18 assertions incl. a **live** root-only
+  install-×2 / teardown idempotency check; the live block validates the chain
+  iteration + `-o <dev>` match + `-C`/`-A`/`-D` logic, since the sandbox kernel
+  may lack `xt_TCPMSS`).
+- Full suite: **222 passed, 0 failed** non-root / **228 passed** as root (the
+  live route/MSS blocks add 6 root-only assertions; was 207 non-root; +15).
+
+---
+
+## [v1.5.5]
+
+> **BUG-169 (CRITICAL) — the panel's own policy routing was breaking WARP's
+> return path, not the provider.** Proven on a *clean* hoster (server 192187):
+> a **bare** `wgcf` tunnel (`Table = off`, no policy routing) reached a
+> Cloudflare egress IP (`curl --interface wgtest` → `104.28.197.7`), but the
+> **panel** setup on the *same server, same endpoint, fresh account* returned
+> `WARP_RESULT=blocked_return` with `rx=92 tx=4.8 GB` (handshake only). The only
+> difference was the fwmark + `ip rule table 51820` the panel layered over
+> `Table = off`. That layer was **missing the canonical wg-quick `add_default()`
+> return-path mechanism**, so the encrypted reply UDP from Cloudflare never made
+> it back to the WireGuard socket. This also means the `blocked_return` verdict
+> was **false on clean hosters** — the scary "provider blocks WARP" banner could
+> fire even when the provider was fine.
+
+### Fixed
+- **BUG-169 (CRITICAL): WARP return traffic dropped by the panel's fwmark/policy
+  routing → false `blocked_return`.** `route_up()` now mirrors wg-quick's
+  `add_default()` exactly:
+  1. `wg set <iface> fwmark 51820` — WireGuard fwmarks its **own** encrypted
+     envelope UDP (the missing key piece).
+  2. `ip rule add not fwmark 51820 lookup 51820` — everything **except** the
+     envelope is sent into the tunnel table (the envelope exits native, no loop).
+  3. **conntrack save/restore of the envelope mark** — the return-path fix:
+     `POSTROUTING -m mark --mark 51820 -p udp -j CONNMARK --save-mark` stamps the
+     mark onto the outgoing envelope's conntrack entry, and
+     `PREROUTING -p udp -j CONNMARK --restore-mark` restores it on the **incoming
+     reply UDP** so the kernel delivers it back to the wg socket instead of
+     dropping it (the `rx≈92 B` symptom).
+  4. `sysctl net.ipv4.conf.all.src_valid_mark=1` — marked / locally-generated
+     packets pass reverse-path filtering, so decrypted return packets survive.
+  5. `ip rule add table main suppress_prefixlength 0` — specific routes in
+     `main` (incl. the on-link route to the WARP endpoint) win, so the envelope
+     leaves via the native NIC.
+  - **Acceptance:** on a server where the bare `wgcf` tunnel yields a CF egress
+    IP, the **panel** WARP now yields the same CF egress (`WARP_RESULT=ok`), not
+    `blocked_return`.
+- **BUG-169 regression (SIGPIPE/pipefail — same class as BUG-166):** the
+  `route_down()` rule-cleanup loop used `while ip rule show | grep -q "^<prio>:"`
+  as its condition. Under `set -o pipefail`, `grep -q` closes the pipe on the
+  first match → `ip rule show` gets SIGPIPE (141) → pipefail makes the pipeline
+  non-zero → the `while` wrongly evaluates **false** → the rule is **never
+  deleted** (observed live to strand `ip rule` prio 9000). Fixed by snapshotting
+  the table into a variable and matching in pure bash (no pipe). The same
+  pattern in `has_ipv6()` (`ip -6 addr show | grep -q inet6 && return 0`) was
+  fixed too — it could produce a false "no IPv6" verdict and wrongly strip
+  `::/0` on a dual-stack host (touches BUG-167).
+
+### Changed
+- `route_down()` now tears down **every** new artifact idempotently (BUG-150
+  guarantee): clears the WireGuard fwmark (`wg set <iface> fwmark 0`), removes
+  the new mangle rules (POSTROUTING save-mark, PREROUTING restore-mark, OUTPUT
+  connmark restore), and deletes the `suppress_prefixlength` (9400) and
+  `not fwmark` default (9500) rules — plus the management exceptions (9000-9010)
+  and the WARP route table. Verified live: `route_up` installs the policy rules,
+  `route_down` removes **all** of them (0 left).
+- The previous explicit `to <endpoint>/32 → main` exception is no longer needed
+  — `suppress_prefixlength 0` covers the on-link endpoint route generically.
+
+### Preserved (unchanged guarantees)
+- **BUG-162:** SSH and the panel are still pinned to the native route via
+  connmark + high-priority `ip rule … lookup main`; they are **never** tunneled.
+- `Table = off`, `MTU = 1280`, IPv4-only Address/`AllowedIPs` (BUG-164/167).
+- Healthcheck + auto-rollback + outcome classification (BUG-164/168).
+
+### Tests
+- New `tests/bug169-warp-fwmark.test.js` (31 assertions): asserts the
+  `wg set fwmark`, `not fwmark`, conntrack save/restore, `src_valid_mark`, and
+  `suppress_prefixlength` pieces in `route_up()`; the full idempotent teardown in
+  `route_down()`; the SIGPIPE-free loop conditions; and — when run as root — a
+  **live** `route_up → route_down` cycle proving the rule table ends up empty.
+- Full suite: **207 passed, 0 failed** without root (the live route_up/route_down
+  block skips when not root); **210 passed** as root (was 179; +28/+31).
+
+---
+
+## [v1.5.4]
+
+> **WARP confirmed working — the v1.5.3 code is correct.** Verified on another
+> hoster with a manual `wgcf` tunnel: `curl --interface … api.ipify.org` →
+> `104.28.197.7` (a Cloudflare IP), return traffic flows, egress switched to CF.
+> The original "WARP kills the server / one-way" report was a **provider-side
+> block of inbound WireGuard/UDP** on the old host (`92 B received` on every
+> port) — outside the panel's control. This release fixes a real registration
+> bug found during that verification, hardens IPv6 stripping, and makes the
+> provider-block case explain itself to the operator.
+
+### Fixed
+- **BUG-166 (HIGH): false "wgcf register failed" even though the account was
+  created.** On a fresh server `wgcf register` printed *"Successfully created
+  Cloudflare Warp account"* (Device active: true) but the panel still aborted with
+  `[warp][ERROR] wgcf register failed`. **Root cause:** the script runs under
+  `set -o pipefail`, and `yes | wgcf register` makes `yes` receive **SIGPIPE
+  (exit 141)** the instant `wgcf` closes its stdin — *even on a fully successful
+  registration*. `pipefail` then propagated 141 as the pipeline's status, so the
+  `|| die` fired. Fix (`warp_egress.sh`):
+  - **Dropped the `yes |` pipe entirely** — `--accept-tos` already answers the
+    only prompt, so no pipe (and no SIGPIPE) is needed.
+  - New `wgcf_register()` judges success by the **account file** Cloudflare wrote,
+    **not** the exit code; uses an explicit `--config "$WGCF_ACCOUNT"` (and a
+    CWD-relative fallback move) so the file is always written/read at the same
+    path regardless of working directory.
+  - `account_is_valid()` now reads the real `wgcf-account.toml` fields
+    (`device_id` + `private_key` + `access_token`, single- **or** double-quoted)
+    and rejects empty values. `wgcf generate` likewise uses `--profile` + a
+    file-based success check.
+
+- **BUG-167: guarantee IPv6 is fully stripped on IPv4-only hosts.** wgcf emits
+  `Address = <v4>/32, <v6>/128` (comma-separated) and `AllowedIPs = 0.0.0.0/0,
+  ::/0`. The generated `warp.conf` now provably contains **only** the IPv4
+  `Address` line and **no** `::/0` (rebuilt from scratch, IPv4 fields only), so
+  `wg-quick up` can never fail with *"IPv6 is disabled on this device"*. Locked in
+  by tests against the exact wgcf comma-separated format.
+
+- **BUG-168 (UX): friendly, non-error message when the HOSTER blocks WARP.** The
+  auto-rollback (v1.5.3) already keeps the box safe; this release classifies the
+  outcome so the operator understands *why* and *what to do* — instead of a scary
+  technical error that triggers false support tickets. `warp_egress.sh` emits a
+  structured `WARP_RESULT=…` line; the panel maps it to a colour + message:
+  - **`ok`** → green: *"WARP включён — egress теперь через Cloudflare (IP …)"*.
+  - **`blocked_return`** (handshake OK but `rx ≈ 92 B` on every port) → **yellow**
+    (not red): *"Ваш хостинг-провайдер блокирует входящий трафик Cloudflare WARP
+    (WireGuard/UDP). Это ограничение сервера, не панели. Всё откачено, доступ
+    сохранён… смените хостера или используйте каскад. (Туннель отправил X,
+    получил Y байт.)"*
+  - **`no_handshake`** (no handshake on any port) → yellow: *"WARP не смог
+    подключиться к Cloudflare ни на одном порту… вероятно, провайдер режет UDP.
+    Всё откачено, доступ сохранён."*
+  - On a rolled-back WARP the panel un-checks the toggle and reports
+    `warpEnabled=false`, so the UI state stays honest.
+
+---
+
+## [v1.5.3]
+
+### Fixed
+- **BUG-164 (HIGH): WARP tunnel was ONE-WAY — egress black-holed.** After v1.5.2
+  the WARP tunnel handshaked correctly but `wg show` reported `received ≈ 92 B`
+  against `sent ≈ 425 MiB`: Cloudflare's return traffic never arrived. Everything
+  routed into the WARP table (table 51820) went into a black hole — `curl ipify`
+  on the server hung, key clients got no response, and from outside it looked like
+  the panel had crashed. The BUG-162 control-plane exceptions were correct and are
+  untouched; the breakage was purely the one-way data path. Fixes
+  (`warp_egress.sh`):
+  - **`MTU = 1280`** in the generated `warp.conf` (cause #1). With the default
+    1420/1500 the encapsulated reply packets exceed the path MTU and are silently
+    dropped — the classic "sent MiB / received ~0 B" symptom.
+  - **Robust wgcf registration.** A key that is *generated* but never actually
+    *registered* with Cloudflare gives the same picture. `account_is_valid()` now
+    checks the account file really contains a `device_id` + `private_key`; an
+    empty/corrupt account is re-registered, and setup hard-fails if registration
+    does not produce a valid account.
+  - **Endpoint-port fallback.** Some hosters block inbound UDP/2408. If the tunnel
+    is unhealthy we retry across `2408 / 500 / 1701 / 4500`.
+  - **Post-up healthcheck with AUTO-ROLLBACK.** After bring-up we probe the egress
+    IP **through the warp interface** (`curl --interface warp … api.ipify.org`,
+    timeout 5s). If no Cloudflare IP comes back on any endpoint port, we
+    automatically `warp_down` (full teardown) and surface a clear error — the box
+    is **never left in a black hole**, so the panel and SSH stay reachable on the
+    native route even when WARP can't be brought up on a given host.
+  - **Autostart enabled only after a healthy tunnel** (and only when
+    `WARP_PERSIST=1`): a bad tunnel is never persisted into the boot path.
+  - `do_status` now reports `rxBytes/txBytes/mtu`, and a `healthcheck` CLI action
+    was added, so a one-way tunnel is immediately observable.
+  - `update.sh` `migrate_warp_safety` now also tears down v1.5.2 confs **missing
+    `MTU = 1280`**, so the panel regenerates the fixed conf on the next enable.
+
+  **Acceptance:** after "Применить WARP", `wg show` shows non-zero `received`;
+  `curl --interface warp` returns a Cloudflare IP in < 5s; a key client checking
+  its IP sees the Cloudflare IP, not the server IP. Panel + SSH stay reachable
+  throughout; if the tunnel can't be brought up healthy, it auto-rolls-back and
+  access is preserved.
+
+- **BUG-165 (cosmetic): removed the misleading "Naive (сервер, суммарно)" banner.**
+  Since v1.5.2 Naive traffic is shown per key in the Users table, so the
+  server-wide banner above the table was both incorrect and confusing. The banner
+  (`renderNaiveServerBanner`) is removed; `removeNaiveServerBanner()` also strips
+  any stale banner left in the DOM by a previously-cached build.
+
+---
+
+## [v1.5.2]
+
+### Fixed
+- **BUG-162 (CRITICAL): WARP locked the server out + re-downed it on every reboot.**
+  In v1.5.1 enabling WARP routed EVERYTHING (`AllowedIPs 0.0.0.0/0`, wg-quick
+  `Table=auto`) into the tunnel — including the SSH and panel management channels
+  — so the operator lost all access (only the hoster console recovered the box).
+  The unit was also `systemctl enable`d, so a reboot brought the server down
+  again automatically. Fix (`warp_egress.sh`):
+  - **`Table = off`** — wg-quick no longer installs ANY routes. We install our own
+    **scoped policy routing**: a dedicated route table (51820) carries the WARP
+    default, while **high-priority `ip rule` exceptions keep the control plane on
+    the native route**: SSH port, panel port, local subnet, default gateway, the
+    WARP endpoint itself, and replies to inbound/ESTABLISHED connections
+    (conntrack mark). Only locally-originated egress (proxy upstream traffic) goes
+    via WARP. **If the tunnel dies, SSH/panel access survives.**
+  - **Autostart is now opt-in** (`WARP_PERSIST=1`, set only on explicit operator
+    confirmation). By default WARP does NOT come back after a reboot — a bad
+    tunnel can never silently re-down the box.
+  - **`update.sh` recovery migration** (`migrate_warp_safety`): disables the old
+    auto-enabled `wg-quick@warp` unit and tears down any stale unsafe tunnel
+    (missing `Table=off`) so boxes already hit by v1.5.1 regain native access on
+    update. Teardown leaves NO artifacts (ip rules, route table, conntrack marks,
+    legacy `0xca6c` fwmark all cleaned — BUG-150 pattern).
+  - UI: explicit "add to autostart" checkbox (default off) + a note that SSH/panel
+    stay reachable.
+- **BUG-163 (honest per-key accounting).** Confirmed: `IPAccounting` gives the
+  **server-wide** caddy-naive total, NOT per-user — per-key Naive is impossible
+  (forward_proxy hijacks CONNECT, access.log is empty for live tunnels). v1.5.1
+  spread that total evenly across users, which **invented** per-user numbers.
+  Now: **Mieru is per-key** (from mita), **Naive is shown as an accurate
+  server-wide total** in a banner above the Users table, clearly labelled. Also
+  fixed the Users table showing 0/0: it never fetched `/api/stats/users` — it now
+  merges the Mieru per-key figures from there into the rows.
+
+---
+
+## [v1.5.1]
+
+### Fixed
+- **BUG-160 (HIGH, regression): traffic accounting zeroed BOTH Naive AND Mieru.**
+  After v1.5.0 every user showed `Naive (МБ) = 0` and `Mieru (МБ) = 0`. Root
+  cause: the `/api/stats/users` aggregator was unguarded — if **either** source
+  (the `mita get users` exec, the Caddy log read, or a malformed `protocols`
+  blob) threw, the whole handler 500'd and the UI fell back to 0.0 for *both*
+  protocols. Fix: each source is now isolated in its own `try/catch`, so one
+  failing source can never zero the other; failures are logged, not silent.
+- **BUG-160: NaiveProxy traffic is now measured from the kernel.** Investigation
+  proved Caddy `forward_proxy` **hijacks** the CONNECT connection: successful
+  tunnels are never written to the access log and the logged handshake reports
+  `bytes_read = size = 0`. Per-user CONNECT byte accounting via the access log
+  is therefore impossible. We now enable `IPAccounting=yes` on
+  `caddy-naive.service` and read `IPIngressBytes/IPEgressBytes` for an accurate
+  server-wide Naive total (survives log rotation — no logs involved), attributed
+  across Naive-capable users. (`update.sh` migrates existing units idempotently.)
+- **BUG-161 (HIGH): WARP would not start on IPv4-only servers.** The wgcf profile
+  always carries an IPv6 `Address` + `AllowedIPs = ::/0`; on hosts with IPv6
+  disabled, `wg-quick` ran `ip -6 address add …` → "IPv6 is disabled on this
+  device" → rolled the whole interface back → tunnel never came up. Fix:
+  `warp_egress.sh` now detects usable IPv6 (`host_has_ipv6`) and, when absent,
+  strips every IPv6 `Address` line and the `::/0` from `AllowedIPs`, bringing the
+  tunnel up IPv4-only. The IPv6 step can no longer hard-fail the bring-up, and a
+  post-start interface check tears down any half-built state cleanly (BUG-150
+  pattern — no leftover routes/rules/interfaces after a failed enable).
+
+---
+
+## [v1.5.0] — 2026-06-22 (Naive traffic accounting fix + Cloudflare WARP egress mode)
+
+- **TASK 1 (MEDIUM) — NaiveProxy traffic always 0.0:** root cause was the Caddy
+  `log` directive living in the GLOBAL options block, which only configures
+  Caddy's runtime logger and never writes HTTP access logs — so `access.log` had
+  no per-request `user_id` / byte counters for `parseCaddyTraffic()` to sum.
+  - Moved the access `log` directive INSIDE the `:port, domain` site block in all
+    generators: `caddyTemplate.js` (primary) + the inline fallbacks in
+    `install.sh` and `update.sh`. The global logger now writes only runtime errors
+    to stderr/journald so it never pollutes `access.log`.
+  - `parseCaddyTraffic()` now survives log rotation: it sums the current
+    `access.log` PLUS all rolled siblings (`access-<ts>.log`), so a Caddy roll no
+    longer resets Naive usage to 0. (.gz rolls are skipped to avoid blocking.)
+  - **UI:** the single "Used (MB)" column is split into two — **Naive (MB)** and
+    **Mieru (MB)** — backed by the existing `naiveMB` / `mieruMB` fields.
+  - Tests: `bug-naive-caddylog.test.js` (9) verifies the access log is in the site
+    block; `bug-naive-traffic.test.js` (17) verifies per-user attribution and
+    rotation survival.
+- **TASK 2 (FEATURE) — Cloudflare WARP egress mode:** optional server-wide egress
+  through Cloudflare WARP so the server's real IP is never exposed.
+  - New `scripts/warp_egress.sh` (wgcf + wg-quick) with idempotent
+    `setup` / `teardown` / `status` / `egress-ip`; reboot-persistent via
+    `wg-quick@warp` systemd unit; full teardown removes the interface, routes,
+    fwmark rules and conf (BUG-150 clean-teardown lesson).
+  - New API: `GET/POST /api/settings/warp`, `GET /api/settings/warp/status`,
+    `POST /api/settings/warp/reset`. The POST reports the measured egress IP so
+    the operator can confirm it switched to Cloudflare.
+  - **Mutual exclusion:** exactly one egress mode is active (native IP / cascade /
+    WARP). Enabling WARP force-tears-down the cascade and vice-versa — enforced
+    server-side AND in the UI (the WARP toggle is locked while the cascade is on).
+  - **Low-RAM advisory:** on VPS with ≤1 GB RAM the UI warns that the extra
+    WireGuard layer adds memory pressure.
+
+## [v1.4.9] — Hotfix 2026-06-12 (BUG-156: trafficPattern.seed boolean → int32, mita IDLE / Mieru port closed)
+
+- **BUG-156 (HIGH):** enabling Mieru obfuscation (traffic pattern) in the UI made
+  the panel serialize `trafficPattern.seed` as a **boolean** (`seed: true`)
+  instead of an **int32** in `mita-state.json`. `mita apply config` then failed
+  with `proto: (line 57:13): invalid value for int32 type: true` →
+  `ValidateFullServerConfig() failed: server config is empty`, so mita stayed
+  **IDLE**, `mita describe` was empty `{}` and the Mieru port (e.g. 2012) stayed
+  closed — even though UFW allowed 2012–2022 and NaiveProxy kept working. The
+  bad block looked like:
+  `"trafficPattern": { "seed": true, "tcpFragment": false, "nonce": false }`.
+  Root cause: the on/off **toggle** value (a boolean) was written into `seed`,
+  and `tcpFragment` / `nonce` were emitted as bare booleans instead of objects.
+- **Fix (panel `buildMitaStateFile` + `update.sh` `rebuild_mita_state_direct`):**
+  generate the `trafficPattern` block against the authoritative mieru proto
+  schema —
+  `seed` is a **numeric int32** (a stable random 31-bit seed, persisted as
+  `cfg.trafficPatternSeed` so regeneration is deterministic),
+  `unlockAll` is the real boolean toggle, and `tcpFragment` / `nonce` are proper
+  objects (`tcpFragment { enable, maxSleepMs }`,
+  `nonce { type, applyToAllUDPPacket, minLen, maxLen }`). The UI toggle is never
+  written into `seed` again.
+- **Validation before apply:** added `validateMitaState()` — a structural
+  JSON-vs-proto-type check that rejects a non-integer `seed`, non-boolean
+  `unlockAll`, malformed `tcpFragment` / `nonce`, or port bindings missing an int
+  `port` / `portRange`. A broken config is now refused **before** it reaches
+  mita instead of leaving the server silently IDLE.
+- **Apply → start → verify RUNNING:** `applyMitaConfig()` now captures
+  `mita apply config` stderr, and after start/reload it verifies
+  `mita status == RUNNING` (with mieru users present), recording the failure
+  reason in `lastMitaError` (surfaced to the UI via the traffic-pattern API
+  response) instead of leaving mita IDLE with no feedback.
+- **Self-healing:** `cfg.trafficPattern` is only ever a string preset, so
+  regenerating `mita-state.json` (toggle obfuscation, create/delete a key) on an
+  already-broken server now writes a correct numeric seed automatically — no
+  config migration needed.
+- Added `tests/bug156-trafficpattern.test.js` (21 assertions): verifies each
+  preset emits an int32 seed (never a boolean), NOOP/unknown return null, seed
+  reuse is stable, the old `seed: true` shape is rejected by the validator,
+  CUSTOM coerces a boolean seed, and the full state survives a JSON round-trip.
+
 ## [v1.4.8] — Hotfix 2026-06-11 (BUG-155: apt output captured into panelBasicAuthHash → caddy-naive failed-loop)
 
 - **BUG-155 (HIGH):** enabling external panel access on a server where

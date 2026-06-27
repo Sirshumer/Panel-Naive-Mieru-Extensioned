@@ -728,12 +728,13 @@ if (fs.existsSync(TEMPLATE_JS)) {
     '  }',
     '  email ' + (cfg.adminEmail || ''),
     '  admin off',
+    // Global = runtime logger only (stderr/journald). Access logs are a
+    // per-site directive (below) — a global log block never writes per-request
+    // user_id / byte counters, so Naive traffic was always 0.0.
     '  log {',
-    '    output file /var/log/caddy-naive/access.log {',
-    '      roll_size     50mb',
-    '      roll_keep_for 720h',
-    '    }',
-    '    format json',
+    '    output stderr',
+    '    format console',
+    '    level ERROR',
     '  }',
     '}',
     '',
@@ -744,6 +745,16 @@ if (fs.existsSync(TEMPLATE_JS)) {
     // Bug 83: ':<port>, <domain>' listener + explicit tls + no route{} wrapper
     ':' + (cfg.naivePort || 443) + ', ' + (cfg.domain || 'localhost') + ' {',
     '  tls ' + (cfg.adminEmail || ''),
+    '',
+    // Traffic accounting: per-site ACCESS log → JSON line per request with
+    // request.user_id + byte counters parseCaddyTraffic() sums per user.
+    '  log {',
+    '    output file /var/log/caddy-naive/access.log {',
+    '      roll_size     50mb',
+    '      roll_keep_for 720h',
+    '    }',
+    '    format json',
+    '  }',
     '',
     '  forward_proxy {',
     authLines,
@@ -837,12 +848,41 @@ rebuild_mita_state_direct() {
     const state = { portBindings, users, loggingLevel: 'INFO', mtu: cfg.mtu || 1400 };
     const pat = cfg.trafficPattern || 'NOOP';
     if (pat !== 'NOOP') {
+      // BUG-156: emit the proto-correct trafficPattern. `seed` is an INT32 (NOT
+      // a boolean — the old 'seed: true' made 'mita apply config' fail with
+      // 'invalid value for int32 type: true' → empty server config → IDLE).
+      // `unlockAll` is the on/off boolean; tcpFragment/nonce are OBJECTS.
+      // Keep a stable numeric seed in cfg.trafficPatternSeed (mirrors index.js).
+      const crypto = require('crypto');
+      let seed = parseInt(cfg.trafficPatternSeed, 10);
+      if (!Number.isInteger(seed) || seed <= 0 || seed > 0x7fffffff) {
+        seed = (crypto.randomBytes(4).readUInt32BE(0) & 0x7fffffff) || 1;
+      }
       const patMap = {
-        RANDOM_PADDING:            { seed: true, tcpFragment: false, nonce: false },
-        RANDOM_PADDING_AGGRESSIVE: { seed: true, tcpFragment: true,  nonce: true  },
-        CUSTOM:                    { seed: true, tcpFragment: true,  nonce: true  }
+        RANDOM_PADDING: {
+          seed, unlockAll: false,
+          tcpFragment: { enable: false, maxSleepMs: 0 },
+          nonce: { type: 'NONCE_TYPE_PRINTABLE', applyToAllUDPPacket: false, minLen: 4, maxLen: 8 }
+        },
+        RANDOM_PADDING_AGGRESSIVE: {
+          seed, unlockAll: true,
+          tcpFragment: { enable: true, maxSleepMs: 10 },
+          nonce: { type: 'NONCE_TYPE_PRINTABLE', applyToAllUDPPacket: true, minLen: 6, maxLen: 12 }
+        },
+        CUSTOM: (cfg.trafficPatternCustom && typeof cfg.trafficPatternCustom === 'object')
+          ? Object.assign({}, cfg.trafficPatternCustom, {
+              seed: Number.isInteger(parseInt((cfg.trafficPatternCustom||{}).seed,10))
+                ? parseInt(cfg.trafficPatternCustom.seed,10) : seed })
+          : { seed, unlockAll: true }
       };
       if (patMap[pat]) state.trafficPattern = patMap[pat];
+      // Persist the stable seed so subsequent regenerations don't churn it.
+      if (cfg.trafficPatternSeed !== seed) {
+        try {
+          cfg.trafficPatternSeed = seed;
+          fs.writeFileSync('$PANEL_CONFIG', JSON.stringify(cfg, null, 2), { mode: 0o600 });
+        } catch (_) {}
+      }
     }
 
     const tmp = '$MITA_STATE_FILE' + '.new';
@@ -935,6 +975,67 @@ SVCCADDY
     rm -f /etc/systemd/system/naive.service
     log_info "Legacy naive.service removed (replaced by caddy-naive.service)"
   fi
+
+  # BUG-162 placeholder kept inline below in migrate_warp_safety().
+
+  # BUG-160 (v1.5.1): enable kernel IP accounting on the caddy-naive unit so the
+  #   panel can report real NaiveProxy traffic (the access log can't — CONNECT
+  #   tunnels are hijacked and never logged). Idempotent: only adds the line if
+  #   missing, then daemon-reload + restart so the cgroup counters start.
+  if [[ -f /etc/systemd/system/caddy-naive.service ]] \
+     && ! grep -q '^IPAccounting=' /etc/systemd/system/caddy-naive.service; then
+    log_step "Enabling IPAccounting on caddy-naive.service (Naive traffic accounting)"
+    sed -i '/^AmbientCapabilities=CAP_NET_BIND_SERVICE/a IPAccounting=yes' \
+      /etc/systemd/system/caddy-naive.service 2>/dev/null \
+      || printf '\n[Service]\nIPAccounting=yes\n' >> /etc/systemd/system/caddy-naive.service
+    systemctl daemon-reload 2>/dev/null || true
+    systemctl restart caddy-naive 2>/dev/null || true
+    log_info "IPAccounting=yes enabled ✓"
+  fi
+}
+
+# ── BUG-162: recover boxes from the broken v1.5.1 WARP (lock-out on reboot) ──
+migrate_warp_safety() {
+  # If the old wg-quick@warp unit is enabled (v1.5.1 auto-enabled it), the box
+  # would tunnel SSH/panel and lose access on every reboot. ALWAYS disable the
+  # autostart on update so a reboot is safe. We do NOT silently bring WARP back —
+  # the operator re-enables it from the panel (now with scoped, safe routing).
+  local changed=0
+  if systemctl is-enabled wg-quick@warp &>/dev/null; then
+    systemctl disable wg-quick@warp 2>/dev/null || true
+    changed=1
+    log_warn "WARP autostart disabled (BUG-162: prevents reboot lock-out) / автозагрузка WARP отключена"
+  fi
+  # If a stale warp.conf still has the broken blanket-route layout (Table=auto or
+  # no Table=off, AllowedIPs ::/0 / 0.0.0.0/0 as default), OR is a v1.5.2 conf
+  # WITHOUT the MTU=1280 fix (BUG-164: one-way tunnel — handshake OK but no return
+  # traffic), tear the tunnel down so the panel regenerates the fixed conf on the
+  # next enable, and the operator is not stuck behind a black-hole/control-plane-
+  # eating route after the update.
+  if [[ -f /etc/wireguard/warp.conf ]]; then
+    if ! grep -qiE '^[[:space:]]*Table[[:space:]]*=[[:space:]]*off' /etc/wireguard/warp.conf; then
+      log_warn "Tearing down old unsafe WARP tunnel (missing Table=off) / снимаю старый небезопасный WARP"
+      systemctl stop wg-quick@warp 2>/dev/null || true
+      wg-quick down warp 2>/dev/null || true
+      ip link del warp 2>/dev/null || true
+      # remove the old broken conf so the panel regenerates the safe one on enable
+      rm -f /etc/wireguard/warp.conf
+      changed=1
+    elif ! grep -qiE '^[[:space:]]*MTU[[:space:]]*=[[:space:]]*1280' /etc/wireguard/warp.conf; then
+      log_warn "Tearing down one-way WARP tunnel (missing MTU=1280, BUG-164) / снимаю односторонний WARP без MTU 1280"
+      systemctl stop wg-quick@warp 2>/dev/null || true
+      wg-quick down warp 2>/dev/null || true
+      ip link del warp 2>/dev/null || true
+      rm -f /etc/wireguard/warp.conf
+      changed=1
+    fi
+  fi
+  # Clean up the v1.5.1 wg-quick fwmark policy artifacts if they linger.
+  while ip rule show 2>/dev/null | grep -q "fwmark 0xca6c"; do
+    ip rule del fwmark 0xca6c 2>/dev/null || break
+  done
+  ip route flush table "$((16#ca6c))" 2>/dev/null || true
+  [[ "$changed" == "1" ]] && systemctl daemon-reload 2>/dev/null || true
 }
 
 # ── Bug 79: fix caddy-naive config permissions ───────────────────────────────
@@ -1705,6 +1806,14 @@ do_update() {
 
   # Ensure service is present and legacy naive is gone
   ensure_caddy_service
+
+  # BUG-162 (CRITICAL migration): v1.5.1 brought WARP up with a blanket default
+  #   route (AllowedIPs 0.0.0.0/0 + Table=auto) AND `systemctl enable`d the unit.
+  #   That tunnelled SSH/panel and re-downed the box on every reboot. Recover any
+  #   such box: disable autostart + tear down the old broken tunnel/routes so the
+  #   operator regains native access. The new (safe) WARP is only re-enabled when
+  #   the operator explicitly toggles it again in the panel.
+  migrate_warp_safety
 
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
 

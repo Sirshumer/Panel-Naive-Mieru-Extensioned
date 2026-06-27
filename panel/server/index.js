@@ -85,7 +85,15 @@ try {
     cascadeEnabled: false, cascadeNaiveUpstream: '',
     cascadeMieru: { host: '', portStart: 2012, portEnd: 2022, user: '', pass: '', mtu: 1400 },
     cascadeMieruEgress: {},   // legacy (Variant A native egress) — kept for back-compat
-    language: 'ru', version: '1.4.8'
+    // FEATURE (egress): Cloudflare WARP as a server-wide egress mode. Exactly one
+    // of three egress modes is active at any time: native IP / Mieru cascade /
+    // WARP. WARP and cascade are MUTUALLY EXCLUSIVE (enabling one disables the
+    // other). Orchestrated by scripts/warp_egress.sh (wgcf + wg-quick).
+    warpEnabled: false,
+    // BUG-162: boot-persistence is OFF by default. Only set true when the
+    //   operator explicitly confirms autostart (protects against reboot lock-out).
+    warpPersist: false,
+    language: 'ru', version: '1.5.7'
   };
 }
 
@@ -96,7 +104,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.4.8';
+const VERSION_FALLBACK = '1.5.7';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -622,6 +630,11 @@ function writeCaddyfileAtomic(content) {
 let lastCaddyError = '';
 function getLastCaddyError() { return lastCaddyError; }
 
+// BUG-156: last mita apply/validate error, surfaced to the UI so a rejected
+// config (e.g. a bad trafficPattern) is visible instead of a silent IDLE mita.
+let lastMitaError = '';
+function getLastMitaError() { return lastMitaError; }
+
 // ── applyCaddyConfig() — Bug 91 ──────────────────────────────────────────────
 // Previously the panel applied config via `systemctl reload` (kill -USR1). A
 // graceful reload SILENTLY KEEPS the old in-memory config when the new config
@@ -726,6 +739,54 @@ function countMieruUsers() {
   }).length;
 }
 
+// BUG-156: build a proto-correct mita `trafficPattern` object for a UI preset.
+// `seed` MUST be an int32 (not a boolean). We keep a STABLE per-install seed in
+// cfg.trafficPatternSeed so regenerating the config (key add/delete, toggling
+// obfuscation off and on) does not churn the implicit pattern. Returns null for
+// NOOP / unknown presets (caller then omits trafficPattern entirely).
+function getStableTrafficSeed() {
+  let s = parseInt(cfg.trafficPatternSeed, 10);
+  if (!Number.isInteger(s) || s <= 0 || s > 0x7fffffff) {
+    // 31-bit positive int → always a valid proto int32.
+    s = (crypto.randomBytes(4).readUInt32BE(0) & 0x7fffffff) || 1;
+    cfg.trafficPatternSeed = s;
+    try { saveConfig(); } catch {}
+  }
+  return s;
+}
+
+function buildTrafficPattern(pat, _cfg) {
+  const seed = getStableTrafficSeed();
+  switch (pat) {
+    case 'RANDOM_PADDING':
+      // Conservative: stable seed + limited implicit options, no TCP fragmenting.
+      return {
+        seed,
+        unlockAll: false,
+        tcpFragment: { enable: false, maxSleepMs: 0 },
+        nonce: { type: 'NONCE_TYPE_PRINTABLE', applyToAllUDPPacket: false, minLen: 4, maxLen: 8 }
+      };
+    case 'RANDOM_PADDING_AGGRESSIVE':
+      // Aggressive: unlock all implicit options + TCP fragmentation + nonce on all UDP.
+      return {
+        seed,
+        unlockAll: true,
+        tcpFragment: { enable: true, maxSleepMs: 10 },
+        nonce: { type: 'NONCE_TYPE_PRINTABLE', applyToAllUDPPacket: true, minLen: 6, maxLen: 12 }
+      };
+    case 'CUSTOM':
+      // Honour an operator-supplied object verbatim, but coerce seed to int32.
+      if (_cfg && _cfg.trafficPatternCustom && typeof _cfg.trafficPatternCustom === 'object') {
+        const c = { ..._cfg.trafficPatternCustom };
+        c.seed = Number.isInteger(parseInt(c.seed, 10)) ? parseInt(c.seed, 10) : seed;
+        return c;
+      }
+      return { seed, unlockAll: true };
+    default:
+      return null;
+  }
+}
+
 function buildMitaStateFile() {
   const allUsers = getAllUsers();
   const mieruUsers = allUsers.filter(u => {
@@ -754,14 +815,21 @@ function buildMitaStateFile() {
     mtu: cfg.mtu || 1400
   };
 
+  // BUG-156 (HIGH): the previous patMap wrote `seed: true` (a boolean) into the
+  // mita trafficPattern. In the mita proto `seed` is an INT32 (it seeds stable
+  // implicit pattern generation), and `tcpFragment` / `nonce` are OBJECTS, not
+  // booleans. `mita apply config` rejected the boolean with
+  //   proto: invalid value for int32 type: true  → server config empty → IDLE,
+  // so the Mieru port never opened. We now emit the proto-correct schema
+  // (see https://github.com/enfein/mieru/blob/main/docs/traffic-pattern.md):
+  //   • seed        → int32  (the on/off toggle is `unlockAll`, a bool)
+  //   • unlockAll   → bool   (false = conservative, true = aggressive)
+  //   • tcpFragment → { enable: bool, maxSleepMs: int }
+  //   • nonce       → { type: enum-string, applyToAllUDPPacket: bool, minLen, maxLen }
   const pat = cfg.trafficPattern || 'NOOP';
   if (pat !== 'NOOP') {
-    const patMap = {
-      'RANDOM_PADDING':            { seed: true,  tcpFragment: false, nonce: false },
-      'RANDOM_PADDING_AGGRESSIVE': { seed: true,  tcpFragment: true,  nonce: true  },
-      'CUSTOM':                    { seed: true,  tcpFragment: true,  nonce: true  }
-    };
-    if (patMap[pat]) mieruCfg.trafficPattern = patMap[pat];
+    const tp = buildTrafficPattern(pat, cfg);
+    if (tp) mieruCfg.trafficPattern = tp;
   }
 
   // v1.2.6 cascade (Mieru): Variant B is used instead of mita native egress.
@@ -802,6 +870,43 @@ function resetMitaFailed() {
   try { execSync('systemctl reset-failed mita 2>/dev/null || true', { timeout: 5000 }); } catch {}
 }
 
+// BUG-156: validate mita-state.json BEFORE we apply it, so a malformed config
+// (e.g. the old `seed: true` int32 violation) never reaches mita and drops it
+// into IDLE with an empty server config. Two layers:
+//   1) structural JSON-vs-proto-type check (fast, no mita needed);
+//   2) `mita apply config` is the real validator at apply time — but we capture
+//      its stderr so the caller can surface "invalid value for int32" etc.
+// Returns { ok, error }.
+function validateMitaState(file) {
+  // Layer 1: structural type check of the fields mita is strict about.
+  try {
+    const obj = JSON.parse(fs.readFileSync(file, 'utf8'));
+    const tp = obj.trafficPattern;
+    if (tp && typeof tp === 'object') {
+      if ('seed' in tp && !Number.isInteger(tp.seed))
+        return { ok: false, error: `trafficPattern.seed must be an int32, got ${JSON.stringify(tp.seed)}` };
+      if ('unlockAll' in tp && typeof tp.unlockAll !== 'boolean')
+        return { ok: false, error: 'trafficPattern.unlockAll must be a boolean' };
+      if ('tcpFragment' in tp) {
+        const f = tp.tcpFragment;
+        if (typeof f !== 'object' || f === null)
+          return { ok: false, error: 'trafficPattern.tcpFragment must be an object { enable, maxSleepMs }' };
+        if ('enable' in f && typeof f.enable !== 'boolean')
+          return { ok: false, error: 'trafficPattern.tcpFragment.enable must be a boolean' };
+        if ('maxSleepMs' in f && !Number.isInteger(f.maxSleepMs))
+          return { ok: false, error: 'trafficPattern.tcpFragment.maxSleepMs must be an int' };
+      }
+      if ('nonce' in tp && (typeof tp.nonce !== 'object' || tp.nonce === null))
+        return { ok: false, error: 'trafficPattern.nonce must be an object' };
+    }
+    if (Array.isArray(obj.portBindings) && obj.portBindings.some(b => !Number.isInteger(b.port) && !b.portRange))
+      return { ok: false, error: 'portBindings entries need an int `port` or a `portRange` string' };
+  } catch (e) {
+    return { ok: false, error: 'mita-state.json is not valid JSON: ' + e.message };
+  }
+  return { ok: true, error: '' };
+}
+
 // Bug 96: the mieru server persists its applied state to
 //   ~/.config/mita/server.conf.pb (root's HOME, since mita.service runs as
 //   root). A stale/corrupt server.conf.pb can make a freshly-(re)started mita
@@ -818,7 +923,17 @@ function clearMitaPersistedState() {
 }
 
 function applyMitaConfig() {
+  lastMitaError = '';
   const file = buildMitaStateFile();
+  // BUG-156: structurally validate the config before doing anything with mita.
+  // A bad trafficPattern (e.g. seed as a boolean) used to be applied blindly,
+  // mita rejected it, the server config went empty and mita stayed IDLE with
+  // the Mieru port closed. We now refuse early and record the reason.
+  const v = validateMitaState(file);
+  if (!v.ok) {
+    lastMitaError = 'mita-state.json invalid (not applying): ' + v.error;
+    return false;
+  }
   try {
     // Bug 96: always clear a lingering failed state first so subsequent
     //   start/restart commands are honoured by systemd.
@@ -838,7 +953,15 @@ function applyMitaConfig() {
       return true;   // idle is the correct, healthy state on an empty base
     }
 
-    execSync(`mita apply config ${file} 2>/dev/null`, { timeout: 15000 });
+    // BUG-156: capture apply stderr so a proto rejection surfaces instead of
+    // being silently swallowed by `2>/dev/null`.
+    try {
+      execSync(`mita apply config ${file}`, { timeout: 15000, stdio: ['ignore', 'ignore', 'pipe'] });
+    } catch (e) {
+      lastMitaError = 'mita apply config failed: ' +
+        (((e.stderr && e.stderr.toString()) || e.message || '').trim().split('\n').slice(-3).join(' '));
+      return false;
+    }
 
     // Bug 75: a fresh mita install sits in state IDLE (the installer does NOT
     // start it while users[] is empty — Bug 4). `mita reload` only re-reads the
@@ -877,8 +1000,26 @@ function applyMitaConfig() {
     }
 
     shredFile(file + '.last');
+
+    // BUG-156: with mieru users present, mita must end up RUNNING (not IDLE) —
+    // an IDLE here means the config was rejected and the Mieru port stays shut.
+    // Give it a moment, then verify; record the reason if it didn't come up.
+    let finalStatus = '';
+    try { finalStatus = execSync('mita status 2>/dev/null', { timeout: 10000 }).toString(); }
+    catch { finalStatus = ''; }
+    if (/RUNNING/i.test(finalStatus)) {
+      lastMitaError = '';
+      return true;
+    }
+    // Not RUNNING despite users — surface a diagnostic but don't hard-fail the
+    // whole apply (the caller may still have applied Caddy etc.).
+    lastMitaError = 'mita is not RUNNING after apply (status: ' +
+      (finalStatus.trim().split('\n')[0] || 'unknown') + '). Check: journalctl -u mita -n 50';
     return true;
-  } catch { return false; }
+  } catch (e) {
+    lastMitaError = 'applyMitaConfig error: ' + (e.message || String(e));
+    return false;
+  }
 }
 
 function restartMieru() {
@@ -927,6 +1068,79 @@ function runCascadeMieru(action, opts = {}) {
   } catch (e) {
     return { ok: false, output: (e.stdout ? e.stdout.toString() : '') + (e.stderr ? e.stderr.toString() : e.message) };
   }
+}
+
+// ── Cloudflare WARP egress — scripts/warp_egress.sh orchestrator ─────────────
+// WARP routes ALL of the server's OUTBOUND traffic through Cloudflare so the
+// real server IP is hidden. It is a server-wide mode and MUTUALLY EXCLUSIVE with
+// the Mieru cascade (the API guarantees only one egress mode is ever active).
+const WARP_SCRIPT = path.join(__dirname, '../scripts/warp_egress.sh');
+
+// Detect the active SSH port (sshd_config Port, then listening sockets, then 22).
+// BUG-162: passed to warp_egress.sh so the SSH control channel is NEVER tunnelled.
+function detectSshPort() {
+  try {
+    const cfgTxt = fs.readFileSync('/etc/ssh/sshd_config', 'utf8');
+    const m = cfgTxt.match(/^\s*Port\s+(\d+)/m);
+    if (m) return m[1];
+  } catch {}
+  try {
+    const ss = execSync("ss -tlnp 2>/dev/null | awk '/sshd/{n=split($4,a,\":\"); print a[n]}' | head -1", { timeout: 4000 })
+      .toString().trim();
+    if (ss) return ss;
+  } catch {}
+  return '22';
+}
+
+// Run warp_egress.sh {setup|teardown|status|egress-ip}. Returns { ok, output }.
+// BUG-162: inject management-plane env so the script can keep SSH + panel on the
+//   native route, and only enable boot-persistence when explicitly confirmed.
+function runWarpEgress(action, opts = {}) {
+  try {
+    const env = Object.assign({}, process.env, {
+      WARP_SSH_PORT:   String(opts.sshPort   || detectSshPort()),
+      WARP_PANEL_PORT: String(opts.panelPort || cfg.panelPort || 3000),
+      WARP_PERSIST:    opts.persist ? '1' : '0',
+    });
+    const out = execFileSync('bash', [WARP_SCRIPT, action], { timeout: 180000, env }).toString();
+    return { ok: true, output: out };
+  } catch (e) {
+    return { ok: false, output: (e.stdout ? e.stdout.toString() : '') + (e.stderr ? e.stderr.toString() : e.message) };
+  }
+}
+
+// BUG-168: classify the WARP setup outcome from the script's structured
+//   `WARP_RESULT=…` line, so the panel can show a FRIENDLY explanation instead
+//   of a raw technical error. The auto-rollback already kept the server safe;
+//   the operator just needs to know WHY and what to do.
+//   Codes:
+//     ok             → tunnel verified, egress is the Cloudflare IP (green)
+//     blocked_return → handshake OK but no return data on any port → the HOSTING
+//                      PROVIDER blocks Cloudflare WARP return traffic (yellow,
+//                      NOT a panel error). Suggest: change host or use cascade.
+//     no_handshake   → no handshake on any port → provider likely blocks UDP.
+//     unknown        → couldn't classify (fall back to the raw output).
+function parseWarpResult(output) {
+  const text = String(output || '');
+  const line = (text.split('\n').reverse().find(l => /^WARP_RESULT=/.test(l.trim())) || '').trim();
+  const out = { code: 'unknown', egressIP: null, rx: null, tx: null, raw: text };
+  if (!line) return out;
+  const get = (k) => { const m = line.match(new RegExp(k + '=([^\\s]+)')); return m ? m[1] : null; };
+  out.code = get('WARP_RESULT') || 'unknown';
+  out.egressIP = get('egressIP');
+  const rx = get('rx'), tx = get('tx');
+  if (rx != null) out.rx = parseInt(rx, 10);
+  if (tx != null) out.tx = parseInt(tx, 10);
+  return out;
+}
+
+// Total RAM in MiB (for the low-RAM warning around the extra WARP network layer).
+// Read /proc/meminfo to avoid pulling in the `os` module.
+function totalRamMB() {
+  try {
+    const m = fs.readFileSync('/proc/meminfo', 'utf8').match(/MemTotal:\s*(\d+)\s*kB/);
+    return m ? Math.round(parseInt(m[1], 10) / 1024) : 0;
+  } catch { return 0; }
 }
 
 function shredFile(fp) {
@@ -1730,7 +1944,10 @@ app.post('/api/settings/traffic-pattern', requireAuth, (req, res) => {
   cfg.trafficPattern = pattern; saveConfig();
   try {
     const ok = applyMitaConfig();
-    res.json({ ok, pattern, mtu: cfg.mtu });
+    // BUG-156: report a config/apply failure (e.g. an invalid trafficPattern)
+    // instead of silently returning ok:false with no reason.
+    const mitaError = getLastMitaError();
+    res.json({ ok, pattern, mtu: cfg.mtu, mitaError: mitaError || undefined });
   } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
@@ -1869,6 +2086,14 @@ app.get('/api/settings/cascade/status', requireAuth, (req, res) => {
 app.post('/api/settings/cascade', requireAuth, (req, res) => {
   const { cascadeEnabled, cascadeNaiveUpstream, cascadeMieru } = req.body;
   const enabled = !!cascadeEnabled;
+
+  // MUTUAL EXCLUSION: enabling the cascade must first fully disable + tear down
+  // WARP (only one egress mode active at a time; BUG-150 clean-teardown rule).
+  if (enabled && cfg.warpEnabled) {
+    cfg.warpEnabled = false;
+    try { runWarpEgress('teardown'); } catch {}
+  }
+
   cfg.cascadeEnabled = enabled;
   if (cascadeNaiveUpstream !== undefined) {
     // Bug 92: normalize on store too (defense in depth) — strip "naive+" etc. so
@@ -2002,6 +2227,156 @@ app.post('/api/settings/cascade/reset', requireAuth, (req, res) => {
              + 'mita пересобрана с родными ключами.'
     });
   } catch (e) { res.status(500).json({ error: e.message }); }
+});
+
+// ── Cloudflare WARP egress (server-wide) ─────────────────────────────────────
+// Exactly one egress mode is active: native IP / Mieru cascade / WARP. WARP and
+// cascade are MUTUALLY EXCLUSIVE — enabling WARP force-disables the cascade (and
+// tears its relay down), and the cascade endpoints likewise disable WARP. The
+// UI also blocks enabling both, but the server enforces it as the source of truth.
+
+// Current WARP settings + a low-RAM advisory.
+app.get('/api/settings/warp', requireAuth, (req, res) => {
+  const ram = totalRamMB();
+  res.json({
+    warpEnabled:    !!cfg.warpEnabled,
+    warpPersist:    !!cfg.warpPersist,
+    cascadeEnabled: !!cfg.cascadeEnabled,   // so the UI can show the lockout
+    ramMB:          ram,
+    // The extra WireGuard layer adds memory/CPU pressure on tiny VPS.
+    lowRam:         ram > 0 && ram <= 1024,
+    lowRamWarning:  (ram > 0 && ram <= 1024)
+      ? 'На VPS с ≤1 ГБ RAM дополнительный сетевой слой WARP (WireGuard) нагружает память — включайте только при необходимости.'
+      : ''
+  });
+});
+
+// Live WARP status incl. the measured public egress IP (should be Cloudflare).
+app.get('/api/settings/warp/status', requireAuth, (req, res) => {
+  const r = runWarpEgress('status');
+  res.json({ ok: r.ok, enabled: !!cfg.warpEnabled, output: r.output });
+});
+
+// Toggle WARP egress on/off.
+app.post('/api/settings/warp', requireAuth, (req, res) => {
+  const enabled = !!(req.body && req.body.warpEnabled);
+
+  // MUTUAL EXCLUSION: enabling WARP must first fully disable + tear down the
+  // Mieru cascade (BUG-150 lesson: a clean teardown, no leftover routes).
+  let cascadeTorn = false, cascadeOut = '';
+  if (enabled && cfg.cascadeEnabled) {
+    cfg.cascadeEnabled       = false;
+    cfg.cascadeNaiveUpstream = '';
+    const prevMieru = cfg.cascadeMieru || {};
+    cfg.cascadeMieru = {
+      host: '', portStart: prevMieru.portStart || 2012,
+      portEnd: prevMieru.portEnd || 2022, user: '', pass: '',
+      mtu: prevMieru.mtu || cfg.mtu || 1400
+    };
+    cfg.cascadeMieruEgress = {};
+    // Naive leg back to direct (no upstream) + Mieru relay torn down.
+    try {
+      const content = buildCaddyfile(cfg, getAllUsers());
+      writeCaddyfileAtomic(content);
+      applyCaddyConfig();
+    } catch {}
+    const td = runCascadeMieru('teardown');
+    cascadeTorn = td.ok; cascadeOut = td.output;
+    try { applyMitaConfig(); } catch {}
+  }
+
+  // BUG-162: boot-persistence (autostart) only when the operator EXPLICITLY
+  //   opts in via `persist: true`. Default = NOT persistent, so a faulty tunnel
+  //   can never silently re-down the box on reboot — a restart restores access.
+  const persist = !!(req.body && req.body.persist);
+  cfg.warpEnabled = enabled;
+  cfg.warpPersist = enabled ? persist : false;
+  saveConfig();
+
+  // Apply the WARP layer (passing the management ports + persist flag).
+  const r = enabled
+    ? runWarpEgress('setup', { persist })
+    : runWarpEgress('teardown');
+
+  // BUG-168: classify the outcome so the UI can show a friendly explanation.
+  const wr = parseWarpResult(r.output);
+
+  // If WARP was requested but the script rolled back (blocked / no handshake),
+  //   the tunnel is DOWN — reflect that in config so the panel state is honest.
+  const rolledBack = enabled && (!r.ok || wr.code === 'blocked_return' || wr.code === 'no_handshake');
+  if (rolledBack) {
+    cfg.warpEnabled = false;
+    cfg.warpPersist = false;
+    saveConfig();
+  }
+
+  // Report the egress IP so the operator can confirm it changed to Cloudflare.
+  let egress = wr.egressIP || '';
+  if (!egress) {
+    try { egress = execSync('curl -s --max-time 8 https://api.ipify.org 2>/dev/null', { timeout: 10000 }).toString().trim(); }
+    catch { egress = ''; }
+  }
+
+  // BUG-168: build a classified result {severity, code, message} for the panel.
+  //   severity: 'success' (green) | 'warning' (yellow, NOT a panel error).
+  const fmtBytes = (n) => (n == null ? '?' : (n >= 1024 ? (n / 1024).toFixed(1) + ' KiB' : n + ' B'));
+  let warpResult;
+  if (!enabled) {
+    warpResult = { severity: 'success', code: 'disabled',
+      message: 'WARP выключен. Возврат к родному IP сервера.' };
+  } else if (wr.code === 'ok' || (r.ok && !rolledBack)) {
+    warpResult = { severity: 'success', code: 'ok', egressIP: egress || '(unknown)',
+      message: (cascadeTorn
+        ? `WARP включён — egress теперь через Cloudflare (IP ${egress || '?'}). Каскад был автоматически отключён. SSH и панель доступны напрямую.`
+        : (persist
+            ? `WARP включён и добавлен в автозагрузку — egress через Cloudflare (IP ${egress || '?'}). В туннель идёт только исходящий прокси-трафик; SSH и панель доступны напрямую.`
+            : `WARP включён — egress через Cloudflare (IP ${egress || '?'}). В туннель идёт только исходящий прокси-трафик; SSH и панель доступны напрямую. Автозагрузка ВЫКЛЮЧЕНА (после ребута WARP не поднимется автоматически).`)) };
+  } else if (wr.code === 'blocked_return') {
+    // Handshake OK but no return traffic → the HOSTING PROVIDER blocks WARP.
+    warpResult = { severity: 'warning', code: 'blocked_return',
+      message: 'WARP не удалось включить: ваш хостинг-провайдер блокирует входящий трафик Cloudflare WARP (WireGuard/UDP). '
+        + 'Это ограничение сервера, не панели. Всё откачено, доступ к серверу сохранён, текущая работа не нарушена. '
+        + 'Если нужен WARP — смените хостера на не блокирующего WireGuard, либо используйте каскад (chain). '
+        + `(Туннель отправил ${fmtBytes(wr.tx)}, получил ${fmtBytes(wr.rx)} — обратный трафик заблокирован.)` };
+  } else if (wr.code === 'no_handshake') {
+    warpResult = { severity: 'warning', code: 'no_handshake',
+      message: 'WARP не смог подключиться к Cloudflare ни на одном порту (2408/500/1701/4500). '
+        + 'Вероятно, провайдер режет UDP. Всё откачено, доступ сохранён. Попробуйте другой сервер или каскад.' };
+  } else {
+    // Unknown failure — surface a safe generic message; rollback already ran.
+    warpResult = { severity: 'warning', code: 'unknown',
+      message: 'WARP включить не удалось. Всё откачено, доступ к серверу сохранён. '
+        + 'Подробности в технических логах ниже.' };
+  }
+
+  res.json({
+    ok: enabled ? (!rolledBack) : r.ok,
+    warpEnabled: cfg.warpEnabled,
+    warpPersist: cfg.warpPersist,
+    rolledBack: rolledBack || undefined,
+    cascadeDisabled: cascadeTorn || undefined,
+    cascadeOutput: cascadeOut || undefined,
+    egressIP: egress || '(unknown)',
+    output: r.output,
+    warpResult,                       // BUG-168: classified {severity, code, message}
+    message: warpResult.message       // back-compat: plain message string
+  });
+});
+
+// Explicit idempotent WARP reset — full teardown regardless of the toggle.
+app.post('/api/settings/warp/reset', requireAuth, (req, res) => {
+  cfg.warpEnabled = false;
+  saveConfig();
+  const r = runWarpEgress('teardown');
+  let egress = '';
+  try { egress = execSync('curl -s --max-time 8 https://api.ipify.org 2>/dev/null', { timeout: 10000 }).toString().trim(); }
+  catch { egress = ''; }
+  res.json({
+    ok: r.ok, warpEnabled: false,
+    nativeEgress: egress || '(unknown)',
+    output: r.output,
+    message: 'WARP полностью снят: интерфейс/маршруты/правила удалены, возврат к родному IP.'
+  });
 });
 
 // ── Client configs ────────────────────────────────────────────────────────────
@@ -2216,19 +2591,64 @@ app.get('/api/status', requireAuth, async (req, res) => {
 // User traffic stats
 app.get('/api/stats/users', requireAuth, (req, res) => {
   const exec_ = cmd => { try { return execSync(cmd, { timeout: 8000 }).toString(); } catch { return ''; } };
+  // BUG-160 (regression, v1.5.1): in v1.5.0 BOTH the «Naive (МБ)» and
+  //   «Mieru (МБ)» columns dropped to 0.0 for every user. Mieru worked before
+  //   the v1.5.0 refactor, so the failure was in the COMMON aggregator — if
+  //   either source (mita exec OR the Caddy log read) threw, the unguarded
+  //   handler 500'd and the UI rendered its 0.0 fallback for BOTH sources.
+  //   Fix: isolate each source in its own try/catch so one failing source can
+  //   NEVER zero the other, and log the failure so it is diagnosable instead of
+  //   silently returning zeros.
+
+  // ── Mieru source (mita get users) — fully isolated ──────────────────────────
   // Bug 78: the real mieru server command is `mita get users` (NOT the
   //   non-existent `mita describe users`, which always returned '' → traffic 0).
   //   Output is a table: User  LastActive  1DayDownload  1DayUpload  30DaysDownload  30DaysUpload
-  const raw   = exec_('mita get users 2>/dev/null');
-  const live  = parseMitaUsers(raw);
+  let live = [];
+  try {
+    const raw = exec_('mita get users 2>/dev/null');
+    live = parseMitaUsers(raw) || [];
+  } catch (e) {
+    live = [];
+    try { console.error('[stats/users] mieru source failed:', e && e.message); } catch {}
+  }
+
+  // ── Naive source (Caddy access log) — fully isolated ────────────────────────
   // Bug 97: also account NaiveProxy traffic from the Caddy access log so
   //   naive-only users no longer show 0.0. Mieru + Naive figures are summed.
-  const naive = parseCaddyTraffic(LOG_CADDY);
-  const users = getAllUsers().map(u => {
+  // BUG-160: the access log only captures the RARE plain-HTTP request — it does
+  //   NOT capture CONNECT tunnels (forward_proxy hijacks the connection, so a
+  //   successful tunnel is never logged and bytes_read/size are 0). So this is
+  //   best-effort per-user data; the authoritative Naive total comes from the
+  //   kernel via systemd IP accounting (naiveTotalMB below).
+  let naive = {};
+  try {
+    naive = parseCaddyTraffic(LOG_CADDY) || {};
+  } catch (e) {
+    naive = {};
+    try { console.error('[stats/users] naive source failed:', e && e.message); } catch {}
+  }
+
+  // BUG-163 (honest accounting): authoritative server-wide NaiveProxy traffic
+  //   from the kernel (systemd IPAccounting on caddy-naive.service). Per-user
+  //   Naive is IMPOSSIBLE: forward_proxy hijacks the CONNECT connection, so the
+  //   access log records nothing for a live tunnel and there is no per-key byte
+  //   signal anywhere. Earlier (v1.5.1) we spread the server total evenly across
+  //   users — that was MISLEADING (it invented per-user numbers). We now report
+  //   Naive ONLY as an accurate server-wide total, and keep Mieru per-key.
+  let naiveServerTotalMB = 0;
+  try { naiveServerTotalMB = readNaiveTotalMB(); } catch { naiveServerTotalMB = 0; }
+
+  const allUsers = getAllUsers();
+
+  const users = allUsers.map(u => {
     const s = live.find(x => x.username === u.username) || {};
     const n = naive[u.username] || {};
     const mieruUp   = s.uploadMB   || 0;
     const mieruDown = s.downloadMB || 0;
+    // Per-user Naive = only what the access log actually attributed (rare plain
+    //   HTTP requests). CONNECT tunnels are never logged → this is usually 0.
+    //   The real Naive figure is server-wide (naiveServerTotalMB), shown apart.
     const naiveUp   = n.uploadMB   || 0;
     const naiveDown = n.downloadMB || 0;
     const uploadMB   = mieruUp   + naiveUp;
@@ -2248,18 +2668,49 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
       username:   u.username,
       email:      u.email,
       expiry:     u.expiry,
-      protocols:  JSON.parse(u.protocols || '[]'),
+      // BUG-160: never let a single malformed protocols blob 500 the whole
+      //   stats endpoint (which would zero EVERY user's counters).
+      protocols:  (() => { try { return JSON.parse(u.protocols || '[]'); } catch { return []; } })(),
       quotaMB:    u.quotaMB,
       usedMB,
       uploadMB,
       downloadMB,
+      // BUG-163: per-user Naive is only the (rare) logged HTTP bytes — usually
+      //   0. The real Naive number is server-wide (see naiveServerTotalMB).
       naiveMB:    naiveUp + naiveDown,
       mieruMB:    mieruUp + mieruDown,
       lastSeen
     };
   });
-  res.json(users);
+  // BUG-163: return an object so the UI can show the honest server-wide Naive
+  //   total separately from the per-key Mieru figures. `users` keeps the same
+  //   shape; `naiveServerTotalMB` is the kernel-measured caddy-naive total.
+  res.json({
+    users,
+    naiveServerTotalMB,
+    naivePerUser: false,   // explicit: Naive cannot be broken down per key
+  });
 });
+
+// BUG-160: read the kernel-measured server-wide NaiveProxy traffic from
+//   systemd IPAccounting on caddy-naive.service. Returns total MB (in+out), or
+//   0 if accounting is unavailable. This is the only reliable Naive figure
+//   because forward_proxy hijacks CONNECT tunnels (never logged).
+function readNaiveTotalMB() {
+  let out = '';
+  try {
+    out = execSync(
+      'systemctl show caddy-naive -p IPIngressBytes -p IPEgressBytes 2>/dev/null',
+      { timeout: 5000 }
+    ).toString();
+  } catch { return 0; }
+  let bytes = 0;
+  for (const line of out.split('\n')) {
+    const m = line.match(/^IP(?:Ingress|Egress)Bytes=(\d+)$/);
+    if (m) bytes += Number(m[1]) || 0;
+  }
+  return bytes / 1048576;
+}
 
 // Bug 78: parse the `mita get users` table.
 //   User  LastActive            1DayDownload  1DayUpload  30DaysDownload  30DaysUpload
@@ -2324,15 +2775,16 @@ function toMB(v, unit) {
 // the Mieru figure for users that have both protocols.
 //
 // Returns: { username: { uploadMB, downloadMB, usedMB, lastSeen } }
-function parseCaddyTraffic(logPath) {
-  const out = {};
-  const file = logPath || LOG_CADDY;
+// Read one Caddy access-log file (capped tail) and fold its per-user byte
+// counters into `out`. Returns nothing; mutates `out`.
+function foldCaddyLogFile(file, out) {
   let raw;
   try {
-    if (!fs.existsSync(file)) return out;
+    if (!fs.existsSync(file)) return;
     // Cap how much we read so a large log never blocks the event loop /
     // exhausts memory. 32 MiB tail is plenty for a 50mb-rolled file.
     const stat = fs.statSync(file);
+    if (stat.size === 0) return;
     const MAX = 32 * 1024 * 1024;
     if (stat.size > MAX) {
       const fd = fs.openSync(file, 'r');
@@ -2346,7 +2798,7 @@ function parseCaddyTraffic(logPath) {
     } else {
       raw = fs.readFileSync(file, 'utf8');
     }
-  } catch { return out; }
+  } catch { return; }
 
   for (const line of raw.split('\n')) {
     const s = line.trim();
@@ -2365,6 +2817,35 @@ function parseCaddyTraffic(logPath) {
     out[user].downloadB += down;
     if (typeof ts === 'number' && ts > out[user].lastTs) out[user].lastTs = ts;
   }
+}
+
+// Traffic accounting: survive log rotation. Caddy rolls the access log to a
+// sibling file in the same directory named like `access-2025-06-22T01-02-03.000.log`
+// (older ones may be gzipped to `.log.gz`). The previous parser only read the
+// single current file, so every roll silently reset Naive usage to 0. We now
+// sum the current log PLUS all plain (un-gzipped) rolled siblings, so the figure
+// is stable across rotations. (.gz files are skipped to avoid blocking the event
+// loop on decompression — a best-effort, same character as mita's window.)
+function parseCaddyTraffic(logPath) {
+  const out = {};
+  const file = logPath || LOG_CADDY;
+
+  // 1) the current (live) access log
+  foldCaddyLogFile(file, out);
+
+  // 2) rolled siblings in the same directory: `<base>-<ts>.log`
+  try {
+    const dir  = path.dirname(file);
+    const base = path.basename(file).replace(/\.log$/i, '');
+    const rollRe = new RegExp('^' + base.replace(/[.*+?^${}()|[\]\\]/g, '\\$&') + '-.*\\.log$', 'i');
+    if (fs.existsSync(dir)) {
+      for (const name of fs.readdirSync(dir)) {
+        if (name === path.basename(file)) continue;   // already counted
+        if (!rollRe.test(name)) continue;             // not a rolled sibling
+        foldCaddyLogFile(path.join(dir, name), out);
+      }
+    }
+  } catch { /* best-effort: rolled files are a bonus, never fatal */ }
 
   const result = {};
   for (const [user, v] of Object.entries(out)) {

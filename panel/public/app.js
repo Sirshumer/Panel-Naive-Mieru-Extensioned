@@ -1,5 +1,5 @@
 /**
- * Panel Naive + Mieru — Frontend Application v1.4.8
+ * Panel Naive + Mieru — Frontend Application v1.5.0
  * Bug 1 fix: ALL inline event handlers removed; wired via delegated addEventListener
  * Bug 10 fix: 401 auto-redirect to login; toast on every API error
  * v1.2.5: probe-secret setting, disabled-button+spinner on all submit handlers,
@@ -281,6 +281,9 @@ function handleDelegatedClick(e) {
     case 'change-cascade':       changeCascade(); break;
     case 'cascade-status':       checkCascadeStatus(); break;
     case 'reset-cascade':        resetCascade(); break;
+    case 'apply-warp':           applyWarp(); break;
+    case 'warp-status':          checkWarpStatus(); break;
+    case 'reset-warp':           resetWarp(); break;
     // ── v1.4.0: external panel access
     case 'gen-web-base-path':    generateWebBasePath(); break;
     case 'save-external-access': saveExternalAccess(); break;
@@ -515,15 +518,42 @@ async function loadDashboard() {
 
 async function loadUsers() {
   const tbody = el('users-tbody');
-  tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${t('users.loading')}</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="11" class="table-empty">${t('users.loading')}</td></tr>`;
   try {
-    state.users = await api('GET', '/api/users');
+    // BUG-163/165: the Users table showed 0 in «Naive (МБ)»/«Mieru (МБ)» because
+    //   /api/users carries NO traffic fields — the per-key figures live in
+    //   /api/stats/users. Fetch both and merge the per-key numbers in.
+    const [users, stats] = await Promise.all([
+      api('GET', '/api/users'),
+      api('GET', '/api/stats/users').catch(() => ({ users: [] })),
+    ]);
+    // Support both the new {users,…} object and a legacy bare array.
+    const statRows = Array.isArray(stats) ? stats : (stats.users || []);
+    const byName = {};
+    statRows.forEach(s => { byName[s.username] = s; });
+    state.users = users.map(u => {
+      const s = byName[u.username] || {};
+      return Object.assign({}, u, {
+        naiveMB: s.naiveMB != null ? s.naiveMB : 0,
+        mieruMB: s.mieruMB != null ? s.mieruMB : 0,
+      });
+    });
+    removeNaiveServerBanner();   // BUG-165: drop any stale server-wide banner
     renderUsersTable(state.users);
     // Доработка 2: re-evaluate the foolproof gates whenever the key list changes.
     applyFoolproofGates(state.users.length);
   } catch (err) {
     tbody.innerHTML = `<tr><td colspan="10" class="table-empty" style="color:var(--red)">${esc(err.message)}</td></tr>`;
   }
+}
+
+// BUG-165: the «Naive (сервер, суммарно)» banner was removed. In v1.5.2+ Naive
+//   traffic is shown PER KEY in the Users table, so the server-wide banner was
+//   both incorrect and confusing. We also remove any banner left in the DOM by a
+//   previously-loaded (cached) build.
+function removeNaiveServerBanner() {
+  const host = el('naive-server-total');
+  if (host && host.parentNode) host.parentNode.removeChild(host);
 }
 
 // Доработка 2 (защита от дурака): most service crashes happen because operators
@@ -582,7 +612,7 @@ async function applyFoolproofGates(count) {
 function renderUsersTable(users) {
   const tbody = el('users-tbody');
   if (!users.length) {
-    tbody.innerHTML = `<tr><td colspan="10" class="table-empty">${t('users.noUsers')}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="11" class="table-empty">${t('users.noUsers')}</td></tr>`;
     return;
   }
   tbody.innerHTML = users.map(u => {
@@ -608,7 +638,8 @@ function renderUsersTable(users) {
       <td>${expBadge}</td>
       <td>${hasNaive ? '<span class="badge badge-blue">✓</span>' : '<span class="badge badge-gray">—</span>'}</td>
       <td>${hasMieru ? '<span class="badge badge-blue">✓</span>' : '<span class="badge badge-gray">—</span>'}</td>
-      <td>${fmtNum(u.usedMB)}</td>
+      <td>${fmtNum(u.naiveMB != null ? u.naiveMB : 0)}</td>
+      <td>${fmtNum(u.mieruMB != null ? u.mieruMB : 0)}</td>
       <td>${u.quotaMB > 0 ? fmtNum(u.quotaMB) : '∞'}</td>
       <td>${quotaStr}</td>
       <td>${fmtLastSeen(u.lastSeen)}</td>
@@ -902,6 +933,23 @@ async function loadSettings() {
     const casc = cfg.cascadeMieru || {};
     const cascadeEnabledEl = el('s-cascade-enabled');
     if (cascadeEnabledEl) cascadeEnabledEl.checked = cfg.cascadeEnabled === true;
+    // WARP egress (mutually exclusive with cascade)
+    const warpEl = el('s-warp-enabled');
+    if (warpEl) warpEl.checked = cfg.warpEnabled === true;
+    const warpPersistEl = el('s-warp-persist');
+    if (warpPersistEl) warpPersistEl.checked = cfg.warpPersist === true;
+    refreshWarpUiState(cfg.cascadeEnabled === true);
+    try {
+      const w = await api('GET', '/api/settings/warp');
+      const lr = el('warp-lowram');
+      if (lr) {
+        if (w && w.lowRam && w.lowRamWarning) { lr.textContent = '⚠ ' + w.lowRamWarning; lr.classList.remove('hidden'); }
+        else lr.classList.add('hidden');
+      }
+      // BUG-162: reflect the real persist (autostart) state from the server.
+      if (warpPersistEl && w && typeof w.warpPersist === 'boolean') warpPersistEl.checked = w.warpPersist;
+      refreshWarpUiState(!!(w && w.cascadeEnabled));
+    } catch {}
     const cascadeNaiveEl = el('s-cascade-naive-upstream');
     if (cascadeNaiveEl) cascadeNaiveEl.value = cfg.cascadeNaiveUpstream || '';
     const cascadeMieruHostEl = el('s-cascade-mieru-host');
@@ -1324,6 +1372,113 @@ async function resetCascade() {
   }
 }
 
+// ── WARP egress (mutually exclusive with cascade) ────────────────────────────
+function refreshWarpUiState(cascadeOn) {
+  const lock = el('warp-cascade-lock');
+  const warpEl = el('s-warp-enabled');
+  const applyBtn = el('btn-apply-warp');
+  if (cascadeOn) {
+    if (lock) lock.classList.remove('hidden');
+    if (warpEl) { warpEl.checked = false; warpEl.disabled = true; }
+    if (applyBtn) applyBtn.disabled = true;
+  } else {
+    if (lock) lock.classList.add('hidden');
+    if (warpEl) warpEl.disabled = false;
+    if (applyBtn) applyBtn.disabled = false;
+  }
+}
+
+async function applyWarp() {
+  const enabled = el('s-warp-enabled')?.checked || false;
+  const btn = el('btn-apply-warp');
+
+  // BUG-162: autostart is opt-in. When enabling WARP, explicitly ask whether to
+  //   persist across reboots — and warn that a bad tunnel could otherwise lock
+  //   the box on every boot. Default answer = NO (do not persist).
+  let persist = false;
+  if (enabled) {
+    const persistEl = el('s-warp-persist');
+    if (persistEl) {
+      persist = !!persistEl.checked;
+    } else {
+      persist = window.confirm(
+        'Добавить WARP в автозагрузку (поднимать после перезагрузки)?\n\n' +
+        'ОК — да, прописать в автозапуск.\n' +
+        'Отмена — нет (безопаснее: после ребута WARP не поднимется автоматически, ' +
+        'доступ к серверу гарантированно сохранится).'
+      );
+    }
+  }
+
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('POST', '/api/settings/warp', { warpEnabled: enabled, persist });
+    if (state.config) {
+      // BUG-168: trust the server's (possibly rolled-back) state, not the toggle.
+      state.config.warpEnabled = res.warpEnabled === true;
+      if (res.cascadeDisabled) state.config.cascadeEnabled = false;
+    }
+    // If WARP rolled back (provider block), reflect it in the toggle so the UI
+    //   doesn't pretend WARP is on.
+    if (res.rolledBack) {
+      const we = el('s-warp-enabled'); if (we) we.checked = false;
+    }
+    if (res.cascadeDisabled) {
+      const ce = el('s-cascade-enabled'); if (ce) ce.checked = false;
+    }
+    // BUG-168: prefer the classified result {severity, message}. severity maps
+    //   to green (success) / yellow (warning — provider block, NOT a panel error).
+    const wr = res.warpResult || {};
+    const severity = wr.severity || (res.ok !== false ? 'success' : 'error');
+    const message  = wr.message || res.message || 'WARP применён';
+    showMsg('warp-msg', message, severity);
+    // Toast: success = green; provider-block warnings are informational, not errors.
+    if (severity === 'success') toast('WARP применён', 'success');
+    else if (severity === 'warning') toast('WARP: ограничение хостинга (всё откачено, доступ сохранён)', 'info');
+    else toast('WARP: ошибка', 'error');
+    if (res.output) { const pre = el('warp-status'); if (pre) { pre.textContent = res.output; pre.classList.remove('hidden'); } }
+    if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
+  } catch (err) {
+    showMsg('warp-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+async function checkWarpStatus() {
+  const btn = document.querySelector('[data-action="warp-status"]');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('GET', '/api/settings/warp/status');
+    const pre = el('warp-status');
+    if (pre) { pre.textContent = res.output || '(нет данных)'; pre.classList.remove('hidden'); }
+  } catch (err) {
+    showMsg('warp-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+async function resetWarp() {
+  if (!confirm('Полностью снять WARP и вернуть родной IP сервера?')) return;
+  const btn = el('btn-reset-warp');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('POST', '/api/settings/warp/reset', {});
+    if (state.config) state.config.warpEnabled = false;
+    const warpEl = el('s-warp-enabled'); if (warpEl) warpEl.checked = false;
+    const egress = res.nativeEgress ? ` (egress: ${res.nativeEgress})` : '';
+    showMsg('warp-msg', (res.message || 'WARP снят') + egress, true);
+    toast('WARP снят', 'success');
+    if (res.output) { const pre = el('warp-status'); if (pre) { pre.textContent = res.output; pre.classList.remove('hidden'); } }
+    if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
+  } catch (err) {
+    showMsg('warp-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
 async function changeLanguage() {
   const sel = el('s-language-select');
   if (!sel) return;
@@ -1364,6 +1519,9 @@ async function refreshStats() {
 
 function renderTrafficTable(stats) {
   const tbody = el('traffic-tbody');
+  // BUG-163: /api/stats/users now returns { users, naiveServerTotalMB }. Accept
+  //   both the new object shape and the legacy bare array.
+  if (!Array.isArray(stats)) stats = (stats && stats.users) || [];
   if (!stats.length) {
     tbody.innerHTML = `<tr><td colspan="8" class="table-empty">${t('monitoring.noUsers')}</td></tr>`;
     return;
@@ -1624,13 +1782,23 @@ function setProgress(id, pct) {
   el2.classList.toggle('danger', p > 85);
 }
 
+// BUG-168: `ok` may be a boolean (legacy ok/err) OR a severity string
+//   ('success' | 'warning' | 'error'). A 'warning' renders yellow and stays
+//   longer (the WARP provider-block explanation is long and important).
 function showMsg(id, text, ok) {
   const el2 = document.getElementById(id);
   if (!el2) return;
+  let cls, ttl = 6000;
+  if (ok === 'warning' || ok === 'warn') { cls = 'warn'; ttl = 16000; }
+  else if (ok === 'success' || ok === true) { cls = 'ok'; }
+  else if (ok === 'error' || ok === false) { cls = 'err'; }
+  else { cls = ok ? 'ok' : 'err'; }
   el2.textContent = text;
-  el2.className = `msg-inline ${ok ? 'ok' : 'err'}`;
+  el2.className = `msg-inline ${cls}`;
   el2.classList.remove('hidden');
-  setTimeout(() => el2.classList.add('hidden'), 6000);
+  // Allow long, persistent warnings to be dismissed manually; auto-hide others.
+  if (el2._hideTimer) clearTimeout(el2._hideTimer);
+  el2._hideTimer = setTimeout(() => el2.classList.add('hidden'), ttl);
 }
 
 function fmtDate(iso) {
