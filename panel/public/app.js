@@ -204,6 +204,12 @@ document.addEventListener('DOMContentLoaded', async () => {
     loadLogs(currentLogService);
   });
 
+  // ── v1.6.0: hidden backup file input → import handler ─────────
+  document.getElementById('backup-file-input')?.addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    if (f) backupImportFile(f);
+  });
+
   // ── Login form ────────────────────────────────────────────────
   document.getElementById('login-form').addEventListener('submit', handleLogin);
 
@@ -291,6 +297,9 @@ function handleDelegatedClick(e) {
     case 'toggle-external-fields': toggleExternalFields(); break;
     case 'load-panel-stub':      loadPanelStub(); break;
     case 'save-panel-stub':      savePanelStub(); break;
+    // ── v1.6.0: backup / restore
+    case 'backup-export':        backupExport(); break;
+    case 'backup-import-pick':   el('backup-file-input').click(); break;
 
     // ── Monitoring
     case 'refresh-stats':    refreshStats(); break;
@@ -1118,6 +1127,82 @@ async function savePanelStub() {
     showMsg('panel-stub-msg', err.message, false);
   } finally {
     if (btn) btn.disabled = false;
+  }
+}
+
+// ── v1.6.0: Backup export / import ───────────────────────────────────────────
+// Export: privileged download of the full backup JSON (users incl. passwords +
+// full config). Uses fetch (not api()) so we can stream the blob download.
+async function backupExport() {
+  const btn = document.querySelector('[data-action="backup-export"]');
+  if (btn) btn.disabled = true;
+  try {
+    const res = await fetch(apiUrl('/api/backup/export'), { credentials: 'include' });
+    if (res.status === 401) { redirectToLogin(); return; }
+    if (!res.ok) throw new Error(await res.text());
+    const blob = await res.blob();
+    const cd   = res.headers.get('Content-Disposition') || '';
+    const fn   = cd.match(/filename="(.+)"/)?.[1] || 'rixxx-backup.json';
+    downloadBlob(blob, fn);
+    toast(t('settings.backupExported') || 'Backup downloaded', 'success');
+  } catch (err) {
+    toast(err.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+  }
+}
+
+// Import: triggered when the hidden file input receives a file. Reads + parses
+// the JSON locally, previews a summary, then asks for the domain mode + a final
+// confirm before POSTing to the server (which restores + rebuilds + restarts).
+async function backupImportFile(file) {
+  if (!file) return;
+  const statusEl = el('backup-import-msg');
+  const show = (m, ok) => { if (statusEl) showMsg('backup-import-msg', m, ok); };
+  let backup;
+  try {
+    const text = await file.text();
+    backup = JSON.parse(text);
+  } catch {
+    show(t('settings.backupBadFile') || 'Not a valid backup file (JSON parse failed)', false);
+    return;
+  }
+  if (!backup || backup.format !== 'rixxx-panel-backup') {
+    show(t('settings.backupBadFile') || 'Not a RIXXX panel backup file', false);
+    return;
+  }
+  const nUsers = Array.isArray(backup.users) ? backup.users.length : 0;
+  const bDomain = (backup.config && backup.config.domain) || '—';
+
+  // Ask which domain to use. OK = keep backup domain (same-DNS move, clients
+  // unaffected); Cancel = keep current server's domain (clients need new keys).
+  const useBackupDomain = confirm(
+    (t('settings.backupDomainPrompt') ||
+      'Restore {n} user(s) from backup.\n\nKeep the DOMAIN/ports FROM THE BACKUP ("{d}")?\n\n• OK = keep backup domain (same DNS → existing client keys keep working)\n• Cancel = keep THIS server\'s current domain (clients must download new keys)')
+      .replace('{n}', nUsers).replace('{d}', bDomain)
+  );
+  const domainMode = useBackupDomain ? 'backup' : 'current';
+
+  if (!confirm(t('settings.backupImportConfirm') ||
+      'This will OVERWRITE the current users and settings with the backup. Continue?')) return;
+
+  const btn = document.querySelector('[data-action="backup-import-pick"]');
+  if (btn) btn.disabled = true;
+  show(t('settings.backupImporting') || 'Restoring…', true);
+  try {
+    const r = await api('POST', '/api/backup/import', { backup, domainMode });
+    show((r.message || 'Restore complete') +
+      (r.servicesReloaded ? '' : ' ⚠ services may need a manual restart'), true);
+    toast((t('settings.backupImported') || 'Backup restored') + ` (${r.restoredUsers})`, 'success');
+    // Reflect restored state everywhere.
+    setTimeout(() => location.reload(), 1500);
+  } catch (err) {
+    show(err.message, false);
+    toast(err.message, 'error');
+  } finally {
+    if (btn) btn.disabled = false;
+    const input = el('backup-file-input');
+    if (input) input.value = '';   // allow re-picking the same file
   }
 }
 

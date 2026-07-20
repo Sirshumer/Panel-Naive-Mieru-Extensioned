@@ -93,7 +93,7 @@ try {
     // BUG-162: boot-persistence is OFF by default. Only set true when the
     //   operator explicitly confirms autostart (protects against reboot lock-out).
     warpPersist: false,
-    language: 'ru', version: '1.5.9'
+    language: 'ru', version: '1.6.0'
   };
 }
 
@@ -104,7 +104,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.5.9';
+const VERSION_FALLBACK = '1.6.0';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -1263,7 +1263,10 @@ app.use(helmet({
 app.use(morgan('combined', {
   stream: { write: m => { try { fs.appendFileSync(LOG_PANEL, m); } catch {} } }
 }));
-app.use(express.json());
+// v1.6.0: backup import can be a large JSON (many users + full config), so lift
+// the default 100kb body cap to 25mb. All other endpoints send tiny bodies, so
+// this only matters for POST /api/backup/import.
+app.use(express.json({ limit: '25mb' }));
 app.use(express.urlencoded({ extended: false }));
 
 // Session
@@ -1382,6 +1385,160 @@ app.post('/api/config/password', requireAuth, (req, res) => {
   cfg.adminPassHash = bcrypt.hashSync(newPass, 12);
   saveConfig();
   res.json({ ok: true });
+});
+
+// ── v1.6.0: Backup (export) / Restore (import) ───────────────────────────────
+// Disaster-recovery: export EVERYTHING needed to bring a fresh server back to
+// the exact same state — all users (INCLUDING plaintext passwords + bcrypt
+// hashes, which are what regenerate the SAME working keys) and the full panel
+// config (domains, ports, protocols, cascade/WARP, admin credentials).
+//
+// Why plaintext passwords are in the backup: a NaiveProxy/Mieru key is
+// `…://<user>:<pass>@…`. To make an existing client keep working after a
+// server move, the restored server MUST reissue the identical user/pass. The
+// bcrypt `passHash` alone cannot reproduce the plaintext, so we carry both.
+// The file is therefore SECRET — the UI warns the operator to store it safely.
+//
+// Restore is idempotent and non-destructive to the mechanism: it upserts users
+// by id, writes the config, then rebuilds the Caddyfile + mita config and
+// restarts the services — the very same code path used by every normal
+// add/delete, so nothing bespoke can drift.
+const BACKUP_FORMAT = 'rixxx-panel-backup';
+const BACKUP_SCHEMA = 1;
+
+app.get('/api/backup/export', requireAuth, (req, res) => {
+  try {
+    const users = getAllUsers().map(u => ({
+      id:        u.id,
+      email:     u.email || null,
+      username:  u.username,
+      passHash:  u.passHash,
+      password:  u.password || '',
+      expiry:    u.expiry || null,
+      protocols: u.protocols || '["naive","mieru"]',
+      quotaMB:   u.quotaMB || 0,
+      usedMB:    u.usedMB || 0,
+      createdAt: u.createdAt,
+      updatedAt: u.updatedAt,
+      lastSeen:  u.lastSeen || null
+    }));
+
+    // Full config incl. admin credentials — this is a privileged, auth-gated
+    // download (never exposed via /api/config, which masks secrets).
+    const backup = {
+      format:    BACKUP_FORMAT,
+      schema:    BACKUP_SCHEMA,
+      version:   readPanelVersion(),
+      exportedAt: new Date().toISOString(),
+      config:    cfg,
+      users
+    };
+
+    const domainTag = (cfg.domain || 'server').replace(/[^A-Za-z0-9._-]/g, '_');
+    const dateTag   = new Date().toISOString().slice(0, 10);
+    const filename  = `rixxx-backup-${domainTag}-${dateTag}.json`;
+    res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
+    res.setHeader('Content-Type', 'application/json');
+    res.json(backup);
+  } catch (e) {
+    console.error('[BACKUP] export failed:', e && e.message);
+    res.status(500).json({ error: 'Backup export failed: ' + (e && e.message) });
+  }
+});
+
+// Import/restore. Body: { backup: <parsed backup object>, domainMode: 'backup'|'current' }
+//   domainMode 'backup'  → keep domains/IP/ports from the backup (same-DNS move; clients unaffected)
+//   domainMode 'current' → keep THIS server's current domain/IP/ports (new DNS; clients need new keys)
+app.post('/api/backup/import', requireAuth, (req, res) => {
+  const backup     = req.body && req.body.backup;
+  const domainMode = (req.body && req.body.domainMode) === 'current' ? 'current' : 'backup';
+
+  // ── Validate shape before touching anything ────────────────────────────────
+  if (!backup || typeof backup !== 'object')
+    return res.status(400).json({ error: 'No backup payload provided' });
+  if (backup.format !== BACKUP_FORMAT)
+    return res.status(400).json({ error: 'Not a RIXXX panel backup file (bad format tag)' });
+  if (!Number.isInteger(backup.schema) || backup.schema > BACKUP_SCHEMA)
+    return res.status(400).json({ error: `Unsupported backup schema (${backup.schema}); this panel supports up to ${BACKUP_SCHEMA}` });
+  if (!backup.config || typeof backup.config !== 'object')
+    return res.status(400).json({ error: 'Backup is missing its config section' });
+  if (!Array.isArray(backup.users))
+    return res.status(400).json({ error: 'Backup is missing its users list' });
+
+  // Per-user validation — reject a malformed file rather than half-import it.
+  for (const u of backup.users) {
+    if (!u || typeof u !== 'object' || !u.id || !u.username || !u.passHash)
+      return res.status(400).json({ error: 'Backup contains a malformed user record (need id, username, passHash)' });
+  }
+
+  try {
+    // ── 1) Restore config, honouring the chosen domain mode ──────────────────
+    // Keys that describe THIS box's network identity. In 'current' mode we keep
+    // the live values so we don't point the restored server at the wrong host.
+    const NETWORK_KEYS = ['domain', 'serverIp', 'naivePort', 'mieruPortStart', 'mieruPortEnd'];
+    const incoming = { ...backup.config };
+
+    if (domainMode === 'current') {
+      for (const k of NETWORK_KEYS) {
+        if (cfg[k] !== undefined) incoming[k] = cfg[k];
+      }
+    }
+    // Never let a backup silently downgrade/overwrite the recorded version tag
+    // (the live version comes from readPanelVersion() anyway).
+    incoming.version = cfg.version || incoming.version;
+
+    // Preserve local runtime paths (dbPath/caddyBin/…) from the CURRENT server —
+    // a backup from another box may have different absolute paths.
+    const PATH_KEYS = ['dbPath', 'caddyBin', 'caddyFile', 'caddyConfigDir',
+                       'fakeSiteDir', 'mitaStateFile'];
+    for (const k of PATH_KEYS) {
+      if (cfg[k] !== undefined) incoming[k] = cfg[k];
+    }
+
+    cfg = incoming;
+    saveConfig();
+
+    // ── 2) Restore users (upsert by id — idempotent) ─────────────────────────
+    let restored = 0;
+    for (const u of backup.users) {
+      upsertUser({
+        id:        u.id,
+        email:     u.email || null,
+        username:  u.username,
+        passHash:  u.passHash,
+        password:  u.password || '',
+        expiry:    u.expiry || null,
+        protocols: u.protocols || '["naive","mieru"]',
+        quotaMB:   u.quotaMB || 0,
+        usedMB:    u.usedMB || 0,
+        createdAt: u.createdAt || new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        lastSeen:  u.lastSeen || null
+      });
+      restored++;
+    }
+
+    // ── 3) Rebuild real configs + restart services (same path as add/delete) ──
+    const apply = applyAllConfigs();
+
+    res.json({
+      ok: true,
+      restoredUsers: restored,
+      domainMode,
+      domain: cfg.domain,
+      servicesReloaded: apply.servicesReloaded,
+      caddyOk: apply.caddyOk,
+      mitaOk:  apply.mitaOk,
+      caddyError: apply.caddyError || undefined,
+      message: `Restored ${restored} user(s). ` +
+        (domainMode === 'backup'
+          ? 'Domains/ports taken from the backup — existing client keys keep working if DNS points here.'
+          : 'Kept this server\'s current domains/ports — clients must download fresh keys.')
+    });
+  } catch (e) {
+    console.error('[BACKUP] import failed:', e && e.message);
+    res.status(500).json({ error: 'Backup import failed: ' + (e && e.message) });
+  }
 });
 
 // ── v1.4.0: external panel access (domain + TLS + basic auth + webBasePath) ───
