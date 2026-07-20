@@ -1038,6 +1038,46 @@ migrate_warp_safety() {
   [[ "$changed" == "1" ]] && systemctl daemon-reload 2>/dev/null || true
 }
 
+# ── BUG-172 migration: refresh the Mieru-cascade watchdog on existing installs ─
+#   The pre-1.5.8 watchdog probed mieru-client's SOCKS5 (:1080) DIRECTLY, so a
+#   redsocks event-loop deadlock (process alive, port open, no events serviced)
+#   went undetected and clients silently timed out after 2-5 days. If a cascade
+#   is currently enabled, re-run the orchestrator's watchdog installer so the box
+#   gets the new full-chain probe (as the mita user) + nightly redsocks recycle
+#   WITHOUT touching the live tunnel/iptables. Idempotent and safe on -y.
+migrate_cascade_watchdog() {
+  # Gate strictly on Variant-B actually being DEPLOYED on this box, not merely on
+  # cascadeEnabled (which is also true for Variant-A native egress). The state
+  # file /var/lib/rixxx-panel/cascade-mieru.state is written ONLY by
+  # `cascade_mieru.sh setup`, and the old watchdog binary is only present after a
+  # Variant-B setup — either is proof the redsocks+mieru-client chain exists here.
+  # This guarantees we never install a chain-probing watchdog on a host that
+  # doesn't run the chain (which could spuriously restart unrelated services).
+  local state="/var/lib/rixxx-panel/cascade-mieru.state"
+  local wd="/usr/local/bin/mieru-watchdog.sh"
+  if [[ ! -f "$state" && ! -f "$wd" ]]; then
+    return 0
+  fi
+  local enabled
+  enabled=$(jq -r '.cascadeEnabled // false' "$PANEL_CONFIG" 2>/dev/null || echo false)
+  [[ "$enabled" != "true" ]] && return 0
+  $DRY_RUN && { log_dry "Would refresh the Mieru-cascade watchdog (BUG-172: full-chain probe + nightly recycle)"; return 0; }
+  local cs="${PANEL_DIR:-/opt/panel-naive-mieru}/panel/scripts/cascade_mieru.sh"
+  [[ -f "$cs" ]] || cs="$(dirname "$0")/panel/scripts/cascade_mieru.sh"
+  [[ -f "$cs" ]] || { log_warn "cascade script not found — skip watchdog refresh"; return 0; }
+  # Load ONLY the function definitions (strip the trailing `case "$ACTION"`
+  # dispatcher, which would otherwise `die` on an empty action), then re-install
+  # just the watchdog + cron. No tunnel/iptables side effects. Runs in a subshell
+  # so the sourced script's `set -euo pipefail` can't leak into the updater.
+  if ( set +eu +o pipefail 2>/dev/null
+       eval "$(sed '/^case "\$ACTION" in/,$d' "$cs")"
+       write_watchdog ) >/dev/null 2>&1; then
+    log_info "Cascade watchdog refreshed (BUG-172: full-chain probe + nightly recycle) ✓"
+  else
+    log_warn "Cascade watchdog refresh returned non-zero — re-toggle the cascade in the panel to update it"
+  fi
+}
+
 # ── Bug 79: fix caddy-naive config permissions ───────────────────────────────
 #   caddy-naive runs as User=caddy and fails to start with
 #     "reading config from file: open /etc/caddy-naive/Caddyfile: permission denied"
@@ -1814,6 +1854,10 @@ do_update() {
   #   operator regains native access. The new (safe) WARP is only re-enabled when
   #   the operator explicitly toggles it again in the panel.
   migrate_warp_safety
+
+  # BUG-172 migration: refresh the cascade watchdog (full-chain probe + nightly
+  # redsocks recycle) on any box that currently has the Mieru cascade enabled.
+  migrate_cascade_watchdog
 
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
 

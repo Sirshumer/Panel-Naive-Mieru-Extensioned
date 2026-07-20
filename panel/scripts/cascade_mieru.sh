@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # ==============================================================================
-# cascade_mieru.sh — Mieru cascade (Variant B) orchestrator  v1.2.6
+# cascade_mieru.sh — Mieru cascade (Variant B) orchestrator  v1.5.8
 #
 # Implements the proven "redsocks + iptables + mieru-client" relay chain so the
 # panel can enable/disable a mieru+mieru cascade entirely from the web UI.
@@ -25,7 +25,11 @@
 #   • redsocks is restarted together with mieru via ExecStartPost (else traffic
 #     stops flowing through the cascade after a mieru restart).
 #   • A RETURN rule for the EXIT node IP prevents an iptables routing loop.
-#   • Watchdog (cron, 3 consecutive failures) restarts mieru to self-heal.
+#   • BUG-172: watchdog probes the FULL chain AS the mita user (iptables →
+#     redsocks → mieru), so a redsocks event-loop deadlock (process alive, port
+#     open, but no events serviced) is detected; it then restarts the actual
+#     culprit (redsocks if only the chain is wedged, else mieru+redsocks). A
+#     nightly redsocks recycle (04:00) pre-empts long-uptime event-loop wedges.
 #   • Lazy install (A2): mieru-client + redsocks are installed on first setup.
 #
 # Idempotent: re-running setup re-applies cleanly. teardown leaves a clean host.
@@ -318,27 +322,81 @@ clear_iptables() {
   command -v netfilter-persistent &>/dev/null && netfilter-persistent save 2>/dev/null || true
 }
 
-# ── Watchdog (cron, 3 consecutive failures → restart mieru) ───────────────────
+# ── Watchdog (cron, 3 consecutive failures → self-heal) ───────────────────────
+# BUG-172 (CRITICAL, field-reported on v1.2.6): after 2-5 days of uptime clients
+#   suddenly time out while `mita`/`redsocks` still show `active (running)` and
+#   the panel stays up. Root cause: redsocks' libevent event-loop can dead-lock
+#   under long uptime / connection micro-storms — the process is alive and the
+#   :12345 port is still bound, but it stops processing socket events (an strace
+#   of the hung redsocks shows ZERO syscalls while a real client request sits
+#   there). The cascade data-plane is dead even though every unit is "healthy".
+#
+#   Why the OLD watchdog missed it: it probed `curl --socks5 127.0.0.1:1080`,
+#   which talks to mieru-client DIRECTLY and completely bypasses iptables AND
+#   redsocks. mieru-client is fine, so the probe succeeded, the watchdog decided
+#   "internet is up", and never restarted anything — while real client traffic
+#   (which DOES traverse iptables → redsocks → mieru) black-holed.
+#
+#   The fix: probe the WHOLE chain exactly as a real client does — generate the
+#   request AS the `mita` user so it is caught by the
+#   `OUTPUT -m owner --uid-owner <mita> -j REDSOCKS` rule and forced through
+#   iptables → redsocks → mieru. Then heal the ACTUAL culprit:
+#     • chain fails but raw SOCKS5 (mieru) still works → redsocks is the wedged
+#       component → restart redsocks (the common case: the libevent deadlock).
+#     • chain AND raw SOCKS5 both fail → mieru itself is down → restart mieru,
+#       then redsocks (redsocks must reconnect to a freshly-restarted mieru).
 write_watchdog() {
   cat > "$WATCHDOG_BIN" <<'WDEOF'
 #!/usr/bin/env bash
-# mieru cascade watchdog — restart mieru only after 3 consecutive failures.
+# mieru cascade watchdog (BUG-172) — probe the FULL chain as the mita user, so a
+# redsocks event-loop deadlock (process alive, port open, but not servicing
+# events) is actually detected. Self-heal the real culprit; act only after 3
+# consecutive failures to avoid flapping on a transient network blip.
+LOG=/var/log/cascade-watchdog.log
+PROBE_URL="https://api.ipify.org"
+
+# One end-to-end probe through iptables → redsocks → mieru, run AS mita.
+chain_ok() {
+  sudo -u mita curl -s --connect-timeout 5 --max-time 10 "$PROBE_URL" >/dev/null 2>&1
+}
+# Raw mieru-client SOCKS5 probe (bypasses iptables+redsocks) — used ONLY to tell
+# a redsocks deadlock apart from a dead mieru tunnel.
+socks_ok() {
+  curl -s --socks5 127.0.0.1:1080 --connect-timeout 5 --max-time 10 "$PROBE_URL" >/dev/null 2>&1
+}
+
 FAILS=0
 for i in 1 2 3; do
-  if curl -s --socks5 127.0.0.1:1080 --max-time 10 https://api.ipify.org >/dev/null 2>&1; then
-    exit 0
-  fi
+  chain_ok && exit 0
   FAILS=$((FAILS+1))
   sleep 5
 done
-[ "$FAILS" -eq 3 ] && systemctl restart mieru
+
+# 3 consecutive end-to-end failures → the cascade data-plane is down. Heal it.
+if socks_ok; then
+  # mieru tunnel is alive but the full chain is broken → redsocks is wedged
+  # (the classic libevent deadlock). Restarting redsocks alone clears it.
+  systemctl restart redsocks
+  echo "[$(date '+%F %T')] cascade watchdog: chain DOWN but SOCKS5 up → redsocks deadlock, restarted redsocks" >> "$LOG"
+else
+  # mieru tunnel itself is down → restart mieru, then redsocks so it re-dials
+  # the freshly-restarted SOCKS5 listener.
+  systemctl restart mieru
+  sleep 2
+  systemctl restart redsocks
+  echo "[$(date '+%F %T')] cascade watchdog: chain+SOCKS5 DOWN → restarted mieru + redsocks" >> "$LOG"
+fi
 WDEOF
   chmod +x "$WATCHDOG_BIN"
   cat > "$CRON_FILE" <<CRONEOF
-# Mieru cascade watchdog — every 5 minutes
+# Mieru cascade watchdog — probe the full chain every 5 minutes (BUG-172).
 */5 * * * * root $WATCHDOG_BIN >/dev/null 2>&1
+# Preventive daily redsocks recycle at 04:00 — redsocks is historically prone to
+# slow FD/memory leaks and event-loop wedges over 24/7 uptime; a nightly restart
+# keeps the event-loop fresh (mieru session survives; brief <1s cascade blip).
+0 4 * * * root systemctl restart redsocks >/dev/null 2>&1
 CRONEOF
-  log "watchdog + cron installed ✓"
+  log "watchdog + cron installed ✓ (full-chain probe + nightly redsocks recycle)"
 }
 
 remove_watchdog() {
