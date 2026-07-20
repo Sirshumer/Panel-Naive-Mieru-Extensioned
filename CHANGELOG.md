@@ -7,6 +7,77 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.8]
+
+> **BUG-172 (CRITICAL) — Mieru cascade silently dies after 2-5 days; watchdog
+> blind to it.** With the cascade (Variant B: `redsocks` + `iptables` +
+> `mieru-client`) enabled, everything works — then after 2-5 days of uptime
+> client devices suddenly time out, while `mita` **and** `redsocks` still report
+> `active (running)` and the web panel stays reachable. Only a manual
+> `systemctl restart redsocks` (or a full reinstall) fixes it.
+>
+> **Field diagnosis (thanks to the reporter's excellent write-up):**
+> - `curl -x socks5h://127.0.0.1:1080 https://api.ipify.org` → **OK** (mieru tunnel alive)
+> - `sudo -u mita curl https://api.ipify.org` → **hangs at TLS handshake, times out**
+> - `strace -p $(pidof redsocks)` while a request is pending → **zero syscalls**
+> - No FD leak (~22 open), no CLOSE-WAIT zombies, iptables `RETURN` rule correct.
+>
+> **Root cause:** redsocks' `libevent` event-loop **dead-locks** under long
+> uptime / connection micro-storms. The process is alive and `:12345` is still
+> bound, but it stops servicing socket events — so the cascade data-plane
+> (`iptables → redsocks → mieru`) is dead even though every unit is "healthy".
+>
+> **Why the old watchdog missed it:** `write_watchdog()` probed
+> `curl --socks5 127.0.0.1:1080`, which talks to **mieru-client directly** and
+> bypasses **both** iptables **and** redsocks. mieru was fine, so the probe
+> passed, the watchdog concluded "internet is up", and never restarted anything
+> — while real client traffic (which *does* traverse iptables → redsocks)
+> black-holed.
+
+### Fixed
+- **BUG-172 (CRITICAL): cascade watchdog now probes the WHOLE chain.**
+  `write_watchdog()` generates a watchdog that issues its health probe **as the
+  `mita` user** (`sudo -u mita curl … https://api.ipify.org`), so the
+  `iptables … OUTPUT -m owner --uid-owner <mita> -j REDSOCKS` rule forces it
+  through the full `iptables → redsocks → mieru` path — exactly like a real
+  client. A redsocks event-loop deadlock is therefore actually detected.
+- **Self-heal targets the ACTUAL culprit** (after 3 consecutive end-to-end
+  failures, to avoid flapping on a transient blip):
+  - chain fails **but** the raw SOCKS5 (`:1080`) probe still works → redsocks is
+    the wedged component → **restart `redsocks`** (the common deadlock case).
+  - chain **and** SOCKS5 both fail → the mieru tunnel itself is down → **restart
+    `mieru`, then `redsocks`** (so redsocks re-dials the fresh SOCKS5 listener).
+  Healing actions are logged to `/var/log/cascade-watchdog.log`.
+
+### Added
+- **Preventive nightly redsocks recycle.** The cron now also runs
+  `0 4 * * * root systemctl restart redsocks` — redsocks is historically prone
+  to slow FD/memory leaks and event-loop wedges over 24/7 uptime, so a nightly
+  restart keeps the loop fresh (the mieru session survives; brief <1 s blip).
+
+### Changed
+- **Safe in-place upgrade for existing cascades.** `update.sh` gains
+  `migrate_cascade_watchdog`, which re-deploys the corrected watchdog + cron on
+  boxes that already run the cascade — **without** touching the live
+  tunnel/iptables (it sources only the orchestrator's function definitions, with
+  the `case "$ACTION"` dispatcher stripped, and calls `write_watchdog` in a
+  guarded subshell). It runs **only** when Variant B is actually deployed here
+  (the `cascade-mieru.state` file or the existing watchdog binary is present)
+  **and** `cascadeEnabled=true`, so a Variant-A-only or cascade-off host is never
+  given a chain-probing watchdog. Idempotent and safe under `-y`.
+
+### Tests
+- `tests/bug172-cascade-watchdog.test.js` (18 assertions): the generated
+  watchdog is valid bash, probes the full chain **as `mita`** (not the bare
+  SOCKS5 shortcut that caused the blind spot), heals the correct component in
+  each state, restarts mieru **before** redsocks, logs its actions, and installs
+  both the 5-minute chain probe and the nightly recycle. Includes a **live**
+  run that shims `sudo`/`curl`/`systemctl` to simulate the three real states
+  (healthy → nothing restarted; redsocks deadlock → redsocks only; mieru down →
+  mieru + redsocks).
+
+---
+
 ## [v1.5.7]
 
 > **BUG-171 (CRITICAL) — WARP: client keys never establish (stuck in SYN-RECV).**

@@ -93,7 +93,7 @@ try {
     // BUG-162: boot-persistence is OFF by default. Only set true when the
     //   operator explicitly confirms autostart (protects against reboot lock-out).
     warpPersist: false,
-    language: 'ru', version: '1.5.7'
+    language: 'ru', version: '1.5.8'
   };
 }
 
@@ -104,7 +104,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.5.7';
+const VERSION_FALLBACK = '1.5.8';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
