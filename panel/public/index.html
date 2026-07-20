@@ -712,6 +712,32 @@
         </div>
       </div>
 
+      <!-- v1.6.0: Backup / Restore card -->
+      <div class="card mt-4" id="card-backup">
+        <div class="card-header" data-i18n="settings.backupTitle">Backup &amp; Restore</div>
+        <div class="card-body">
+          <p class="card-desc" data-i18n="settings.backupDesc">
+            Export a full backup (all users + all settings) to a single file, or restore it on a fresh server.
+            If the new server uses the same domain (just point DNS to it), existing client keys keep working with no changes.
+          </p>
+          <div class="warn-box" data-i18n="settings.backupWarn">
+            ⚠ The backup file contains user passwords in plain text. Store it somewhere safe and never share it.
+          </div>
+          <div class="btn-row mt-2">
+            <button class="btn btn-primary"   data-action="backup-export">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+              <span data-i18n="settings.backupExport">Download backup</span>
+            </button>
+            <button class="btn btn-secondary" data-action="backup-import-pick">
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" width="14" height="14"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"/><polyline points="17 8 12 3 7 8"/><line x1="12" y1="3" x2="12" y2="15"/></svg>
+              <span data-i18n="settings.backupImport">Restore from backup</span>
+            </button>
+            <input type="file" id="backup-file-input" accept="application/json,.json" style="display:none" />
+          </div>
+          <div id="backup-import-msg" class="msg-inline hidden"></div>
+        </div>
+      </div>
+
       <div class="card mt-4">
         <div class="card-header" data-i18n="settings.aboutTitle">About</div>
         <div class="card-body about-grid">

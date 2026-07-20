@@ -7,6 +7,46 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.6.0]
+
+> **FEATURE — Backup & Restore (one-file disaster recovery).** New card in
+> **Server Settings → Backup & Restore**. Requested for server migration: if a
+> server dies, the admin restores everything on a fresh box in a couple of
+> clicks and every existing client key keeps working (if the new server uses the
+> same domain — just repoint DNS).
+>
+> **Export** (`GET /api/backup/export`, auth-gated): downloads a single JSON
+> containing **all users** (including plaintext passwords **and** bcrypt hashes —
+> both are needed to reissue the *identical* `naive+https://` / `mierus://` keys)
+> and the **full panel config** (domains, ports, protocols, cascade/WARP, admin
+> credentials). Filename `rixxx-backup-<domain>-<date>.json`.
+>
+> **Restore** (`POST /api/backup/import`, auth-gated): validates the file
+> (format tag, schema, required sections, per-user records) *before* touching
+> anything, then upserts users and writes the config, and finally rebuilds the
+> Caddyfile + mita config and restarts the services — the **same code path** as
+> every normal add/delete, so nothing bespoke can drift.
+>   - **Domain mode** is chosen at import time:
+>     - *keep backup domain* → same-DNS move, existing client keys keep working;
+>     - *keep this server's domain* → new DNS, clients download fresh keys.
+>   - Local runtime paths (`dbPath`, `caddyBin`, …) are always taken from the
+>     live server, never the backup (a backup from another box may differ).
+>   - The live version tag is never downgraded by a backup.
+>
+> **UI:** "Download backup" + "Restore from backup" buttons, a plaintext-password
+> warning banner, and an inline status line. i18n EN + RU. The JSON body limit
+> was lifted to 25 MB so large user lists import cleanly.
+>
+> **Test:** `tests/feat-backup.test.js` (31 assertions) — structural checks
+> (endpoints, auth, validation, non-destructive rebuild path) plus a standalone
+> simulation of the export shape and the domain-mode merge.
+>
+> **Non-breaking:** purely additive. Existing add/delete/config flows and all
+> issued keys are untouched. Anyone who updates can immediately take a backup and
+> move to a new server.
+
+---
+
 ## [v1.5.9]
 
 > **FEATURE — Mieru share-link export (`mierus://`) for routers (Keenetic / OpenWRT).**
