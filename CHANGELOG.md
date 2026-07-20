@@ -7,6 +7,44 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.5.9]
+
+> **FEATURE — Mieru share-link export (`mierus://`) for routers (Keenetic / OpenWRT).**
+> Requested by a user: export a user's Mieru config not only as a sing-box JSON
+> file, but also as a single copy-paste **share link**, so it can be imported
+> directly on routers (Keenetic NDMS / OpenWRT) and by tools like
+> [awg-manager](https://github.com/hoaxisr/awg-manager).
+>
+> **Link format (canonical, round-trippable):**
+> ```
+> mierus://<user>:<pass>@<host>?profile=default&port=<p>&protocol=TCP
+> ```
+> - scheme `mierus` (the plain-text share form);
+> - `profile` always present (`default`);
+> - **each** `port` paired with its own `protocol` (canonical shape accepted by
+>   real router parsers — see awg-manager issue #516);
+> - host is the raw server IP; userinfo + query values are percent-encoded so
+>   unusual passwords stay valid.
+>
+> **Added — non-breaking (purely additive):**
+> - New endpoint `GET /api/users/:id/config/mieru-link` (auth-gated), returning
+>   `{ link, username }` exactly like the existing Naive-link endpoint. Supports
+>   `?port=<n>` (single, default) and `?range=1` (every port in the configured
+>   Mieru range, each paired with its protocol).
+> - New **"Mieru Link"** button in the config modal, next to "Mieru JSON". It
+>   reuses the shared link box + QR code and copies the link to the clipboard
+>   (same UX as "Naive Link").
+> - i18n: `config.mieruLink` / `config.mieruLinkCopied` in EN + RU.
+> - Test `tests/feat-mieru-link.test.js` (29 assertions) locking down the
+>   canonical format, per-port protocol pairing, percent-encoding, and that the
+>   existing Mieru JSON download is untouched.
+>
+> **Nothing existing changed** — the Mieru JSON download, Naive link, and
+> Universal config paths are all byte-for-byte the same. Safe for existing users;
+> `update.sh` needs no migration for this feature.
+
+---
+
 ## [v1.5.8]
 
 > **BUG-172 (CRITICAL) — Mieru cascade silently dies after 2-5 days; watchdog

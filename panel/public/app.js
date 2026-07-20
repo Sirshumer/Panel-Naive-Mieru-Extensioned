@@ -263,6 +263,7 @@ function handleDelegatedClick(e) {
     case 'open-config':      openConfigDownload(btn.dataset.id); break;
     case 'close-config-modal': closeConfigModal(); break;
     case 'dl-naive-link':    downloadNaiveLink(); break;
+    case 'dl-mieru-link':    downloadMieruLink(); break;
     case 'dl-mieru-config':  downloadMieruConfig(); break;
     case 'dl-universal-config': downloadUniversalConfig(); break;
 
@@ -840,6 +841,24 @@ async function downloadNaiveLink() {
     el('naive-link-box').classList.remove('hidden');
     copyToClipboard(data.link);
     toast(t('config.naiveCopied'), 'success');
+    generateQR(data.link);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+// Mieru share-link (mierus://) — copy-paste form for routers (Keenetic/OpenWRT).
+// Additive: reuses the shared link box + QR, exactly like the Naive link. The
+// existing Mieru JSON download is untouched.
+async function downloadMieruLink() {
+  try {
+    const q = mieruPortQuery();
+    if (q === null) return;              // invalid port — abort (toast already shown)
+    const data = await api('GET',
+      `/api/users/${state.selectedUserId}/config/mieru-link${q}`);
+
+    el('naive-link-box').textContent = data.link;
+    el('naive-link-box').classList.remove('hidden');
+    copyToClipboard(data.link);
+    toast(t('config.mieruLinkCopied'), 'success');
     generateQR(data.link);
   } catch (err) { toast(err.message, 'error'); }
 }

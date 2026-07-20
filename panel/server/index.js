@@ -93,7 +93,7 @@ try {
     // BUG-162: boot-persistence is OFF by default. Only set true when the
     //   operator explicitly confirms autostart (protects against reboot lock-out).
     warpPersist: false,
-    language: 'ru', version: '1.5.8'
+    language: 'ru', version: '1.5.9'
   };
 }
 
@@ -104,7 +104,7 @@ try {
 //   3. config.json's `version` field (synced by update.sh as a belt-and-braces)
 //   4. hard fallback constant
 // Returns a clean semver-ish string. Cheap (tiny file reads); fine per-request.
-const VERSION_FALLBACK = '1.5.8';
+const VERSION_FALLBACK = '1.5.9';
 function readPanelVersion() {
   // 1) /etc/rixxx-panel/version  → "panel_version=1.4.4"
   try {
@@ -2445,6 +2445,60 @@ app.get('/api/users/:id/config/mieru', requireAuth, (req, res) => {
   res.setHeader('Content-Disposition', `attachment; filename="${filename}"`);
   res.setHeader('Content-Type', 'application/json');
   res.json(singboxCfg);
+});
+
+// ── Mieru share-link (mierus://) — for routers (Keenetic / OpenWRT) ───────────
+// Feature request: export Mieru not only as a sing-box JSON file but as a single
+// copy-paste share link, like the Naive link. The canonical mieru share-link
+// (as consumed by e.g. hoaxisr/awg-manager and the reference mieru client) is:
+//
+//   mierus://<user>:<pass>@<host>?profile=<name>&port=<p>&protocol=<TCP|UDP>[&port=&protocol=…][&multiplexing=<LEVEL>]
+//
+// Round-trip rules that matter for real router parsers:
+//   • scheme is `mierus` (the plain-text share form; `mieru://` is base64 proto);
+//   • username AND password are both mandatory (userinfo);
+//   • `profile` is mandatory (we use "default");
+//   • EACH port gets its OWN paired `protocol` (awg-manager issue #516: a single
+//     `protocol` for several `port`s used to be rejected — pairing is the safe,
+//     canonical shape that imports back cleanly);
+//   • host is the raw server IP (mieru is IP-based, no SNI/TLS);
+//   • userinfo + query values are percent-encoded so odd passwords stay valid.
+function buildMierusLink({ username, password, host, ports, transport, multiplexing }) {
+  const enc = encodeURIComponent;
+  const userinfo = `${enc(username)}:${enc(password)}`;
+  const parts = [`profile=default`];
+  for (const p of ports) {
+    parts.push(`port=${enc(String(p))}`);
+    parts.push(`protocol=${enc(transport || 'TCP')}`);
+  }
+  if (multiplexing) parts.push(`multiplexing=${enc(multiplexing)}`);
+  return `mierus://${userinfo}@${host}?${parts.join('&')}`;
+}
+
+app.get('/api/users/:id/config/mieru-link', requireAuth, (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  const password = req.query.password || user.password || 'YOUR_PASSWORD';
+
+  const _ps = parseInt(cfg.mieruPortStart, 10) || 2000;
+  const _pe = parseInt(cfg.mieruPortEnd,   10) || 2010;
+  // Default: a single port (matches the JSON's server_port and the simple router
+  // form). ?range=1 emits every port in the configured range (mita listens on
+  // the whole range), each paired with its protocol — still canonical.
+  const wantRange = String(req.query.range || '') === '1';
+  const ports = wantRange
+    ? Array.from({ length: Math.max(0, _pe - _ps + 1) }, (_, i) => _ps + i)
+    : [pickMieruPort(req.query.port, _ps, _pe)];
+
+  const link = buildMierusLink({
+    username: user.username,
+    password,
+    host: cfg.serverIp || cfg.domain,
+    ports,
+    transport: 'TCP',
+    multiplexing: 'MULTIPLEXING_HIGH'
+  });
+  res.json({ link, username: user.username });
 });
 
 app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
