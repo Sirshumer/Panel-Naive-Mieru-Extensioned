@@ -28,21 +28,63 @@ const UPDATE_SH  = path.join(ROOT, 'update.sh');
 const INSTALL_SH = path.join(ROOT, 'install.sh');
 const WARP_SH    = path.join(ROOT, 'panel', 'scripts', 'warp_egress.sh');
 const SERVER_JS  = path.join(ROOT, 'panel', 'server', 'index.js');
+const INSTALL_HY2_SH = path.join(ROOT, 'panel', 'scripts', 'install_hysteria.sh');
 
 const upSrc     = fs.readFileSync(UPDATE_SH, 'utf8');
 const instSrc   = fs.readFileSync(INSTALL_SH, 'utf8');
 const warpSrc   = fs.readFileSync(WARP_SH, 'utf8');
 const serverSrc = fs.readFileSync(SERVER_JS, 'utf8');
+const hy2Src    = fs.readFileSync(INSTALL_HY2_SH, 'utf8');
 
 const hasJq = cp.spawnSync('sh', ['-c', 'command -v jq']).status === 0;
 
 // ─────────────────────────────────────────────────────────────────────────────
 console.log('\n[1] scripts are syntactically valid');
 {
-  for (const [name, file] of [['update.sh', UPDATE_SH], ['install.sh', INSTALL_SH], ['warp_egress.sh', WARP_SH]]) {
+  for (const [name, file] of [['update.sh', UPDATE_SH], ['install.sh', INSTALL_SH], ['warp_egress.sh', WARP_SH], ['install_hysteria.sh', INSTALL_HY2_SH]]) {
     const r = cp.spawnSync('bash', ['-n', file], { encoding: 'utf8' });
     ok(r.status === 0, 'bash -n ' + name + ' passes (' + (r.stderr || 'clean') + ')');
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.8.1 — Hy2 cert-path fix. On servers where Caddy's data-dir is
+// /var/lib/caddy (XDG_DATA_HOME set directly), certs live under
+// /var/lib/caddy/caddy/certificates — NOT the .local/share path the installer
+// used to search exclusively. Missing that path → cert "not found" → placeholder
+// written without tls: → Hy2 FATAL "tls: must set either tls or acme". This
+// section asserts the installer now searches that path, has a broad-find
+// fallback, and installs a self-heal timer so a late-arriving cert recovers.
+console.log('\n[1b] install_hysteria.sh: cert search covers /var/lib/caddy/caddy + self-heal');
+{
+  ok(/CADDY_CERT_ROOTS=\(/.test(hy2Src), 'CADDY_CERT_ROOTS array present');
+  ok(/"\/var\/lib\/caddy\/caddy\/certificates"/.test(hy2Src),
+     'searches /var/lib/caddy/caddy/certificates (the missing path — root cause)');
+  ok(/"\/var\/lib\/caddy\/\.local\/share\/caddy\/certificates"/.test(hy2Src),
+     'still searches legacy .local/share XDG path');
+  ok(/"\/root\/\.local\/share\/caddy\/certificates"/.test(hy2Src),
+     'searches root-run .local/share path');
+  ok(/find_caddy_cert\(\)/.test(hy2Src), 'find_caddy_cert() helper present');
+  // broad-find fallback over /var/lib/caddy for any non-standard data-dir
+  ok(/for BASE in \/var\/lib\/caddy \/root\/\.local \/home/.test(hy2Src),
+     'broad-find fallback scans /var/lib/caddy + /root/.local + /home');
+  ok(/-name "\$\{DOMAIN\}\.crt"/.test(hy2Src),
+     'find matches ${DOMAIN}.crt (verifies matching .key exists)');
+
+  // self-heal: cert-not-found branch must NOT leave Hy2 permanently dead
+  ok(/hy2-cert-selfheal\.sh/.test(hy2Src), 'ships hy2-cert-selfheal.sh helper');
+  ok(/hy2-cert-selfheal\.timer/.test(hy2Src), 'installs hy2-cert-selfheal.timer');
+  ok(/systemctl enable --now hy2-cert-selfheal\.timer/.test(hy2Src),
+     'enables self-heal timer when cert not ready at install time');
+  ok(/OnUnitActiveSec=60s/.test(hy2Src), 'self-heal retries ~every 60s');
+  // self-heal script disables itself once tls:/acme: present (no thrash)
+  ok(/grep -qE '\^\(tls\|acme\):'/.test(hy2Src),
+     'self-heal short-circuits when tls:/acme: already present');
+  // successful cert path still writes real tls: block + cert-watcher
+  ok(/tls:\s*\n\s*cert: \$\{CADDY_CERT_DIR\}\/\$\{DOMAIN\}\.crt/.test(hy2Src),
+     'writes real tls: block pointing at discovered cert dir');
+  ok(/caddy-cert-watcher\.path/.test(hy2Src),
+     'sets up caddy-cert-watcher.path to restart Hy2 on cert renewal');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────

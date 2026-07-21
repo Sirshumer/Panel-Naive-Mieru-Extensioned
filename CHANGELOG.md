@@ -7,6 +7,44 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.8.1]
+
+> **BUGFIX — Hy2 fails to start with `tls: must set either tls or acme`.**
+> On servers where Caddy's data-dir is `/var/lib/caddy` (i.e. `XDG_DATA_HOME`
+> points there directly), the Let's Encrypt certificate lives under
+> `/var/lib/caddy/caddy/certificates/…` — **not** the
+> `/var/lib/caddy/.local/share/caddy/certificates` path the installer searched
+> exclusively. The cert was never found → a placeholder comment (with no `tls:`
+> block) was written → `hysteria-server` crash-looped with
+> `FATAL … invalid config: tls: must set either tls or acme`.
+
+### Fixed
+- **`install_hysteria.sh` cert discovery** now covers the real-world layouts:
+  - Added `/var/lib/caddy/caddy/certificates` (the missing path — root cause),
+    plus `/root/.local/share/caddy/certificates`,
+    `/home/caddy/.local/share/caddy/certificates`, `/etc/caddy/certificates`.
+  - New `find_caddy_cert()` helper: checks all known roots **and** does a broad
+    `find` under `/var/lib/caddy`, `/root/.local`, `/home` as a final fallback —
+    catches any non-standard Caddy data-dir. Verifies a matching `.key` exists.
+
+### Added
+- **Self-heal for a late-arriving certificate.** If Caddy hasn't issued the
+  cert within 150 s at install time, the installer no longer leaves Hy2
+  permanently dead. It drops `/usr/local/bin/hy2-cert-selfheal.sh` and a
+  `hy2-cert-selfheal.timer` (retries ~every 60 s): as soon as the cert appears
+  it splices the real `tls:` block in, restarts `hysteria-server`, switches to
+  the permanent `caddy-cert-watcher.path`, and disables itself. The self-heal
+  script short-circuits when a `tls:`/`acme:` block is already present (no
+  thrash), so it's safe on already-working configs.
+
+### Tests
+- `feat-hy2-migration.test.js`: +13 assertions covering the new cert-search
+  roots, the broad-find fallback, and the self-heal timer/script wiring
+  (55 assertions total, all green). No behavioural change to add/delete user,
+  Naive/Mieru configs, or the shared user pool — nothing breaks.
+
+---
+
 ## [v1.8.0]
 
 > **FEATURE — Hysteria2 UI + WARP compatibility + upgrade migration
