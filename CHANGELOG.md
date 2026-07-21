@@ -7,6 +7,38 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.8.0]
+
+> **FEATURE — Hysteria2 UI + WARP compatibility (continuation of v1.7.0).**
+> Completes the Hy2 frontend and makes Hy2/QUIC work through Cloudflare WARP.
+
+### Added
+- **Full Hy2 frontend (Sub-stage B-UI):**
+  - Dashboard: Hy2 service card (auto-shown when installed) with status badge
+    and start/stop/restart service buttons.
+  - User modal: Hy2 protocol checkbox with install-gating (disabled + hint when
+    Hy2 not installed); edit keeps hy2 enabled for users that already have it.
+  - Users table: new **Hy2** column (✓/—) after Mieru; colspan bumped 11→12
+    across header + loading/error/empty render paths.
+  - Config modal: Hy2 link download button (`hysteria2://…` + QR + copy),
+    shown only when Hy2 installed AND the user has the `hy2` protocol.
+  - Settings: Hy2 card with not-installed (install + port) and installed
+    (reinstall + change-port) states.
+  - i18n: 23 Hy2 keys added to ru/en; fixed pre-existing `toast.cascadeUpdated`
+    gap in en.json (full locale parity restored).
+- **WARP UDP return-path rule (Sub-stage D)** in `scripts/warp_egress.sh`:
+  mirrors the BUG-171 TCP fix for UDP so Hysteria2/QUIC replies (udp/443 or
+  configured `hy2Port`) stay on the NATIVE route instead of being swallowed
+  into Cloudflare. Marks NEW inbound UDP from non-WARP ifaces + restores on
+  OUTPUT; teardown mirrors the deletes. Hy2's own outbound dials still egress
+  via WARP.
+
+### Notes
+- Sub-stage C (`update.sh` migration for existing installs — "Доустановить Hy2")
+  is **still pending** and tracked for a follow-up commit.
+
+---
+
 ## [v1.7.0]
 
 > **FEATURE — Hysteria2 (Hy2) integration.** The panel now manages a THIRD
