@@ -224,41 +224,178 @@ PYEOF
     log "  Caddy уже без HTTP/3 (или Caddyfile не найден) — UDP/${HY_PORT} свободен"
   fi
 
-  # Caddy может получить сертификат от любого CA (LE / ZeroSSL / Google).
+  # Caddy может получить сертификат от любого CA (LE / ZeroSSL / Google) и
+  # хранить его в РАЗНЫХ местах в зависимости от того, как задан data-dir:
+  #   • XDG-стиль (User=caddy, HOME=/var/lib/caddy) → .local/share/caddy
+  #   • XDG_DATA_HOME=/var/lib/caddy напрямую       → /var/lib/caddy/caddy   ← частый!
+  #   • root-запуск                                  → /root/.local/share/caddy
+  #   • системный /etc                               → /etc/ssl/caddy и т.п.
+  # Раньше мы искали только XDG-путь и промахивались на серверах с data-dir
+  # /var/lib/caddy → сертификат «не найден» → в конфиг попадала заглушка без
+  # tls: → Hy2 падал с «tls: must set either tls or acme». Теперь ищем по всем
+  # известным корням И делаем широкий find по /var/lib/caddy + /root/.local как
+  # финальный фолбэк (ловит любой нестандартный data-dir).
   CADDY_CERT_ROOTS=(
+    "/var/lib/caddy/caddy/certificates"
     "/var/lib/caddy/.local/share/caddy/certificates"
     "/root/.local/share/caddy/certificates"
+    "/home/caddy/.local/share/caddy/certificates"
+    "/etc/caddy/certificates"
   )
   CADDY_CERT_DIR=""
 
-  log "  Ждём сертификат от Caddy (до 150с, любой CA)..."
-  for i in $(seq 1 75); do
+  # Хелпер: находит пару .crt/.key для домена в списке корней ИЛИ широким find.
+  find_caddy_cert() {
+    local found
     for ROOT in "${CADDY_CERT_ROOTS[@]}"; do
       [[ -d "$ROOT" ]] || continue
-      FOUND=$(find "$ROOT" -type f -name "${DOMAIN}.crt" 2>/dev/null | head -1)
-      if [[ -n "$FOUND" && -f "${FOUND%.crt}.key" ]]; then
-        CADDY_CERT_DIR="$(dirname "$FOUND")"
-        CA_NAME="$(basename "$(dirname "$CADDY_CERT_DIR")")"
-        log "✅ Сертификат найден (${i}х2 с) — CA: ${CA_NAME}"
-        break 2
+      found=$(find "$ROOT" -type f -name "${DOMAIN}.crt" 2>/dev/null | head -1)
+      if [[ -n "$found" && -f "${found%.crt}.key" ]]; then
+        echo "$found"; return 0
       fi
     done
+    # Широкий фолбэк — любой нестандартный data-dir под /var/lib/caddy или /root.
+    for BASE in /var/lib/caddy /root/.local /home; do
+      [[ -d "$BASE" ]] || continue
+      found=$(find "$BASE" -type f -name "${DOMAIN}.crt" 2>/dev/null | head -1)
+      if [[ -n "$found" && -f "${found%.crt}.key" ]]; then
+        echo "$found"; return 0
+      fi
+    done
+    return 1
+  }
+
+  log "  Ждём сертификат от Caddy (до 150с, любой CA, любой data-dir)..."
+  for i in $(seq 1 75); do
+    FOUND="$(find_caddy_cert || true)"
+    if [[ -n "$FOUND" ]]; then
+      CADDY_CERT_DIR="$(dirname "$FOUND")"
+      CA_NAME="$(basename "$(dirname "$CADDY_CERT_DIR")")"
+      log "✅ Сертификат найден (${i}х2 с) — CA: ${CA_NAME} — ${CADDY_CERT_DIR}"
+      break
+    fi
     sleep 2
   done
 
   if [[ -z "$CADDY_CERT_DIR" ]]; then
     log "⚠ Сертификат Caddy не найден за 150с."
     log "  Hy2 НЕ запускается с собственным ACME (риск Let's Encrypt 429)."
-    log "  Почините Caddy, потом: systemctl restart hysteria-server"
+    log "  Ставим self-heal: как только Caddy выпустит сертификат — tls: блок"
+    log "  допишется автоматически и Hy2 стартанёт (проверка каждую минуту)."
     cat >> /etc/hysteria/config.yaml << 'HYNOTLSEOF'
 # ⚠ Сертификат не был готов при установке.
-# После починки Caddy:
+# Self-heal-таймер (hy2-cert-selfheal.timer) сам допишет tls: блок и
+# перезапустит hysteria-server, как только Caddy выпустит сертификат.
+# Ручная починка (если таймер отключён):
 #   1) find /var/lib/caddy -name '*.crt'
 #   2) tls:
 #        cert: /var/lib/caddy/.../<domain>.crt
 #        key:  /var/lib/caddy/.../<domain>.key
 #   3) systemctl restart hysteria-server
 HYNOTLSEOF
+
+    # ── Self-heal: скрипт ищет cert по тем же корням и, найдя, впишет tls: ──
+    cat > /usr/local/bin/hy2-cert-selfheal.sh << SELFHEALEOF
+#!/usr/bin/env bash
+# Авто-починка Hy2 TLS: ждёт появления Caddy-сертификата для домена и,
+# как только он есть, дописывает tls: блок в /etc/hysteria/config.yaml
+# и перезапускает hysteria-server. Ставится установщиком, когда cert
+# ещё не готов. Само-деактивируется после успеха.
+set -euo pipefail
+DOMAIN="${DOMAIN}"
+CFG="/etc/hysteria/config.yaml"
+
+# Уже есть tls: (или acme:) — чинить нечего, гасим таймер.
+if grep -qE '^(tls|acme):' "\$CFG" 2>/dev/null; then
+  systemctl disable --now hy2-cert-selfheal.timer >/dev/null 2>&1 || true
+  exit 0
+fi
+
+CERT_ROOTS=(
+  "/var/lib/caddy/caddy/certificates"
+  "/var/lib/caddy/.local/share/caddy/certificates"
+  "/root/.local/share/caddy/certificates"
+  "/home/caddy/.local/share/caddy/certificates"
+  "/etc/caddy/certificates"
+)
+FOUND=""
+for R in "\${CERT_ROOTS[@]}"; do
+  [[ -d "\$R" ]] || continue
+  FOUND="\$(find "\$R" -type f -name "\${DOMAIN}.crt" 2>/dev/null | head -1)"
+  [[ -n "\$FOUND" && -f "\${FOUND%.crt}.key" ]] && break || FOUND=""
+done
+if [[ -z "\$FOUND" ]]; then
+  for B in /var/lib/caddy /root/.local /home; do
+    [[ -d "\$B" ]] || continue
+    FOUND="\$(find "\$B" -type f -name "\${DOMAIN}.crt" 2>/dev/null | head -1)"
+    [[ -n "\$FOUND" && -f "\${FOUND%.crt}.key" ]] && break || FOUND=""
+  done
+fi
+[[ -z "\$FOUND" ]] && exit 0   # ещё нет — попробуем в следующий тик
+
+CDIR="\$(dirname "\$FOUND")"
+chmod -R o+rX "\$(dirname "\$CDIR")" 2>/dev/null || true
+
+# Убрать placeholder-комментарий и дописать реальный tls: блок.
+sed -i '/# ⚠ Сертификат не был готов при установке./,/#   3) systemctl restart hysteria-server/d' "\$CFG"
+cat >> "\$CFG" << TLSBLK
+
+tls:
+  cert: \${CDIR}/\${DOMAIN}.crt
+  key:  \${CDIR}/\${DOMAIN}.key
+TLSBLK
+
+systemctl reset-failed hysteria-server >/dev/null 2>&1 || true
+systemctl restart hysteria-server >/dev/null 2>&1 || true
+
+# Успех — переключиться на постоянный cert-watcher и погасить self-heal.
+cat > /etc/systemd/system/caddy-cert-watcher.path << WEOF
+[Unit]
+Description=Watch Caddy cert for changes -> restart hysteria-server
+[Path]
+PathModified=\${CDIR}
+[Install]
+WantedBy=multi-user.target
+WEOF
+cat > /etc/systemd/system/caddy-cert-watcher.service << 'WSEOF'
+[Unit]
+Description=Restart hysteria-server on Caddy cert change
+[Service]
+Type=oneshot
+ExecStart=/bin/systemctl restart hysteria-server.service
+WSEOF
+systemctl daemon-reload >/dev/null 2>&1 || true
+systemctl enable --now caddy-cert-watcher.path >/dev/null 2>&1 || true
+systemctl disable --now hy2-cert-selfheal.timer >/dev/null 2>&1 || true
+SELFHEALEOF
+    chmod +x /usr/local/bin/hy2-cert-selfheal.sh
+
+    cat > /etc/systemd/system/hy2-cert-selfheal.service << 'SHSVCEOF'
+[Unit]
+Description=Hy2 TLS self-heal (wait for Caddy cert, then enable tls: + start Hy2)
+After=caddy-naive.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/bin/hy2-cert-selfheal.sh
+SHSVCEOF
+
+    cat > /etc/systemd/system/hy2-cert-selfheal.timer << 'SHTMREOF'
+[Unit]
+Description=Periodically try to self-heal Hy2 TLS until Caddy cert appears
+
+[Timer]
+OnBootSec=30s
+OnUnitActiveSec=60s
+AccuracySec=10s
+
+[Install]
+WantedBy=timers.target
+SHTMREOF
+
+    systemctl daemon-reload
+    systemctl enable --now hy2-cert-selfheal.timer >/dev/null 2>&1 || true
+    log "✅ hy2-cert-selfheal.timer активен — Hy2 стартанёт сам после выдачи сертификата"
   else
     chmod -R 755 "$(dirname "$CADDY_CERT_DIR")" 2>/dev/null || true
     chmod 644 "${CADDY_CERT_DIR}/${DOMAIN}.crt" 2>/dev/null || true
