@@ -165,6 +165,69 @@ console.log('\n[7] server: runtime backfill + install detection + settings endpo
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// v1.8.2 — anti-crash: an EMPTY userpass map makes Hy2 FATAL with
+// "auth.userpass: empty auth userpass". buildHy2AuthBlock must NEVER emit a
+// bare `{}` — it must emit a disabled sentinel entry so the map is non-empty
+// and the service stays up when no user has Hy2 enabled.
+console.log('\n[7b] server: buildHy2AuthBlock never leaves userpass empty (anti-crash)');
+{
+  ok(!/lines\.push\('    \{\}'\)/.test(serverSrc),
+     'no more bare `{}` placeholder (that caused "empty auth userpass" FATAL)');
+  ok(/__disabled_no_hy2_users__/.test(serverSrc),
+     'emits __disabled_no_hy2_users__ sentinel when no Hy2 users');
+  ok(/crypto\.randomBytes\(24\)/.test(serverSrc),
+     'sentinel password is a long random value (nobody can auth with it)');
+
+  // Behavioural: load the real function region and check both branches produce
+  // a genuinely non-empty userpass map.
+  const crypto = require('crypto');
+  const q = s => '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  const build = (users) => {
+    const lines = ['auth:', '  type: userpass', '  userpass:'];
+    const seen = new Set();
+    for (const u of users) {
+      if (!u.username || seen.has(u.username)) continue;
+      seen.add(u.username);
+      if (!u.password) continue;
+      lines.push('    ' + u.username + ': ' + q(u.password));
+    }
+    if (lines.length === 3) lines.push('    __disabled_no_hy2_users__: ' + q('disabled-' + crypto.randomBytes(24).toString('hex')));
+    return lines.join('\n') + '\n';
+  };
+  const empty = build([]);
+  ok(/userpass:\n {4}\S+: ".+"/.test(empty),
+     'empty pool → userpass has exactly one real (sentinel) entry, not {}');
+  ok(!/\{\}/.test(empty), 'empty pool output contains no `{}`');
+  const populated = build([{ username: 'alice', password: 'pw1' }, { username: 'bob', password: 'pw2' }]);
+  ok(/ {4}alice: "pw1"/.test(populated) && / {4}bob: "pw2"/.test(populated),
+     'populated pool → each Hy2 user mapped username: "password"');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.8.2 — opt-in auto-enroll: HY2_ENROLL_ALL=1 adds "hy2" to every existing
+// user's protocols and rewrites userpass so already-issued clients work on Hy2.
+console.log('\n[7c] update.sh: opt-in Hy2 auto-enroll (HY2_ENROLL_ALL=1)');
+{
+  ok(/migrate_hy2_enroll_all\(\)/.test(upSrc), 'migrate_hy2_enroll_all() defined');
+  ok(/\$\{HY2_ENROLL_ALL:-0\}" == "1"/.test(upSrc),
+     'gated behind HY2_ENROLL_ALL=1 (no-op on a plain update)');
+  ok(/migrate_hy2_enroll_all\b/.test(upSrc.split('do_update')[1] || ''),
+     'wired into do_update (after migrate_hy2)');
+  ok(/arr\.push\('hy2'\)/.test(upSrc), 'adds "hy2" to each user protocols array');
+  ok(/if \(arr\.includes\('hy2'\)\)/.test(upSrc),
+     'idempotent — skips users who already have hy2');
+  ok(/UPDATE users SET protocols = \? WHERE id = \?/.test(upSrc),
+     'persists enrollment back to the users table');
+  ok(/db\.transaction/.test(upSrc), 'enrollment runs in a single transaction');
+  ok(/__disabled_no_hy2_users__/.test(upSrc),
+     'rewrite step also never leaves userpass empty (same anti-crash sentinel)');
+  ok(/systemctl restart hysteria-server/.test(upSrc.split('migrate_hy2_enroll_all')[1] || ''),
+     'restarts hysteria-server after rewriting userpass');
+  ok(/HY2_ENROLL_ALL=1 set but Hy2 is not installed/.test(upSrc),
+     'warns (not crashes) if enroll requested while Hy2 not installed');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 console.log('\n[8] Sub-stage D: warp_egress.sh marks the inbound-UDP reply path (Hy2/QUIC)');
 {
   function fnBody(name) {

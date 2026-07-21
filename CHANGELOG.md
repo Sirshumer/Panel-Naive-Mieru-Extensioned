@@ -7,6 +7,42 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.8.2]
+
+> **BUGFIX — Hy2 crash-loops with `auth.userpass: empty auth userpass`** when no
+> user in the shared pool has Hy2 enabled + **FEATURE — opt-in auto-enroll** so
+> already-issued clients work over Hy2 without re-provisioning.
+
+### Fixed
+- **Empty `userpass` no longer FATALs Hy2.** `buildHy2AuthBlock()` used to emit a
+  bare `{}` when no user had `"hy2"` in their `protocols` — but Hysteria2 rejects
+  an empty userpass map (`invalid config: auth.userpass: empty auth userpass`) and
+  crash-loops. It now emits a single **disabled sentinel** entry
+  (`__disabled_no_hy2_users__` + a long random password) so the map is genuinely
+  non-empty and the service stays **up** while admitting zero real clients. The
+  sentinel is silently replaced the moment a real Hy2 user is added.
+
+### Added
+- **Opt-in auto-enroll (`HY2_ENROLL_ALL=1`).** Existing clients issued before Hy2
+  existed have `protocols = ["naive","mieru"]` and never appear in `userpass`.
+  Running `HY2_ENROLL_ALL=1 ./update.sh` now:
+  - adds `"hy2"` to **every** user's `protocols` array (idempotent — users who
+    already have it are skipped; runs in a single SQLite transaction);
+  - rewrites `/etc/hysteria/config.yaml`'s `userpass` from the enrolled pool
+    (same username → stored plaintext password, so the client's existing
+    credential works — no re-provisioning);
+  - restarts `hysteria-server` → all clients active over Hy2 immediately.
+  Fully opt-in: a plain `update.sh` never changes which protocols users have.
+  Warns (does not crash) if requested while Hy2 isn't installed.
+
+### Tests
+- `feat-hy2-migration.test.js`: +16 assertions (anti-crash sentinel behaviour +
+  auto-enroll wiring). `feat-hy2-link.test.js`: empty-pool assertion updated to
+  the sentinel + `crypto` bound for the extracted helper. Full suite green
+  (18 files, 0 failed). No change to add/delete user, Naive/Mieru — nothing breaks.
+
+---
+
 ## [v1.8.1]
 
 > **BUGFIX — Hy2 fails to start with `tls: must set either tls or acme`.**

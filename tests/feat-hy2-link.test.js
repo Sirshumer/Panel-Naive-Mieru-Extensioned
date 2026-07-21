@@ -14,6 +14,9 @@
 'use strict';
 const fs   = require('fs');
 const path = require('path');
+// buildHy2AuthBlock() uses crypto.randomBytes for the disabled sentinel entry;
+// the eval-extracted function closes over this in-scope binding.
+const crypto = require('crypto');
 
 let pass = 0, fail = 0;
 const ok = (c, m) => { if (c) { pass++; console.log('  \u2713 ' + m); } else { fail++; console.log('  \u2717 ' + m); } };
@@ -67,7 +70,12 @@ ok(!/nopw/.test(block), 'user without plaintext password is skipped');
 ok((block.match(/alice:/g) || []).length === 1, 'duplicate username emitted once');
 
 const emptyBlock = buildHy2AuthBlock([]);
-ok(/\{\}/.test(emptyBlock), 'empty pool still emits a valid (empty) map');
+// v1.8.2 anti-crash: Hy2 FATALs on an empty userpass map, so instead of a bare
+// `{}` we now emit a disabled sentinel entry with a random password → the map
+// is genuinely non-empty and the service stays up with zero real clients.
+ok(!/\{\}/.test(emptyBlock), 'empty pool no longer emits a bare `{}` (would FATAL)');
+ok(/^    __disabled_no_hy2_users__: ".+"$/m.test(emptyBlock),
+   'empty pool emits a disabled sentinel entry (non-empty map → Hy2 stays up)');
 
 // ── spliceHy2Auth ────────────────────────────────────────────────────────────
 const cfgText = [
