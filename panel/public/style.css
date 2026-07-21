@@ -491,6 +491,7 @@ img { max-width: 100%; display: block; }
   border: 1px solid rgba(192,133,82,0.25);
 }
 .stat-icon.mieru  { background: var(--purple-dim); color: var(--purple); }
+.stat-icon.hy2    { background: rgba(56,189,248,0.13); color: #38bdf8; }
 .stat-icon.users  { background: var(--green-dim);  color: var(--green);  }
 .stat-icon.system { background: var(--yellow-dim); color: var(--yellow); }
 .stat-label { font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; }

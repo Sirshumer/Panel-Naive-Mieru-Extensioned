@@ -53,7 +53,8 @@
     "restart": "Restart",
     "stop": "Stop",
     "active": "Active",
-    "inactive": "Inactive"
+    "inactive": "Inactive",
+    "hy2": "Hysteria2"
   },
   "users": {
     "title": "Users",
@@ -107,7 +108,10 @@
     "copyPassword": "📋 Copy",
     "passwordGenerated": "Random password generated & copied",
     "passwordCopied": "Password copied",
-    "passwordEmpty": "Password field is empty"
+    "passwordEmpty": "Password field is empty",
+    "hy2Label": "Hysteria2",
+    "hy2NotInstalled": "Hysteria2 is not installed — install it in Server Settings to issue hy2 keys.",
+    "hy2Col": "Hy2"
   },
   "config": {
     "downloadTitle": "Download Client Config",
@@ -129,7 +133,9 @@
     "mieruDownloaded": "Mieru config downloaded",
     "universalDownloaded": "Universal config downloaded",
     "qrCode": "QR Code",
-    "qrNote": "Scan QR code with client app (iOS: ShadowRocket, Karing)"
+    "qrNote": "Scan QR code with client app (iOS: ShadowRocket, Karing)",
+    "hy2Link": "Hy2 Link",
+    "hy2LinkCopied": "Hy2 link copied to clipboard"
   },
   "settings": {
     "title": "Server Settings",
@@ -261,7 +267,24 @@
     "externalStubSaved": "Stub saved ✓",
     "externalStubEmpty": "Stub HTML must not be empty",
     "externalBaPassNew": "Basic-auth password (required on first enable)",
-    "externalBaPassKeep": "Basic-auth password (leave blank to keep current)"
+    "externalBaPassKeep": "Basic-auth password (leave blank to keep current)",
+    "hy2Title": "Hysteria2 (Hy2)",
+    "hy2Desc": "Hysteria2 is a fast QUIC/UDP protocol. It runs over UDP and coexists with NaiveProxy on TCP/443. Uses the shared user pool and Caddys certificate (no second email).",
+    "hy2NotInstalled": "Hysteria2 is not yet installed on this server.",
+    "hy2Installed": "Hysteria2 installed.",
+    "hy2PortLabel": "UDP port (1-65535)",
+    "hy2PortHint": "Default 443/udp (next to Naive TCP/443). Can be changed to 8443 etc.",
+    "hy2PortNote": "Changing the port restarts Hy2. Clients must update their links.",
+    "hy2Install": "Install Hy2",
+    "hy2Reinstall": "Reinstall",
+    "hy2ApplyPort": "Apply Hy2 Port",
+    "hy2Installing": "Installing Hy2... (up to 2 min)",
+    "hy2InstallConfirm": "Install Hysteria2 on this server? May take 1-2 minutes.",
+    "hy2ReinstallConfirm": "Reinstall Hysteria2? The service will restart.",
+    "hy2PortConfirm": "Change Hy2 port? The service will restart, clients need new links.",
+    "hy2PortUpdated": "Hy2 port updated",
+    "hy2Port": "Port",
+    "hy2Users": "users"
   },
   "monitoring": {
     "title": "Monitoring",
@@ -327,6 +350,7 @@
     "naivePortUpdated": "NaiveProxy port updated — clients need new configs",
     "mieruPortsUpdated": "Mieru ports updated — service restarted, clients need new configs",
     "trafficPatternUpdated": "Traffic pattern updated",
+    "cascadeUpdated": "Cascade updated",
     "error": "Error",
     "info": "Info"
   },

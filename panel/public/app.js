@@ -270,6 +270,7 @@ function handleDelegatedClick(e) {
     case 'close-config-modal': closeConfigModal(); break;
     case 'dl-naive-link':    downloadNaiveLink(); break;
     case 'dl-mieru-link':    downloadMieruLink(); break;
+    case 'dl-hy2-link':      downloadHy2Link(); break;
     case 'dl-mieru-config':  downloadMieruConfig(); break;
     case 'dl-universal-config': downloadUniversalConfig(); break;
 
@@ -279,6 +280,9 @@ function handleDelegatedClick(e) {
     // ── Settings page
     case 'change-naive-port':    changeNaivePort(); break;
     case 'change-mieru-ports':   changeMieruPorts(); break;
+    case 'install-hy2':          installHy2(false); break;
+    case 'reinstall-hy2':        installHy2(true); break;
+    case 'change-hy2-port':      changeHy2Port(); break;
     case 'change-traffic-pattern': changeTrafficPattern(); break;
     case 'change-udp-mode':      changeUdpMode(); break;
     case 'change-language':      changeLanguage(); break;
@@ -480,6 +484,19 @@ async function loadDashboard() {
       t('dashboard.active'), t('dashboard.inactive'));
     el('d-mieru-status').innerHTML = badge(status.services.mieru.active,
       t('dashboard.active'), t('dashboard.inactive'));
+    // Hy2 card: only show when installed; reflect active/inactive.
+    const hy2 = status.services.hy2 || {};
+    state.hy2Installed = !!hy2.installed;
+    const hy2Card = el('d-hy2-card');
+    if (hy2Card) {
+      if (hy2.installed) {
+        hy2Card.classList.remove('hidden');
+        el('d-hy2-status').innerHTML = badge(hy2.active,
+          t('dashboard.active'), t('dashboard.inactive'));
+      } else {
+        hy2Card.classList.add('hidden');
+      }
+    }
     el('d-user-count').textContent = status.panel.userCount;
     el('d-domain').textContent     = status.domain || '—';
 
@@ -528,7 +545,7 @@ async function loadDashboard() {
 
 async function loadUsers() {
   const tbody = el('users-tbody');
-  tbody.innerHTML = `<tr><td colspan="11" class="table-empty">${t('users.loading')}</td></tr>`;
+  tbody.innerHTML = `<tr><td colspan="12" class="table-empty">${t('users.loading')}</td></tr>`;
   try {
     // BUG-163/165: the Users table showed 0 in «Naive (МБ)»/«Mieru (МБ)» because
     //   /api/users carries NO traffic fields — the per-key figures live in
@@ -553,7 +570,7 @@ async function loadUsers() {
     // Доработка 2: re-evaluate the foolproof gates whenever the key list changes.
     applyFoolproofGates(state.users.length);
   } catch (err) {
-    tbody.innerHTML = `<tr><td colspan="10" class="table-empty" style="color:var(--red)">${esc(err.message)}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12" class="table-empty" style="color:var(--red)">${esc(err.message)}</td></tr>`;
   }
 }
 
@@ -622,7 +639,7 @@ async function applyFoolproofGates(count) {
 function renderUsersTable(users) {
   const tbody = el('users-tbody');
   if (!users.length) {
-    tbody.innerHTML = `<tr><td colspan="11" class="table-empty">${t('users.noUsers')}</td></tr>`;
+    tbody.innerHTML = `<tr><td colspan="12" class="table-empty">${t('users.noUsers')}</td></tr>`;
     return;
   }
   tbody.innerHTML = users.map(u => {
@@ -630,6 +647,7 @@ function renderUsersTable(users) {
     const protocols = Array.isArray(u.protocols) ? u.protocols : safeParseJSON(u.protocols, []);
     const hasNaive  = protocols.includes('naive');
     const hasMieru  = protocols.includes('mieru');
+    const hasHy2    = protocols.includes('hy2');
     const expBadge  = u.expiry
       ? (new Date(u.expiry) < new Date()
           ? `<span class="badge badge-red">${t('users.expired')}</span>`
@@ -648,6 +666,7 @@ function renderUsersTable(users) {
       <td>${expBadge}</td>
       <td>${hasNaive ? '<span class="badge badge-blue">✓</span>' : '<span class="badge badge-gray">—</span>'}</td>
       <td>${hasMieru ? '<span class="badge badge-blue">✓</span>' : '<span class="badge badge-gray">—</span>'}</td>
+      <td>${hasHy2 ? '<span class="badge badge-blue">✓</span>' : '<span class="badge badge-gray">—</span>'}</td>
       <td>${fmtNum(u.naiveMB != null ? u.naiveMB : 0)}</td>
       <td>${fmtNum(u.mieruMB != null ? u.mieruMB : 0)}</td>
       <td>${u.quotaMB > 0 ? fmtNum(u.quotaMB) : '∞'}</td>
@@ -675,9 +694,24 @@ function openAddUser() {
   el('u-quota').value      = '0';
   el('p-naive').checked    = true;
   el('p-mieru').checked    = true;
+  if (el('p-hy2')) el('p-hy2').checked = false;
+  applyHy2Gate();
   el('u-pass-hint').textContent = t('users.passwordHintNew');
   el('user-modal-error').classList.add('hidden');
   el('user-modal').classList.remove('hidden');
+}
+
+// Gate the Hy2 protocol checkbox: enabled only when Hy2 is installed on the
+// server. When not installed, disable it and show an inline hint. state.hy2Installed
+// is refreshed by loadDashboard()/loadSettings() from /api/status /api/settings/hy2.
+function applyHy2Gate() {
+  const cb   = el('p-hy2');
+  const hint = el('p-hy2-hint');
+  if (!cb) return;
+  const installed = !!state.hy2Installed;
+  cb.disabled = !installed;
+  if (!installed) cb.checked = false;
+  if (hint) hint.classList.toggle('hidden', installed);
 }
 
 function openEditUser(id) {
@@ -696,6 +730,13 @@ function openEditUser(id) {
   el('u-quota').value    = user.quotaMB || 0;
   el('p-naive').checked  = protocols.includes('naive');
   el('p-mieru').checked  = protocols.includes('mieru');
+  applyHy2Gate();
+  // After gating: reflect the saved hy2 state (a user may already have hy2 even
+  // if the checkbox got disabled — keep it checked so an edit doesn't drop it).
+  if (el('p-hy2')) {
+    el('p-hy2').checked = protocols.includes('hy2');
+    if (protocols.includes('hy2')) el('p-hy2').disabled = false;
+  }
   el('u-pass-hint').textContent = t('users.passwordHintEdit');
   el('user-modal-error').classList.add('hidden');
   el('user-modal').classList.remove('hidden');
@@ -718,6 +759,7 @@ async function saveUser() {
   const protocols = [];
   if (el('p-naive').checked) protocols.push('naive');
   if (el('p-mieru').checked) protocols.push('mieru');
+  if (el('p-hy2') && el('p-hy2').checked) protocols.push('hy2');
 
   if (!username)            return showUserError(t('users.usernameRequired'));
   if (!id && !password)     return showUserError(t('users.passwordRequired'));
@@ -806,6 +848,12 @@ function openConfigDownload(id) {
   }
   const rangeEl = el('cfg-mieru-port-range');
   if (rangeEl) rangeEl.textContent = ` (${start}–${end})`;
+  // Show the Hy2 link button only when THIS user has hy2 enabled AND Hy2 is
+  // installed on the server (state.hy2Installed refreshed elsewhere).
+  const user = state.users.find(u => u.id === id);
+  const uProtos = user ? (Array.isArray(user.protocols) ? user.protocols : safeParseJSON(user.protocols, [])) : [];
+  const hy2Btn = el('btn-dl-hy2-link');
+  if (hy2Btn) hy2Btn.classList.toggle('hidden', !(state.hy2Installed && uProtos.includes('hy2')));
   // P3: no password prompt — the server uses the user's stored password.
   // Auto-load the naive link + QR right away.
   loadNaiveLink();
@@ -868,6 +916,21 @@ async function downloadMieruLink() {
     el('naive-link-box').classList.remove('hidden');
     copyToClipboard(data.link);
     toast(t('config.mieruLinkCopied'), 'success');
+    generateQR(data.link);
+  } catch (err) { toast(err.message, 'error'); }
+}
+
+// Hy2 share-link (hysteria2://) — copy-paste form for NekoBox/Karing/Shadowrocket.
+// Additive: reuses the shared link box + QR, exactly like Naive/Mieru links.
+async function downloadHy2Link() {
+  try {
+    const data = await api('GET',
+      `/api/users/${state.selectedUserId}/config/hy2`);
+
+    el('naive-link-box').textContent = data.link;
+    el('naive-link-box').classList.remove('hidden');
+    copyToClipboard(data.link);
+    toast(t('config.hy2LinkCopied') || 'Hy2 link copied', 'success');
     generateQR(data.link);
   } catch (err) { toast(err.message, 'error'); }
 }
@@ -977,6 +1040,12 @@ async function loadSettings() {
       // BUG-162: reflect the real persist (autostart) state from the server.
       if (warpPersistEl && w && typeof w.warpPersist === 'boolean') warpPersistEl.checked = w.warpPersist;
       refreshWarpUiState(!!(w && w.cascadeEnabled));
+    } catch {}
+    // Hy2 (Hysteria2) settings card
+    try {
+      const h = await api('GET', '/api/settings/hy2');
+      state.hy2Installed = !!(h && h.installed);
+      renderHy2Card(h || {});
     } catch {}
     const cascadeNaiveEl = el('s-cascade-naive-upstream');
     if (cascadeNaiveEl) cascadeNaiveEl.value = cfg.cascadeNaiveUpstream || '';
@@ -1237,6 +1306,84 @@ async function changeMieruPorts() {
     toast(t('toast.mieruPortsUpdated') || `Порты Mieru → ${portStart}–${portEnd}`, 'info');
   } catch (err) {
     showMsg('mieru-port-msg', err.message, false);
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+// ── Hy2 (Hysteria2) ──────────────────────────────────────────────────────────
+
+// Render the Hy2 settings card from GET /api/settings/hy2.
+function renderHy2Card(h) {
+  const notInstalled = el('hy2-not-installed');
+  const installed    = el('hy2-installed');
+  const port         = h.port || 443;
+  if (h.installed) {
+    if (notInstalled) notInstalled.classList.add('hidden');
+    if (installed)    installed.classList.remove('hidden');
+    const pInput = el('s-hy2-port-installed');
+    if (pInput) pInput.value = port;
+    const statusTxt = el('hy2-status-txt');
+    if (statusTxt) {
+      statusTxt.textContent = ` ${t('settings.hy2Port') || 'Порт'}: ${port}/udp · ` +
+        (h.active ? (t('dashboard.active') || 'активен') : (t('dashboard.inactive') || 'остановлен')) +
+        ` · ${h.hy2UserCount || 0} ${t('settings.hy2Users') || 'польз.'}`;
+    }
+  } else {
+    if (notInstalled) notInstalled.classList.remove('hidden');
+    if (installed)    installed.classList.add('hidden');
+    const pInput = el('s-hy2-port');
+    if (pInput) pInput.value = port;
+  }
+}
+
+async function installHy2(reinstall) {
+  const portEl = reinstall ? el('s-hy2-port-installed') : el('s-hy2-port');
+  const port = parseInt(portEl?.value, 10) || 443;
+  if (port < 1 || port > 65535) {
+    showMsg('hy2-install-msg', t('settings.invalidPort') || 'Неверный порт (1–65535)', false); return;
+  }
+  const confirmMsg = reinstall
+    ? (t('settings.hy2ReinstallConfirm') || 'Переустановить Hysteria2? Сервис будет перезапущен.')
+    : (t('settings.hy2InstallConfirm')   || 'Установить Hysteria2 на этот сервер? Может занять до 1–2 минут.');
+  if (!confirm(confirmMsg)) return;
+
+  const btn = document.querySelector(reinstall ? '[data-action="reinstall-hy2"]' : '[data-action="install-hy2"]');
+  const msgId = reinstall ? 'hy2-port-msg' : 'hy2-install-msg';
+  setBtnBusy(btn, true);
+  showMsg(msgId, t('settings.hy2Installing') || 'Установка Hy2… (до 2 минут)', true);
+  try {
+    const res = await api('POST', '/api/settings/hy2/install', { port });
+    showMsg(msgId, res.message || 'Hy2 установлен', true);
+    toast(t('settings.hy2Installed') || 'Hysteria2 установлен', 'success');
+    state.hy2Installed = true;
+    // Refresh the card + dashboard so the new service/state appears immediately.
+    try { const h = await api('GET', '/api/settings/hy2'); renderHy2Card(h); } catch {}
+    if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
+  } catch (err) {
+    showMsg(msgId, err.message, false);
+    toast(err.message, 'error');
+  } finally {
+    setBtnBusy(btn, false);
+  }
+}
+
+async function changeHy2Port() {
+  const port = parseInt(el('s-hy2-port-installed')?.value, 10);
+  if (!port || port < 1 || port > 65535) {
+    showMsg('hy2-port-msg', t('settings.invalidPort') || 'Неверный порт (1–65535)', false); return;
+  }
+  if (!confirm(t('settings.hy2PortConfirm') || 'Сменить порт Hy2? Сервис будет перезапущен, клиентам нужны новые ссылки.')) return;
+  const btn = document.querySelector('[data-action="change-hy2-port"]');
+  setBtnBusy(btn, true);
+  try {
+    const res = await api('POST', '/api/settings/hy2-port', { port });
+    showMsg('hy2-port-msg', res.message || `Порт Hy2 → ${port}`, true);
+    toast(t('settings.hy2PortUpdated') || `Порт Hy2 → ${port}/udp`, 'info');
+    try { const h = await api('GET', '/api/settings/hy2'); renderHy2Card(h); } catch {}
+  } catch (err) {
+    showMsg('hy2-port-msg', err.message, false);
+    toast(err.message, 'error');
   } finally {
     setBtnBusy(btn, false);
   }
