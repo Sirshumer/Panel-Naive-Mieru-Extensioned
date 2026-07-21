@@ -69,7 +69,11 @@ try {
     adminUser: 'admin',
     adminPassHash: bcrypt.hashSync('admin', 12),
     naivePort: 443, mieruPortStart: 2012, mieruPortEnd: 2022,
-    panelPort: 3000, panelHost: '127.0.0.1', exposePanel: false,
+    // Hy2 (Hysteria2) — QUIC/UDP proxy. Default UDP/443 coexists with Naive on
+    // TCP/443 (our Caddy runs `protocols h1 h2` → HTTP/3 off → UDP/443 free).
+    // `stack.hy2` marks whether the operator has installed the Hy2 server.
+    hy2Port: 443,
+    stack: { naive: true, mieru: true, hy2: false },
     dbPath:        DB_PATH,
     caddyBin:      CADDY_BIN,
     caddyFile:     CADDY_FILE,
@@ -96,6 +100,20 @@ try {
     language: 'ru', version: '1.6.0'
   };
 }
+
+// ── Hy2 config normalization ──────────────────────────────────────────────────
+// Existing installs (config.json written before Hy2 support) will NOT have
+// `hy2Port` or `stack`. Backfill safe defaults at load time so the rest of the
+// code can assume they exist. We DO NOT flip stack.hy2 to true here — that only
+// happens after the operator installs Hy2 (POST /api/settings/hy2/install).
+if (cfg.hy2Port === undefined || cfg.hy2Port === null) cfg.hy2Port = 443;
+if (!cfg.stack || typeof cfg.stack !== 'object') {
+  // Legacy config: naive+mieru were always installed together by install.sh.
+  cfg.stack = { naive: true, mieru: true, hy2: false };
+}
+if (cfg.stack.naive === undefined) cfg.stack.naive = true;
+if (cfg.stack.mieru === undefined) cfg.stack.mieru = true;
+if (cfg.stack.hy2   === undefined) cfg.stack.hy2   = false;
 
 // Bug 143 (recurring): single source of truth for the displayed version.
 // Precedence, read LIVE so the UI updates the moment update.sh runs:
@@ -1136,6 +1154,190 @@ function shredFile(fp) {
   catch { try { fs.unlinkSync(fp); } catch {} }
 }
 
+// ── Hysteria2 (Hy2) config management ─────────────────────────────────────────
+// Hy2 users live in the SHARED SQLite `users` pool: a user has Hy2 access iff
+// its `protocols` array contains "hy2". The Hy2 server auths against an
+// `auth.userpass` map in /etc/hysteria/config.yaml. This module is the single
+// owner of that map — it rewrites ONLY the `auth:` block from the DB, preserving
+// every other section (listen / tls / masquerade / quic) byte-for-byte.
+//
+// We deliberately do NOT pull in a YAML library: our usernames match
+// /^[a-zA-Z0-9_.-]{1,64}$/ and passwords are the safe alphabet [a-zA-Z0-9]
+// (generateSafePassword) or admin-supplied (min 8 chars). We still quote every
+// value so an admin-supplied password with YAML-special chars can't break the
+// document. Rewriting is a targeted string splice, not a full parse/serialize,
+// so unrelated formatting/comments are untouched.
+const HY2_CONFIG = '/etc/hysteria/config.yaml';
+
+// Return the list of users (from the shared pool) that have Hy2 enabled.
+function getHy2Users() {
+  return getAllUsers()
+    .map(parseUserRow)
+    .filter(u => Array.isArray(u.protocols) && u.protocols.includes('hy2'));
+}
+
+// YAML double-quoted scalar: escape backslash and double-quote (sufficient for
+// double-quoted flow scalars per the YAML spec for our value set).
+function yamlQuote(s) {
+  return '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+}
+
+// Build the replacement `auth:` block (userpass map) from the given users.
+// A username maps to its plaintext password (Hy2 needs the plaintext to auth
+// the client; we store `password` alongside the bcrypt hash for exactly the
+// same reason Naive/Mieru links need it).
+function buildHy2AuthBlock(users) {
+  const lines = ['auth:', '  type: userpass', '  userpass:'];
+  const seen = new Set();
+  for (const u of users) {
+    if (!u.username || seen.has(u.username)) continue;
+    seen.add(u.username);
+    const pw = u.password || '';
+    if (!pw) continue;   // no stored plaintext → cannot auth; skip safely
+    lines.push(`    ${u.username}: ${yamlQuote(pw)}`);
+  }
+  // Hysteria requires userpass to be a non-empty map to start; when there are
+  // no Hy2 users we still emit a valid (empty flow) map so the service stays up.
+  if (lines.length === 3) lines.push('    {}');
+  return lines.join('\n') + '\n';
+}
+
+// Splice the freshly-built `auth:` block into the existing config text,
+// replacing the old `auth:` … (up to the next top-level key or EOF).
+function spliceHy2Auth(configText, authBlock) {
+  const text = String(configText);
+  // Match a top-level `auth:` line and everything indented under it, stopping
+  // at the next top-level (column-0, non-comment, non-blank) key or EOF.
+  const re = /^auth:[ \t]*\r?\n(?:[ \t].*\r?\n?|\r?\n)*/m;
+  if (re.test(text)) {
+    return text.replace(re, () => authBlock);
+  }
+  // No existing auth: block (unexpected) — insert after the `listen:` line, or
+  // prepend if listen is also missing.
+  const listenRe = /^listen:.*\r?\n/m;
+  if (listenRe.test(text)) {
+    return text.replace(listenRe, (m) => m + '\n' + authBlock);
+  }
+  return authBlock + '\n' + text;
+}
+
+// Basic structural sanity check for a Hy2 config before we commit it: must
+// contain a listen directive and either tls or acme (so the server can bind
+// and terminate QUIC/TLS). Prevents writing a config that would crash-loop.
+function hy2ConfigLooksValid(text) {
+  const t = String(text);
+  if (!/^listen:/m.test(t)) return false;
+  if (!/^tls:/m.test(t) && !/^acme:/m.test(t)) return false;
+  if (!/^auth:/m.test(t)) return false;
+  return true;
+}
+
+// Rewrite /etc/hysteria/config.yaml's auth block from the DB and restart Hy2.
+// Atomic: write .new → validate structure → backup current to .last → rename →
+// restart → verify is-active; on failure roll back to .last. Returns
+// { ok, changed, error, active }.
+function writeHysteriaConfig({ restart = true } = {}) {
+  // If Hy2 was never installed there's no config to manage — no-op success so
+  // user add/delete never fails just because Hy2 isn't present.
+  if (!fs.existsSync(HY2_CONFIG)) {
+    return { ok: true, changed: false, active: false, error: null, skipped: 'not-installed' };
+  }
+  let current = '';
+  try { current = fs.readFileSync(HY2_CONFIG, 'utf8'); }
+  catch (e) { return { ok: false, changed: false, active: false, error: 'read failed: ' + e.message }; }
+
+  const users = getHy2Users();
+  const authBlock = buildHy2AuthBlock(users);
+  const next = spliceHy2Auth(current, authBlock);
+
+  if (next === current) {
+    // Nothing to change (idempotent). Optionally ensure it's running.
+    let active = false;
+    try { active = execSync('systemctl is-active hysteria-server 2>/dev/null', { timeout: 5000 }).toString().trim() === 'active'; } catch {}
+    return { ok: true, changed: false, active, error: null };
+  }
+
+  if (!hy2ConfigLooksValid(next)) {
+    return { ok: false, changed: false, active: false,
+             error: 'refusing to write Hy2 config: failed structural validation (missing listen/tls/auth)' };
+  }
+
+  const tmp  = HY2_CONFIG + '.new';
+  const last = HY2_CONFIG + '.last';
+  try {
+    fs.writeFileSync(tmp, next, { mode: 0o600 });
+    try { fs.copyFileSync(HY2_CONFIG, last); } catch {}   // backup for rollback
+    fs.renameSync(tmp, HY2_CONFIG);                        // atomic replace
+  } catch (e) {
+    try { fs.unlinkSync(tmp); } catch {}
+    return { ok: false, changed: false, active: false, error: 'write failed: ' + e.message };
+  }
+
+  if (!restart) return { ok: true, changed: true, active: false, error: null };
+
+  const r = reloadHysteria();
+  if (!r.ok) {
+    // Roll back to the last-known-good config and restart again.
+    try {
+      if (fs.existsSync(last)) {
+        fs.copyFileSync(last, HY2_CONFIG);
+        reloadHysteria();
+      }
+    } catch {}
+    return { ok: false, changed: true, active: r.active, error: 'Hy2 failed to start with new users; rolled back. ' + (r.error || '') };
+  }
+  return { ok: true, changed: true, active: r.active, error: null };
+}
+
+// Restart hysteria-server and verify it came up. Clears any lingering
+// systemd "failed" state first (mirrors restartMieru's Bug-96 handling).
+function reloadHysteria() {
+  try { execSync('systemctl reset-failed hysteria-server 2>/dev/null || true', { timeout: 5000 }); } catch {}
+  try {
+    execSync('systemctl restart hysteria-server', { timeout: 20000 });
+  } catch (e) {
+    return { ok: false, active: false, error: (e.stderr ? e.stderr.toString() : e.message) };
+  }
+  let active = false;
+  try { active = execSync('systemctl is-active hysteria-server 2>/dev/null', { timeout: 8000 }).toString().trim() === 'active'; } catch {}
+  if (!active) {
+    let j = '';
+    try { j = execSync('journalctl -u hysteria-server -n 15 --no-pager 2>/dev/null', { timeout: 5000 }).toString(); } catch {}
+    return { ok: false, active: false, error: 'hysteria-server not active after restart. ' + j.slice(-500) };
+  }
+  return { ok: true, active: true, error: null };
+}
+
+// Is Hy2 installed on this box? (binary + config present, or stack flag set.)
+function hy2Installed() {
+  try {
+    return fs.existsSync(HY2_CONFIG) && fs.existsSync('/usr/local/bin/hysteria');
+  } catch { return false; }
+}
+
+// ── Hy2 installer orchestrator — scripts/install_hysteria.sh ─────────────────
+const HY2_INSTALL_SCRIPT = path.join(__dirname, '../scripts/install_hysteria.sh');
+
+// Run install_hysteria.sh with env from cfg. USE_CADDY_CERT defaults to 1
+// (reuse Caddy's cert — no second email). Returns { ok, output }.
+function runInstallHysteria(opts = {}) {
+  try {
+    const env = Object.assign({}, process.env, {
+      HY_DOMAIN:      String(cfg.domain || ''),
+      HY_PORT:        String(opts.port || cfg.hy2Port || 443),
+      HY_EMAIL:       String(cfg.adminEmail || 'admin@example.com'),
+      // Bootstrap password is optional — the panel rewrites userpass from the
+      // DB immediately after install. Pass empty so the map starts empty.
+      HY_PASSWORD:    '',
+      USE_CADDY_CERT: opts.useCaddyCert === false ? '0' : '1',
+    });
+    const out = execFileSync('bash', [HY2_INSTALL_SCRIPT], { timeout: 300000, env }).toString();
+    return { ok: true, output: out };
+  } catch (e) {
+    return { ok: false, output: (e.stdout ? e.stdout.toString() : '') + (e.stderr ? e.stderr.toString() : e.message) };
+  }
+}
+
 // ── naiveCascadeStatusText() — Bug 93 ────────────────────────────────────────
 // The "Проверить статус" button used to only diagnose the Mieru cascade (Variant
 // B), so a Naive-only cascade always showed "configured: 0 / inactive" — wildly
@@ -1218,7 +1420,7 @@ function naiveCascadeStatusText() {
 // writeCaddyfileAtomic and the full restart+verify in applyCaddyConfig, a new
 // key now activates immediately. We also surface the real caddy error.
 function applyAllConfigs() {
-  let caddyOk = false, mitaOk = false, caddyError = '';
+  let caddyOk = false, mitaOk = false, hy2Ok = true, caddyError = '', hy2Error = '';
   try {
     const content = buildCaddyfile(cfg, getAllUsers());
     writeCaddyfileAtomic(content);          // Bug 90: chown root:caddy inside
@@ -1231,7 +1433,15 @@ function applyAllConfigs() {
   } catch (e) { caddyError = e.message; console.error('[CADDY]', e.message); }
   try { mitaOk = applyMitaConfig(); }
   catch (e) { console.error('[MITA]', e.message); }
-  return { caddyOk, mitaOk, caddyError, servicesReloaded: caddyOk && mitaOk };
+  // Hy2: only acts when installed (config file present); otherwise it's a
+  // no-op success so user CRUD never fails just because Hy2 isn't deployed.
+  try {
+    const h = writeHysteriaConfig();
+    hy2Ok = h.ok;
+    if (!h.ok) { hy2Error = h.error || ''; console.error('[HY2] apply failed:', h.error); }
+  } catch (e) { hy2Ok = false; hy2Error = e.message; console.error('[HY2]', e.message); }
+  return { caddyOk, mitaOk, hy2Ok, caddyError, hy2Error,
+           servicesReloaded: caddyOk && mitaOk && hy2Ok };
 }
 
 // ── Express app ───────────────────────────────────────────────────────────────
@@ -1721,7 +1931,7 @@ app.post('/api/panel/stub', requireAuth, (req, res) => {
 });
 
 // ── Validation helpers ────────────────────────────────────────────────────────
-const VALID_PROTOCOLS = ['naive', 'mieru'];
+const VALID_PROTOCOLS = ['naive', 'mieru', 'hy2'];
 const USERNAME_RE     = /^[a-zA-Z0-9_.-]{1,64}$/;
 const EMAIL_RE        = /^[^\s@]+@[^\s@]+\.[^\s@]+$/;
 
@@ -1797,7 +2007,7 @@ function validateUserInput({ email, username, password, protocols, quotaMB, quot
     if (invalid.length)
       return { error: `unknown protocol(s): ${invalid.join(', ')}. Allowed: ${VALID_PROTOCOLS.join(', ')}` };
     if (!protocols.length)
-      return { error: 'at least one protocol is required (naive, mieru)' };
+      return { error: 'at least one protocol is required (naive, mieru, hy2)' };
     resolvedProtocols = protocols;
   }
   return { quotaMB: resolvedQuotaMB, protocols: resolvedProtocols };
@@ -2072,6 +2282,116 @@ app.post('/api/settings/mieru-ports', requireAuth, (req, res) => {
     const ok = restartMieru();
     res.json({ ok, message: `Mieru ports changed to ${s}–${e}. Service restarted. Clients must download new configs.` });
   } catch (err) { res.status(500).json({ error: err.message }); }
+});
+
+// ── Hy2 (Hysteria2) settings ─────────────────────────────────────────────────
+
+// Status: is Hy2 installed, on which port, and is the service active + how many
+// users in the shared pool have hy2 enabled.
+app.get('/api/settings/hy2', requireAuth, (req, res) => {
+  const installed = hy2Installed();
+  let active = false;
+  if (installed) {
+    try { active = execSync('systemctl is-active hysteria-server 2>/dev/null', { timeout: 5000 }).toString().trim() === 'active'; } catch {}
+  }
+  res.json({
+    installed,
+    active,
+    port: parseInt(cfg.hy2Port, 10) || 443,
+    stack: cfg.stack || { naive: true, mieru: true, hy2: false },
+    hy2UserCount: (() => { try { return getHy2Users().length; } catch { return 0; } })()
+  });
+});
+
+// Install (or reinstall) the Hy2 server. Runs install_hysteria.sh with the
+// configured domain/port and USE_CADDY_CERT=1 (reuse Caddy cert, no 2nd email),
+// then immediately writes the userpass map from the shared pool.
+app.post('/api/settings/hy2/install', requireAuth, (req, res) => {
+  if (!cfg.domain || cfg.domain === 'localhost')
+    return res.status(400).json({ error: 'A real domain must be configured before installing Hy2 (TLS/SNI required).' });
+
+  // Optional one-shot port override at install time.
+  if (req.body && req.body.port !== undefined) {
+    const p = parseInt(req.body.port, 10);
+    if (!p || p < 1 || p > 65535) return res.status(400).json({ error: 'Invalid port (1–65535)' });
+    cfg.hy2Port = p;
+  }
+  const useCaddyCert = !(req.body && req.body.useCaddyCert === false);
+
+  const r = runInstallHysteria({ port: cfg.hy2Port, useCaddyCert });
+  if (!r.ok) {
+    return res.status(500).json({ ok: false, error: 'Hy2 install failed', output: r.output });
+  }
+  // Mark installed and persist BEFORE writing users so a restart mid-flow still
+  // knows Hy2 is present.
+  cfg.stack = cfg.stack || {};
+  cfg.stack.hy2 = true;
+  saveConfig();
+
+  // Push the shared-pool users into the userpass map right away.
+  let hy2Sync = { ok: true };
+  try { hy2Sync = writeHysteriaConfig(); } catch (e) { hy2Sync = { ok: false, error: e.message }; }
+
+  let active = false;
+  try { active = execSync('systemctl is-active hysteria-server 2>/dev/null', { timeout: 5000 }).toString().trim() === 'active'; } catch {}
+
+  res.json({
+    ok: true,
+    installed: true,
+    active,
+    port: cfg.hy2Port,
+    hy2Sync,
+    message: `Hysteria2 установлен на порт ${cfg.hy2Port}/udp. Пользователи с протоколом hy2 добавлены. Клиенты могут скачать hy2-ссылку.`,
+    output: r.output
+  });
+});
+
+// Change the Hy2 UDP port: update config.yaml's listen directive + restart.
+app.post('/api/settings/hy2-port', requireAuth, (req, res) => {
+  const p = parseInt(req.body.port, 10);
+  if (!p || p < 1 || p > 65535)
+    return res.status(400).json({ error: 'Invalid port (1–65535)' });
+
+  const oldPort = parseInt(cfg.hy2Port, 10) || 443;
+  cfg.hy2Port = p; saveConfig();
+
+  // If Hy2 isn't installed yet, just remember the port for the next install.
+  if (!hy2Installed()) {
+    return res.json({ ok: true, port: p, installed: false,
+      message: `Hy2 порт сохранён (${p}/udp). Применится при установке Hy2.` });
+  }
+
+  // Rewrite the `listen:` line in config.yaml atomically, then restart.
+  try {
+    let text = fs.readFileSync(HY2_CONFIG, 'utf8');
+    const before = text;
+    text = text.replace(/^listen:.*$/m, `listen: :${p}`);
+    if (text === before && !/^listen:/m.test(text)) {
+      // No listen line at all — prepend one.
+      text = `listen: :${p}\n` + text;
+    }
+    // Update firewall if UFW active (best-effort).
+    try {
+      execSync(`command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active' && ufw allow ${p}/udp >/dev/null 2>&1 || true`, { timeout: 8000 });
+      if (oldPort !== p) execSync(`command -v ufw >/dev/null 2>&1 && ufw status 2>/dev/null | grep -qi 'Status: active' && ufw delete allow ${oldPort}/udp >/dev/null 2>&1 || true`, { timeout: 8000 });
+    } catch {}
+
+    const tmp = HY2_CONFIG + '.new';
+    const last = HY2_CONFIG + '.last';
+    fs.writeFileSync(tmp, text, { mode: 0o600 });
+    try { fs.copyFileSync(HY2_CONFIG, last); } catch {}
+    fs.renameSync(tmp, HY2_CONFIG);
+
+    const r = reloadHysteria();
+    if (!r.ok) {
+      // Roll back
+      try { if (fs.existsSync(last)) { fs.copyFileSync(last, HY2_CONFIG); reloadHysteria(); } } catch {}
+      cfg.hy2Port = oldPort; saveConfig();
+      return res.status(500).json({ ok: false, error: 'Hy2 failed to start on new port; rolled back. ' + (r.error || '') });
+    }
+    res.json({ ok: true, port: p, installed: true,
+      message: `Hy2 порт изменён на ${p}/udp. Сервис перезапущен. Клиенты должны обновить ссылки.` });
+  } catch (e) { res.status(500).json({ error: e.message }); }
 });
 
 // Traffic pattern + MTU: mita reload
@@ -2658,6 +2978,37 @@ app.get('/api/users/:id/config/mieru-link', requireAuth, (req, res) => {
   res.json({ link, username: user.username });
 });
 
+// Hy2 (Hysteria2) share link. Canonical form consumed by NekoBox/Karing/
+// Shadowrocket/Streisand:
+//   hysteria2://user:pass@domain:port?sni=domain&insecure=0#user
+// Host is the DOMAIN (Hy2 uses real TLS SNI + a shared Caddy cert), port is the
+// configurable cfg.hy2Port (default 443/udp). We percent-encode userinfo so odd
+// passwords stay valid; `insecure=0` because the cert is a real trusted one.
+function buildHy2Link({ username, password, domain, port }) {
+  const enc = encodeURIComponent;
+  const userinfo = `${enc(username)}:${enc(password)}`;
+  const q = `sni=${enc(domain)}&insecure=0`;
+  return `hysteria2://${userinfo}@${domain}:${port}?${q}#${enc(username)}`;
+}
+
+app.get('/api/users/:id/config/hy2', requireAuth, (req, res) => {
+  const user = getUserById(req.params.id);
+  if (!user) return res.status(404).json({ error: 'User not found' });
+  // Guard: the user must actually have Hy2 enabled in the shared pool.
+  const protos = parseUserRow(user).protocols || [];
+  if (!protos.includes('hy2'))
+    return res.status(409).json({ error: 'User does not have the hy2 protocol enabled' });
+  const password = req.query.password || user.password || 'YOUR_PASSWORD';
+  const port = parseInt(cfg.hy2Port, 10) || 443;
+  const link = buildHy2Link({
+    username: user.username,
+    password,
+    domain: cfg.domain,
+    port
+  });
+  res.json({ link, username: user.username });
+});
+
 app.get('/api/users/:id/config/universal', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
@@ -2765,6 +3116,14 @@ app.get('/api/status', requireAuth, async (req, res) => {
         mieru: {
           active:  exec_('systemctl is-active mita') === 'active',
           version: exec_('mita version 2>/dev/null | head -1')
+        },
+        // Hy2: only report as a service if installed; UI hides the card
+        // otherwise. `installed:false` lets the UI show a "Доустановить Hy2".
+        hy2: {
+          installed: hy2Installed(),
+          active:    hy2Installed() && exec_('systemctl is-active hysteria-server') === 'active',
+          version:   hy2Installed() ? exec_('/usr/local/bin/hysteria version 2>/dev/null | head -1') : '',
+          port:      parseInt(cfg.hy2Port, 10) || 443
         },
         panel: { active: true }
       },
@@ -3108,7 +3467,11 @@ app.get('/api/diagnostics', requireAuth, async (_req, res) => {
     ports: {
       naive:       chkPort(cfg.naivePort),
       mieru:       chkPort(cfg.mieruPortStart),
-      mieruPorts:  mieruPortsListening
+      mieruPorts:  mieruPortsListening,
+      // Hy2 listens on UDP; chkPort uses `ss -tlnup` which covers UDP too.
+      hy2:         hy2Installed() ? chkPort(cfg.hy2Port) : false,
+      hy2Port:     parseInt(cfg.hy2Port, 10) || 443,
+      hy2Installed: hy2Installed()
     },
     naiveVersionOk:    caddyVersionOk,
     naiveVersion:      caddyVersionStr,    // kept as 'naiveVersion' for front-end compat
@@ -3135,10 +3498,11 @@ app.get('/api/diagnostics', requireAuth, async (_req, res) => {
 app.post('/api/service/:name/:action', requireAuth, (req, res) => {
   const { name, action } = req.params;
   // Map legacy 'naive' name to 'caddy-naive'; keep 'mita' as-is
-  const svcMap = { 'naive': 'caddy-naive', 'caddy-naive': 'caddy-naive', 'mita': 'mita' };
+  const svcMap = { 'naive': 'caddy-naive', 'caddy-naive': 'caddy-naive', 'mita': 'mita',
+                   'hy2': 'hysteria-server', 'hysteria-server': 'hysteria-server' };
   const svcName = svcMap[name];
   if (!svcName)
-    return res.status(400).json({ error: 'Unknown service (valid: naive/caddy-naive, mita)' });
+    return res.status(400).json({ error: 'Unknown service (valid: naive/caddy-naive, mita, hy2/hysteria-server)' });
   if (!['start','stop','restart','reload'].includes(action))
     return res.status(400).json({ error: 'Unknown action' });
   try {
@@ -3178,7 +3542,9 @@ wss.on('connection', ws => {
         ramTotalMB: Math.round(mem.total / 1048576),
         // v1.2.3: check caddy-naive service
         naive:      exec_('systemctl is-active caddy-naive') === 'active',
-        mieru:      exec_('systemctl is-active mita')        === 'active'
+        mieru:      exec_('systemctl is-active mita')        === 'active',
+        // Hy2: only meaningful when installed; false otherwise (UI hides card).
+        hy2:        hy2Installed() && exec_('systemctl is-active hysteria-server') === 'active'
       }));
     } catch {}
   };
