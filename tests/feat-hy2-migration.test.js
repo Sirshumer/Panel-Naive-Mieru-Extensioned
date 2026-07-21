@@ -228,6 +228,32 @@ console.log('\n[7c] update.sh: opt-in Hy2 auto-enroll (HY2_ENROLL_ALL=1)');
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
+// v1.8.3 — a same-version box hit the "Nothing to do" early-exit before the
+// enroll step ran. Two fixes: (a) HY2_ENROLL_ALL=1 forces the full flow even
+// when version is unchanged; (b) a dedicated --enroll-hy2 mode runs ONLY the
+// enroll (no full update) as a clean one-liner.
+console.log('\n[7d] update.sh: enroll reachable on a same-version box');
+{
+  // (a) HY2_ENROLL_ALL=1 bypasses the "Nothing to do" early-exit
+  ok(/HY2_ENROLL_ALL:-0\}" == "1" \]\] && ! version_gt "\$TARGET_VERSION" "\$current"/.test(upSrc),
+     'HY2_ENROLL_ALL=1 runs full flow even when version already matches');
+  ok(/running full update flow to apply the Hy2 enrollment/.test(upSrc),
+     'logs that it is proceeding despite unchanged version');
+
+  // (b) dedicated --enroll-hy2 mode
+  ok(/--enroll-hy2\) MODE="enroll-hy2"/.test(upSrc), '--enroll-hy2 flag parsed');
+  ok(/do_enroll_hy2\(\)/.test(upSrc), 'do_enroll_hy2() defined');
+  ok(/enroll-hy2\) check_install; load_config; do_enroll_hy2/.test(upSrc),
+     '--enroll-hy2 dispatched in main() case');
+  ok(/HY2_ENROLL_ALL=1 migrate_hy2_enroll_all/.test(upSrc),
+     'do_enroll_hy2 forces the flag and reuses migrate_hy2_enroll_all (no dup logic)');
+  ok(/Hysteria2 is not installed\. Install it first/.test(upSrc),
+     'do_enroll_hy2 errors clearly if Hy2 not installed');
+  ok(/--enroll-hy2 {2,}Add Hysteria2 to EVERY existing user/.test(upSrc),
+     '--enroll-hy2 documented in --help');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 console.log('\n[8] Sub-stage D: warp_egress.sh marks the inbound-UDP reply path (Hy2/QUIC)');
 {
   function fnBody(name) {

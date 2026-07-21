@@ -113,6 +113,7 @@ parse_args() {
       --ssh-only)  MODE="ssh-only" ;;
       --status)    MODE="status" ;;
       --repair)    MODE="repair" ;;
+      --enroll-hy2) MODE="enroll-hy2" ;;
       --help|-h)   print_help; exit 0 ;;
       *) die "Unknown argument: $1  (use --help)" ;;
     esac
@@ -151,6 +152,9 @@ OPTIONS:
                           remove the panel block, close any legacy bare port
   --status               Print full health report
   --repair               Rebuild Caddyfile + mita config from SQLite DB; restart services
+  --enroll-hy2           Add Hysteria2 to EVERY existing user + rewrite userpass +
+                         restart Hy2 (one-off; existing clients start working over Hy2).
+                         Same as HY2_ENROLL_ALL=1 but runs ONLY this step (no full update).
   --help                 Show this help
 
 EXAMPLES:
@@ -1857,6 +1861,28 @@ print_panel_credentials() {
   echo ""
 }
 
+# ── --enroll-hy2 mode ────────────────────────────────────────────────────────
+# One-off: add "hy2" to every existing user, rewrite userpass, restart Hy2 —
+# WITHOUT running a full update. Delegates to migrate_hy2_enroll_all (which is
+# gated on HY2_ENROLL_ALL=1), so we just force the flag on for this invocation.
+do_enroll_hy2() {
+  log_step "Enroll-Hy2 mode — adding Hysteria2 to all existing users"
+  if [[ ! -f /etc/hysteria/config.yaml || ! -x /usr/local/bin/hysteria ]]; then
+    log_error "Hysteria2 is not installed. Install it first: panel → Settings → «Доустановить Hy2»."
+    exit 1
+  fi
+  if ! $YES; then
+    if [[ -r /dev/tty ]]; then
+      read -rp "Add Hy2 to EVERY user and restart hysteria-server? [y/N]: " confirm </dev/tty || confirm=""
+      [[ "${confirm^^}" != "Y" ]] && { log_info "Aborted."; exit 0; }
+    else
+      log_info "No interactive terminal — proceeding (explicit --enroll-hy2 is consent)."
+    fi
+  fi
+  HY2_ENROLL_ALL=1 migrate_hy2_enroll_all
+  log_info "Enroll-Hy2 done. Verify: systemctl is-active hysteria-server"
+}
+
 # ── --repair mode ─────────────────────────────────────────────────────────────
 # Rebuild Caddyfile + mita config from SQLite DB; no data loss.
 # v1.2.3: Calls /api/services/rebuild-all (falls back to direct DB rebuild).
@@ -2019,7 +2045,14 @@ do_update() {
   local current; current=$(get_current_version)
   log_info "Installed version: $current  |  Target: $TARGET_VERSION"
 
-  if ! $FORCE && ! version_gt "$TARGET_VERSION" "$current"; then
+  # v1.8.3: an explicit maintenance action (HY2_ENROLL_ALL=1) must ALWAYS run to
+  # completion, even when the installed version already equals the target — the
+  # operator asked for a one-off migration, not a version upgrade. Without this,
+  # a same-version box hit the "Nothing to do" early-exit and the enroll step
+  # (which lives further down in do_update) never executed.
+  if [[ "${HY2_ENROLL_ALL:-0}" == "1" ]] && ! version_gt "$TARGET_VERSION" "$current"; then
+    log_info "HY2_ENROLL_ALL=1 — running full update flow to apply the Hy2 enrollment (version unchanged)."
+  elif ! $FORCE && ! version_gt "$TARGET_VERSION" "$current"; then
     log_info "Version file already reports $current (target $TARGET_VERSION)."
     if $YES; then
       # Bug 76: in non-interactive mode, re-sync the panel files anyway. The
@@ -2139,6 +2172,7 @@ main() {
     expose)   check_install; load_config; do_expose ;;
     ssh-only) check_install; load_config; do_ssh_only ;;
     repair)   check_install; load_config; do_repair ;;
+    enroll-hy2) check_install; load_config; do_enroll_hy2 ;;
     update)   check_install; load_config; do_update ;;
   esac
 }

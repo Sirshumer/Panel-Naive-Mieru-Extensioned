@@ -7,6 +7,34 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.8.3]
+
+> **BUGFIX — `HY2_ENROLL_ALL=1 ./update.sh` did nothing on a same-version box**
+> (it hit the "Nothing to do" early-exit before the enroll step) + a dedicated
+> one-liner mode for the enrollment.
+
+### Fixed
+- **Enroll now runs even when the installed version already equals the target.**
+  A box already on the current version answered the "Re-sync / force update
+  anyway?" gate and exited with "Nothing to do" *before* reaching
+  `migrate_hy2_enroll_all`, so `HY2_ENROLL_ALL=1` silently had no effect. When
+  `HY2_ENROLL_ALL=1` is set the updater now proceeds through the full flow
+  regardless of version.
+
+### Added
+- **`update.sh --enroll-hy2`** — dedicated mode that runs ONLY the Hy2
+  enrollment (add `"hy2"` to every user → rewrite `userpass` → restart Hy2),
+  with **no full update**. Cleaner one-liner than the env var; errors clearly if
+  Hy2 isn't installed; confirms on a TTY (or `-y` to skip). Documented in
+  `--help`.
+
+### Tests
+- `feat-hy2-migration.test.js`: +8 assertions (same-version bypass + the
+  `--enroll-hy2` flag/dispatch/help wiring), 79 total. Full suite green
+  (18 files, 0 failed). Nothing breaks.
+
+---
+
 ## [v1.8.2]
 
 > **BUGFIX — Hy2 crash-loops with `auth.userpass: empty auth userpass`** when no
