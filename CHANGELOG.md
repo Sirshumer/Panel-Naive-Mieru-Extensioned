@@ -7,6 +7,36 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.7.0]
+
+> **FEATURE — Hysteria2 (Hy2) integration.** The panel now manages a THIRD
+> protocol, Hysteria2 (QUIC/UDP), alongside Naive and Mieru — **one shared user
+> pool**: a user has Hy2 access iff its `protocols` array contains `"hy2"`.
+
+### Added
+- **`scripts/install_hysteria.sh`** — multi-arch Hy2 installer. Configurable
+  UDP port (`HY_PORT`, default **443/udp**, coexists with Naive on TCP/443
+  because our Caddy runs `protocols h1 h2` → HTTP/3 off → UDP/443 free).
+  `USE_CADDY_CERT=1` reuses Caddy's existing certificate (**no second email,
+  no second ACME**) and installs a `caddy-cert-watcher` to restart Hy2 on cert
+  renewal. Standalone ACME path retained as a fallback.
+- **Backend Hy2 config owner** — `writeHysteriaConfig()` rewrites ONLY the
+  `auth.userpass` block of `/etc/hysteria/config.yaml` from the shared SQLite
+  pool (atomic write → structural validate → `.last` backup → restart → verify
+  → rollback on failure). No new dependency (targeted string splice, not YAML
+  parse). `applyAllConfigs()` calls it after every user add/edit/delete/backup-
+  restore — **non-fatal, no-op when Hy2 isn't installed**.
+- **API** — `GET /api/users/:id/config/hy2` (`hysteria2://` share link),
+  `GET /api/settings/hy2` (installed/active/port/user-count),
+  `POST /api/settings/hy2/install`, `POST /api/settings/hy2-port` (atomic
+  `listen:` rewrite + restart + rollback + UFW). `hy2` added to
+  `VALID_PROTOCOLS`. `/api/status`, `/api/diagnostics`, WS metrics and the
+  service-control map all report/allow `hy2`/`hysteria-server`.
+- **Config** — `cfg.hy2Port` (default 443) and `cfg.stack {naive,mieru,hy2}`
+  with runtime backfill so legacy configs upgrade seamlessly.
+- **Tests** — `tests/feat-hy2-link.test.js` (33 assertions: link builder, auth
+  block, config splice/preservation, structural validation).
+
 ## [v1.6.0]
 
 > **FEATURE — Backup & Restore (one-file disaster recovery).** New card in
