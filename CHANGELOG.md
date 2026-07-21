@@ -9,10 +9,32 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [v1.8.0]
 
-> **FEATURE — Hysteria2 UI + WARP compatibility (continuation of v1.7.0).**
-> Completes the Hy2 frontend and makes Hy2/QUIC work through Cloudflare WARP.
+> **FEATURE — Hysteria2 UI + WARP compatibility + upgrade migration
+> (continuation of v1.7.0).** Completes the Hy2 frontend, makes Hy2/QUIC work
+> through Cloudflare WARP, and makes existing installs upgrade cleanly — the
+> "Доустановить Hy2" button appears after a plain `update.sh` with **zero data
+> loss** (existing users, protocols, Naive/Mieru configs are untouched).
 
 ### Added
+- **Upgrade migration (Sub-stage C)** — `update.sh` / `install.sh`:
+  - `migrate_config`: backfills `hy2Port` (443/udp) and `stack.{naive,mieru,hy2}`
+    into `config.json` for pre-Hy2 installs. **`stack.hy2` defaults to `false` —
+    the update NEVER auto-installs Hy2**; it only makes the install card
+    available in Settings. Idempotent — custom `hy2Port` / operator-enabled
+    `stack.hy2=true` are preserved via jq `//` fallbacks. Existing `users` and
+    their `protocols` arrays are left completely untouched.
+  - `migrate_hy2`: on update, restarts `hysteria-server` **only if Hy2 is
+    installed** (config.yaml + binary present); otherwise prints a one-line
+    "Доустановить Hy2" hint. `do_repair` likewise restarts Hy2 when installed
+    (the panel re-syncs the `userpass` map from the SQLite pool → no user loss).
+  - `update_panel`: `chmod +x` the shipped `install_hysteria.sh` /
+    `warp_egress.sh` / `cascade_mieru.sh` helpers (both `$PANEL_DIR/scripts` and
+    the legacy `$PANEL_DIR/panel/scripts` layouts) so the panel can run them.
+  - `do_status`: adds a `hysteria (Hy2)` version line, a hysteria-server
+    active/inactive (or "not installed") indicator, and `hy2Port`/`stack` in the
+    config dump.
+  - `install.sh`: fresh installs write the same Hy2 config defaults
+    (`hy2Port: 443`, `stack.hy2: false`) — Hy2 added later from the panel.
 - **Full Hy2 frontend (Sub-stage B-UI):**
   - Dashboard: Hy2 service card (auto-shown when installed) with status badge
     and start/stop/restart service buttons.
@@ -33,9 +55,13 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   OUTPUT; teardown mirrors the deletes. Hy2's own outbound dials still egress
   via WARP.
 
-### Notes
-- Sub-stage C (`update.sh` migration for existing installs — "Доустановить Hy2")
-  is **still pending** and tracked for a follow-up commit.
+### Tests
+- **`tests/feat-hy2-migration.test.js`** (40 assertions): validates the
+  update.sh/install.sh Hy2 migration (config backfill, idempotency, users
+  preserved), the Hy2 restart-only-when-installed logic, do_status wiring, the
+  server runtime backfill + `/api/settings/hy2`, and the Sub-stage D WARP UDP
+  reply-path rules (incl. that the BUG-171 TCP rule is untouched). Wired into
+  `npm test`. Full suite: **18 files, all green, 0 failed.**
 
 ---
 

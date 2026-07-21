@@ -401,6 +401,31 @@ migrate_config() {
     rm -f "$tmp2"
   fi
 
+  # v1.8.0 (Hy2 Sub-stage C): backfill the Hysteria2 config fields for installs
+  # that predate the 3rd protocol. We add hy2Port (default 443/udp) and the
+  # stack.{naive,mieru,hy2} map. CRITICAL: stack.hy2 defaults to FALSE — the
+  # update NEVER auto-installs Hy2; it only makes the "Доустановить Hy2" button
+  # available in Settings (the server reports installed:false via
+  # /api/settings/hy2, so the UI renders the install card). Existing users and
+  # their protocols array are left completely untouched. This mirrors the
+  # server-side runtime backfill (index.js) so the config is correct even before
+  # the panel process restarts.
+  local has_hy2; has_hy2=$(jq -r 'has("hy2Port") and (.stack? // {} | has("hy2"))' "$PANEL_CONFIG" 2>/dev/null)
+  if [[ "$has_hy2" != "true" ]]; then
+    local tmp3; tmp3=$(mktemp)
+    if jq '
+        .hy2Port      = (.hy2Port // 443)
+      | .stack        = (.stack // {})
+      | .stack.naive  = (.stack.naive // true)
+      | .stack.mieru  = (.stack.mieru // true)
+      | .stack.hy2    = (.stack.hy2   // false)
+    ' "$PANEL_CONFIG" > "$tmp3" 2>/dev/null && [[ -s "$tmp3" ]]; then
+      cat "$tmp3" > "$PANEL_CONFIG"
+      log_info "Config migrated: Hy2 fields added (hy2Port=443/udp, stack.hy2=false — install via Settings) ✓"
+    fi
+    rm -f "$tmp3"
+  fi
+
   # BUG-155 (HIGH): self-heal a polluted panelBasicAuthHash. A pre-fix installer
   # could capture `apt-get install apache2-utils` stdout (Selecting previously…,
   # Unpacking…, needrestart banner) into the hash → multi-line value → invalid
@@ -1078,6 +1103,30 @@ migrate_cascade_watchdog() {
   fi
 }
 
+# ── v1.8.0 (Hy2 Sub-stage C): Hysteria2 update migration ─────────────────────
+#   Hy2 is the OPTIONAL third protocol. This migration NEVER auto-installs it.
+#     • Installed (config + binary present): restart hysteria-server so the
+#       refreshed unit/config (and any panel-rewritten userpass) take effect,
+#       exactly like caddy-naive/mita above. The panel keeps the userpass map in
+#       sync from the SQLite pool on the next applyAllConfigs(), so existing Hy2
+#       users are NOT dropped.
+#     • Not installed: print a one-line hint that Hy2 can be added from Settings
+#       ("Доустановить Hy2"). No side effects — existing installs are untouched.
+#   Idempotent and safe under -y / --dry-run.
+migrate_hy2() {
+  $DRY_RUN && { log_dry "Would restart hysteria-server if Hy2 is installed (else print an install hint)"; return 0; }
+  if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    if systemctl restart hysteria-server 2>/dev/null; then
+      log_info "Hy2: hysteria-server restarted to pick up the update ✓"
+    else
+      log_warn "Hy2: hysteria-server restart failed — journalctl -u hysteria-server -n 20"
+    fi
+  else
+    log_info "Hy2 (Hysteria2) is available but NOT installed — add it any time from the panel: Settings → «Доустановить Hy2» (443/udp by default, reuses the Caddy cert)."
+  fi
+}
+
 # ── Bug 79: fix caddy-naive config permissions ───────────────────────────────
 #   caddy-naive runs as User=caddy and fails to start with
 #     "reading config from file: open /etc/caddy-naive/Caddyfile: permission denied"
@@ -1280,6 +1329,20 @@ update_panel() {
   done
   chmod +x "$PANEL_DIR/update.sh" "$PANEL_DIR/install.sh" "$PANEL_DIR/uninstall.sh" 2>/dev/null || true
 
+  # v1.8.0 (Hy2 Sub-stage C): make the shipped helper scripts executable so the
+  # panel can run them. install_hysteria.sh is the Hy2 installer invoked by
+  # POST /api/settings/hy2/install (the "Доустановить Hy2" button); warp_egress.sh
+  # / cascade_mieru.sh are the WARP + cascade helpers. `cp -a` preserves mode from
+  # the repo, but a git/tarball checkout may land them non-executable — force it.
+  # NOTE: server/index.js resolves scripts via __dirname/../scripts, so on prod
+  # they live at $PANEL_DIR/scripts. We chmod BOTH that canonical location and the
+  # legacy $PANEL_DIR/panel/scripts path (older layouts) to be safe.
+  for base in "$PANEL_DIR/scripts" "$PANEL_DIR/panel/scripts"; do
+    for s in install_hysteria.sh warp_egress.sh cascade_mieru.sh; do
+      [[ -f "$base/$s" ]] && chmod +x "$base/$s" 2>/dev/null || true
+    done
+  done
+
   # npm install must NOT be fatal — keep going even on a transient failure.
   ( cd "$PANEL_DIR" && npm install --omit=dev --silent ) \
     || ( cd "$PANEL_DIR" && npm install --production --silent ) \
@@ -1319,6 +1382,17 @@ smoke_test() {
   # v1.2.3: check caddy-naive (not legacy naive)
   check_svc caddy-naive
   check_svc mita
+
+  # v1.8.0 (Hy2 Sub-stage C): Hy2 is OPTIONAL — only smoke-test it when the
+  # operator has actually installed it (config + binary present). A box that
+  # never enabled Hy2 must NOT be flagged as failing.
+  if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
+    if systemctl is-active --quiet hysteria-server; then
+      echo -e "  ${GREEN}✓${NC} hysteria-server active (Hy2)"; (( pass++ ))
+    else
+      echo -e "  ${YELLOW}⚠${NC}  hysteria-server INACTIVE (Hy2 installed) — journalctl -u hysteria-server -n 20"
+    fi
+  fi
 
   # caddy-naive version check
   if timeout 5 "$CADDY_BIN" version &>/dev/null 2>&1 || \
@@ -1387,6 +1461,7 @@ do_status() {
   echo "  Panel:          $(get_current_version) (target: $TARGET_VERSION)"
   echo "  caddy-naive:    $("$CADDY_BIN" version 2>/dev/null | head -1 || echo 'not installed')"
   echo "  mita:           $(mita version 2>/dev/null | head -1 || echo 'not installed')"
+  echo "  hysteria (Hy2): $([[ -x /usr/local/bin/hysteria ]] && /usr/local/bin/hysteria version 2>/dev/null | head -1 || echo 'not installed')"
   echo "  Node.js:        $(node --version 2>/dev/null || echo 'not installed')"
   echo "  PM2:            $(pm2 --version 2>/dev/null || echo 'not installed')"
   echo ""
@@ -1408,6 +1483,18 @@ do_status() {
       echo -e "  ${RED}●${NC} $svc — $status"
     fi
   done
+  # v1.8.0: Hy2 (Hysteria2) — only shown when the optional 3rd protocol is
+  # installed; a box that never enabled it simply omits the line.
+  if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
+    local hy2s; hy2s=$(systemctl is-active hysteria-server 2>/dev/null || echo "unknown")
+    if [[ "$hy2s" == "active" ]]; then
+      echo -e "  ${GREEN}●${NC} hysteria-server — active (Hy2)"
+    else
+      echo -e "  ${RED}●${NC} hysteria-server — $hy2s (Hy2)"
+    fi
+  else
+    echo -e "  ${YELLOW}○${NC} hysteria-server — not installed (add from Settings → «Доустановить Hy2»)"
+  fi
   # Legacy naive check
   if systemctl is-active naive &>/dev/null 2>&1; then
     echo -e "  ${YELLOW}●${NC} naive — active (LEGACY — should have been removed in v1.2.3 migration)"
@@ -1421,6 +1508,7 @@ do_status() {
   echo -e "${BOLD}Configuration:${NC}"
   if [[ -f "$PANEL_CONFIG" ]]; then
     jq '{ domain, serverIp, naivePort, mieruPortStart, mieruPortEnd,
+          hy2Port, stack,
           exposePanel, trafficPattern, mtu, udpEnabled,
           fakeSiteUrl, probeSecret }' \
       "$PANEL_CONFIG" 2>/dev/null | sed 's/^/  /'
@@ -1740,6 +1828,16 @@ FAKEHTML
   systemctl restart mita 2>/dev/null && log_info "mita restarted ✓" || \
     log_warn "mita restart failed — journalctl -u mita -n 20"
 
+  # v1.8.0 (Hy2 Sub-stage C): if Hy2 is installed, restart it too. The panel
+  # rewrites /etc/hysteria/config.yaml's userpass map from the SQLite pool on its
+  # next applyAllConfigs(), so a repair keeps Hy2 users in sync (no data loss).
+  # Skipped entirely when Hy2 was never installed.
+  if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    systemctl restart hysteria-server 2>/dev/null && log_info "hysteria-server restarted (Hy2) ✓" || \
+      log_warn "hysteria-server restart failed — journalctl -u hysteria-server -n 20"
+  fi
+
   # Bug 104 (v1.4.2): --repair previously left config.json's "version" untouched,
   # so PM2 / the UI kept reporting a stale version (e.g. 1.2.6 while 1.4.x is
   # installed). Sync config.json to the installed VERSION *before* restarting the
@@ -1858,6 +1956,10 @@ do_update() {
   # BUG-172 migration: refresh the cascade watchdog (full-chain probe + nightly
   # redsocks recycle) on any box that currently has the Mieru cascade enabled.
   migrate_cascade_watchdog
+
+  # v1.8.0 (Hy2 Sub-stage C): restart Hy2 if installed, else hint how to add it.
+  # Runs BEFORE the dry-run gate returns so --dry-run reports the intended action.
+  migrate_hy2
 
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
 
