@@ -1127,6 +1127,121 @@ migrate_hy2() {
   fi
 }
 
+# ── v1.8.2: Opt-in auto-enroll — add "hy2" to EVERY existing user's protocols ─
+#   Requested feature: "чтобы на уже выпущенные клиенты Hy2 сам подтянулся".
+#   Existing clients were issued BEFORE Hy2 existed, so their protocols array is
+#   ["naive","mieru"] and they never appear in auth.userpass → they can't use Hy2.
+#   This backfills "hy2" into every user (idempotent — users who already have it
+#   are skipped), then rewrites /etc/hysteria/config.yaml's userpass block and
+#   restarts the service so all clients work over Hy2 immediately.
+#
+#   OPT-IN by design: runs only when HY2_ENROLL_ALL=1 is set (so a plain update
+#   never silently changes which protocols users have). Requires Hy2 installed.
+#   Passwords are unchanged — the same credential the client already has works
+#   for Hy2 (auth.userpass maps username → the stored plaintext password).
+migrate_hy2_enroll_all() {
+  [[ "${HY2_ENROLL_ALL:-0}" == "1" ]] || return 0
+  $DRY_RUN && { log_dry "Would add 'hy2' to every user's protocols and rewrite Hy2 userpass (HY2_ENROLL_ALL=1)"; return 0; }
+
+  if [[ ! -f /etc/hysteria/config.yaml || ! -x /usr/local/bin/hysteria ]]; then
+    log_warn "HY2_ENROLL_ALL=1 set but Hy2 is not installed — install it first (Settings → «Доустановить Hy2»), then re-run."
+    return 0
+  fi
+  [[ -f "$DB_PATH" ]] || { log_warn "DB not found at $DB_PATH — cannot enroll users"; return 0; }
+
+  log_step "Enrolling all existing users into Hy2 (HY2_ENROLL_ALL=1)"
+
+  local enroll_js; enroll_js="$(mktemp /tmp/rixxx-hy2-enroll.XXXXXX.js)"
+  cat > "$enroll_js" << 'NODE_EOF'
+'use strict';
+const Database = require('better-sqlite3');
+const db = new Database(process.env.RB_DB_PATH);
+const rows = db.prepare('SELECT id, username, protocols FROM users').all();
+const upd = db.prepare('UPDATE users SET protocols = ? WHERE id = ?');
+let changed = 0, already = 0;
+const tx = db.transaction(() => {
+  for (const r of rows) {
+    let arr;
+    try { arr = JSON.parse(r.protocols || '["naive","mieru"]'); }
+    catch { arr = ['naive', 'mieru']; }
+    if (!Array.isArray(arr)) arr = ['naive', 'mieru'];
+    if (arr.includes('hy2')) { already++; continue; }
+    arr.push('hy2');
+    upd.run(JSON.stringify(arr), r.id);
+    changed++;
+  }
+});
+tx();
+db.close();
+console.log('[hy2-enroll] added hy2 to ' + changed + ' user(s); ' + already + ' already had it');
+NODE_EOF
+
+  if ( cd "$PANEL_DIR" && RB_DB_PATH="$DB_PATH" node "$enroll_js" ); then
+    log_info "All users enrolled into Hy2 ✓"
+  else
+    rm -f "$enroll_js"
+    log_warn "Hy2 auto-enroll failed (node/better-sqlite3) — users left unchanged"
+    return 1
+  fi
+  rm -f "$enroll_js"
+
+  # Rewrite the userpass block from the (now-enrolled) DB and restart Hy2.
+  local rewrite_js; rewrite_js="$(mktemp /tmp/rixxx-hy2-rewrite.XXXXXX.js)"
+  cat > "$rewrite_js" << 'NODE_EOF'
+'use strict';
+const fs = require('fs');
+const Database = require('better-sqlite3');
+const CFG = '/etc/hysteria/config.yaml';
+const db = new Database(process.env.RB_DB_PATH, { readonly: true });
+const users = db.prepare('SELECT username, password, protocols FROM users').all()
+  .filter(u => { try { return JSON.parse(u.protocols || '[]').includes('hy2'); } catch { return false; } });
+db.close();
+
+const q = s => '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+const lines = ['auth:', '  type: userpass', '  userpass:'];
+const seen = new Set();
+for (const u of users) {
+  if (!u.username || seen.has(u.username) || !u.password) continue;
+  seen.add(u.username);
+  lines.push('    ' + u.username + ': ' + q(u.password));
+}
+if (lines.length === 3) {
+  // never leave an empty map (Hy2 FATALs) — disabled sentinel
+  const rnd = require('crypto').randomBytes(24).toString('hex');
+  lines.push('    __disabled_no_hy2_users__: ' + q('disabled-' + rnd));
+}
+const block = lines.join('\n') + '\n';
+
+let text = fs.readFileSync(CFG, 'utf8');
+const re = /^auth:[ \t]*\r?\n(?:[ \t].*\r?\n?|\r?\n)*/m;
+if (re.test(text)) text = text.replace(re, () => block);
+else {
+  const lr = /^listen:.*\r?\n/m;
+  text = lr.test(text) ? text.replace(lr, m => m + '\n' + block) : block + '\n' + text;
+}
+if (!/^listen:/m.test(text) || (!/^tls:/m.test(text) && !/^acme:/m.test(text)) || !/^auth:/m.test(text)) {
+  console.error('[hy2-rewrite] refusing to write — structural validation failed');
+  process.exit(2);
+}
+fs.writeFileSync(CFG, text, { mode: 0o600 });
+console.log('[hy2-rewrite] userpass rewritten with ' + seen.size + ' Hy2 user(s)');
+NODE_EOF
+
+  if ( cd "$PANEL_DIR" && RB_DB_PATH="$DB_PATH" node "$rewrite_js" ); then
+    rm -f "$rewrite_js"
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    if systemctl restart hysteria-server 2>/dev/null && \
+       [[ "$(systemctl is-active hysteria-server 2>/dev/null)" == "active" ]]; then
+      log_info "Hy2 config rewritten and hysteria-server restarted — all clients active over Hy2 ✓"
+    else
+      log_warn "Hy2 restart failed after enroll — journalctl -u hysteria-server -n 20"
+    fi
+  else
+    rm -f "$rewrite_js"
+    log_warn "Hy2 config rewrite failed — run a user add/delete in the panel to resync userpass"
+  fi
+}
+
 # ── Bug 79: fix caddy-naive config permissions ───────────────────────────────
 #   caddy-naive runs as User=caddy and fails to start with
 #     "reading config from file: open /etc/caddy-naive/Caddyfile: permission denied"
@@ -1960,6 +2075,10 @@ do_update() {
   # v1.8.0 (Hy2 Sub-stage C): restart Hy2 if installed, else hint how to add it.
   # Runs BEFORE the dry-run gate returns so --dry-run reports the intended action.
   migrate_hy2
+
+  # v1.8.2: opt-in — enroll ALL existing users into Hy2 (HY2_ENROLL_ALL=1).
+  # No-op unless the operator explicitly sets the env var. Also honours --dry-run.
+  migrate_hy2_enroll_all
 
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
 

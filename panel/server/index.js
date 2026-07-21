@@ -1196,9 +1196,17 @@ function buildHy2AuthBlock(users) {
     if (!pw) continue;   // no stored plaintext → cannot auth; skip safely
     lines.push(`    ${u.username}: ${yamlQuote(pw)}`);
   }
-  // Hysteria requires userpass to be a non-empty map to start; when there are
-  // no Hy2 users we still emit a valid (empty flow) map so the service stays up.
-  if (lines.length === 3) lines.push('    {}');
+  // Hysteria REJECTS an empty userpass map ("invalid config: auth.userpass:
+  // empty auth userpass") — neither `userpass: {}` nor a bare `{}` on the next
+  // line satisfy it. So when no user in the shared pool has Hy2 enabled we emit
+  // a single DISABLED sentinel entry with a long random password nobody can
+  // guess. This keeps the service UP (instead of crash-looping) while still
+  // admitting zero real clients; it's silently replaced the moment a real Hy2
+  // user is added.
+  if (lines.length === 3) {
+    const rnd = crypto.randomBytes(24).toString('hex');
+    lines.push(`    __disabled_no_hy2_users__: ${yamlQuote('disabled-' + rnd)}`);
+  }
   return lines.join('\n') + '\n';
 }
 
