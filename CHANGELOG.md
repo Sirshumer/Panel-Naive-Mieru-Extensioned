@@ -7,6 +7,54 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.8.4]
+
+> **FEATURE — Hysteria2 now relays through the cascade (relay) chain, like
+> Naive & Mieru.** Turning on **"Включить каскад (relay)"** now cascades all
+> three protocols. Plus a `better-sqlite3` fix for the Hy2 enroll one-liner.
+
+### The problem
+The cascade chain (`cascade_mieru.sh`) captures egress **by process owner-UID**
+(`iptables -t nat -A OUTPUT -p tcp -m owner --uid-owner <mita> -j REDSOCKS`),
+not by interface or mark. Hysteria2 ran as **root**, so its traffic never
+matched the owner-UID rule and silently **bypassed the cascade entirely** —
+even with the relay checkbox on, Hy2 clients exited from the panel's own IP.
+(WARP egress is unaffected: it marks by interface, so it already relayed all
+three protocols.)
+
+### Fixed
+- **Hysteria2 now runs under a dedicated `hysteria` system user** instead of
+  root, so the cascade can add a parallel owner-match rule for it.
+  - `install_hysteria.sh` creates a `--system --no-create-home` `hysteria`
+    user, adds it to group `caddy`, and runs the unit as
+    `User=hysteria` / `Group=hysteria` with `SupplementaryGroups=caddy`.
+  - `CAP_NET_BIND_SERVICE` is kept so the non-root user can still bind `:443`.
+  - The shared Caddy cert is made **group-readable for `caddy`** (dir chain
+    `chgrp caddy` + `chmod g+rx`, cert/key `g+r`) instead of world-readable.
+- **Cascade now relays Hy2 egress.** `cascade_mieru.sh` adds a guarded
+  `hy2_uid()` helper and, when Hy2 is installed, an
+  `-m owner --uid-owner <hysteria> -j REDSOCKS` rule alongside the mita rule;
+  `clear_iptables` removes it on teardown. The existing `exit_ip` RETURN
+  anti-loop and TCP-only REDIRECT already cover the new UID; QUIC/UDP replies
+  to clients are never captured (return-path safe).
+- **`update.sh` migrates existing installs in place.**
+  `migrate_hy2_service_user()` idempotently rewrites a `User=root` unit to
+  `User=hysteria` (+ user creation, caddy group, cert group-read,
+  `daemon-reload`) and is called from `migrate_hy2()` before the restart. Boxes
+  already on `hysteria` are skipped — **nothing changes for them.**
+- **Fixed `Cannot find module 'better-sqlite3'` in the Hy2 enroll flow.** The
+  temporary enroll/rewrite node scripts are now written into `$PANEL_DIR`
+  (not `/tmp`) so Node resolves `$PANEL_DIR/node_modules` (`require()` resolves
+  relative to the script file's directory).
+
+### Compatibility
+- Existing Naive/Mieru cascade behaviour is unchanged (the original mita
+  owner-match rule is untouched). The migration is idempotent and no-ops on
+  boxes that don't have Hy2 or are already migrated — **existing installs
+  keep working.**
+
+---
+
 ## [v1.8.3]
 
 > **BUGFIX — `HY2_ENROLL_ALL=1 ./update.sh` did nothing on a same-version box**
