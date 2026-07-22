@@ -7,6 +7,49 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.8.5]
+
+> **BUGFIX — Hy2 died with `permission denied` on the config after the v1.8.4
+> root→hysteria migration, whenever the panel rewrote the config.**
+
+### The problem
+v1.8.4 moved hysteria-server to a non-root `hysteria` user. But the **panel
+runs as root** and rewrites `/etc/hysteria/config.yaml` on every edit
+(toggling the Hy2 checkbox, add/delete user, port/masquerade change) with:
+```js
+fs.writeFileSync(tmp, next, { mode: 0o600 });  // → root:root 0600
+fs.renameSync(tmp, HY2_CONFIG);
+```
+So right after you enabled Hy2 in the panel, the config became `root:root 0600`
+and the service user could no longer read it:
+```
+FATAL failed to read server config
+{"error": "open /etc/hysteria/config.yaml: permission denied"}
+```
+(The cert was fine — this was the **config file itself**, not the cert.)
+
+### Fixed
+- **`index.js` — new `hy2ChownConfig()` helper, called after every config
+  write and rollback** (`writeHysteriaConfig()` + the masquerade/port rewrite
+  path). It resolves the `hysteria` uid/gid and restores
+  `hysteria:hysteria` ownership with dir `750` / config `640`, so the service
+  user can always read what the root panel just wrote.
+  - **Legacy-safe:** if there is no `hysteria` user (an old box still running
+    Hy2 as root), the helper **no-ops** — nothing changes for old installs.
+- **`install_hysteria.sh`** — after writing the config as root, explicitly
+  `chown -R hysteria:hysteria /etc/hysteria` + `chmod 750` dir + `chmod 640`
+  config (the `cat >` heredoc had left it root-owned).
+- **`update.sh`** — the `migrate_hy2_service_user()` migration now also sets
+  the explicit `750`/`640` modes, seeding correct perms on in-place upgrades.
+
+### Upgrade note
+Boxes already broken by v1.8.4 self-heal on the next panel config write. To fix
+immediately without waiting: `chown -R hysteria:hysteria /etc/hysteria &&
+chmod 750 /etc/hysteria && chmod 640 /etc/hysteria/config.yaml &&
+systemctl restart hysteria-server`.
+
+---
+
 ## [v1.8.4]
 
 > **FEATURE — Hysteria2 now relays through the cascade (relay) chain, like

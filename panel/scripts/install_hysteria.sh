@@ -508,6 +508,13 @@ quic:
   disablePathMTUDiscovery: false
 HYBWEOF
 
+# The config was written by root via `cat >`, so it ends up root-owned. Hand it
+# (and the dir) back to the service user with explicit modes — otherwise the
+# non-root hysteria service hits "open config.yaml: permission denied" on start.
+chown -R "$HY_USER":"$HY_USER" /etc/hysteria 2>/dev/null || true
+chmod 750 /etc/hysteria 2>/dev/null || true
+chmod 640 /etc/hysteria/config.yaml 2>/dev/null || true
+
 log "✅ Конфиг /etc/hysteria/config.yaml создан (порт ${HY_PORT}/udp)"
 
 # ══════════════════════════════════════════════════════

@@ -398,5 +398,42 @@ console.log('\n[11] enroll: node temp scripts live in $PANEL_DIR (better-sqlite3
      'no more /tmp/rixxx-hy2-*.js (the MODULE_NOT_FOUND path)');
 }
 
+// v1.8.4 fix — the panel runs as root and wrote the Hy2 config as root:root
+// 0600 on every edit; the non-root `hysteria` service then hit
+// "open /etc/hysteria/config.yaml: permission denied" FATAL. Every write path
+// must hand the config back to the service user, and install/update must seed
+// the right owner+mode. Guarded so legacy root installs (no hysteria user) no-op.
+console.log('\n[12] Hy2 config stays readable by the non-root service user');
+{
+  // server: helper exists and is called after every config write / rollback.
+  ok(/function hy2ChownConfig\(/.test(serverSrc),
+     'server: hy2ChownConfig() helper defined');
+  ok(/id -u hysteria 2>\/dev\/null/.test(serverSrc),
+     'server: helper resolves the hysteria uid');
+  // It must be invoked after the atomic rename in writeHysteriaConfig() and in
+  // the masquerade/port rewrite path — count ≥ 3 (write + 2 rollbacks/port).
+  const chownCalls = (serverSrc.match(/hy2ChownConfig\(HY2_CONFIG\)/g) || []).length;
+  ok(chownCalls >= 3,
+     'server: hy2ChownConfig(HY2_CONFIG) called on every write path (found ' + chownCalls + ')');
+  // Legacy safety: helper returns early when no hysteria user (uid null).
+  ok(/if \(uid === null \|\| Number\.isNaN\(uid\)\) return;/.test(serverSrc),
+     'server: no-ops on legacy root install (no hysteria user) — nothing breaks');
+  // files → 640, dir → 750.
+  ok(/st\.isDirectory\(\) \? 0o750 : 0o640/.test(serverSrc),
+     'server: dir 750 / config 640 modes applied');
+
+  // install: seeds owner + explicit modes AFTER writing the config as root.
+  ok(/chmod 750 \/etc\/hysteria/.test(hy2Src),
+     'install: /etc/hysteria mode 750 (traversable by service user)');
+  ok(/chmod 640 \/etc\/hysteria\/config\.yaml/.test(hy2Src),
+     'install: config.yaml mode 640 (group-readable)');
+
+  // update migration: same explicit modes so an in-place upgrade is readable.
+  ok(/chmod 750 \/etc\/hysteria/.test(upSrc),
+     'update: migration sets /etc/hysteria mode 750');
+  ok(/chmod 640 \/etc\/hysteria\/config\.yaml/.test(upSrc),
+     'update: migration sets config.yaml mode 640');
+}
+
 console.log('\nResult: ' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);
