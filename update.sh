@@ -1146,8 +1146,13 @@ migrate_hy2_service_user() {
     sed -i -E '/^\s*Group\s*=\s*hysteria\s*$/a SupplementaryGroups=caddy' "$unit"
   fi
 
-  # 3) Config dir owned by the service user (it only reads it).
+  # 3) Config dir + files owned by the service user (it only reads them), with
+  #    explicit modes: dir traversable (750), config group-readable (640). The
+  #    panel writes the config as root 0600 on every edit, so the running server
+  #    (index.js hy2ChownConfig) hands it back — this is the migration-time seed.
   chown -R hysteria:hysteria /etc/hysteria 2>/dev/null || true
+  chmod 750 /etc/hysteria 2>/dev/null || true
+  [[ -f /etc/hysteria/config.yaml ]] && chmod 640 /etc/hysteria/config.yaml 2>/dev/null || true
 
   # 4) Cert perms: make the Caddy cert group-readable for the caddy group so the
   #    hysteria user (member of caddy) can read it. Discover the cert dir from the

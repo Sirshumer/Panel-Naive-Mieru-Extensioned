@@ -1169,6 +1169,48 @@ function shredFile(fp) {
 // so unrelated formatting/comments are untouched.
 const HY2_CONFIG = '/etc/hysteria/config.yaml';
 
+// The panel runs as root; hysteria-server runs as the dedicated `hysteria`
+// system user (cascade owner-match, since v1.8.4). fs.writeFileSync therefore
+// creates config files owned root:root, which the service user then cannot
+// read → "open /etc/hysteria/config.yaml: permission denied" FATAL. After ANY
+// write to a Hy2 config file we MUST hand ownership back to the service user
+// (and its dir) so hysteria can read it. Best-effort + idempotent: on a legacy
+// box still running Hy2 as root, `hysteria` simply doesn't exist and we no-op,
+// so nothing breaks for old installs.
+function hy2ChownConfig(file) {
+  try {
+    // Resolve the uid/gid the unit actually runs as. Prefer the `hysteria`
+    // user; fall back to whatever owns the existing config (covers custom
+    // setups) so we never *lower* access.
+    let uid = null, gid = null;
+    try {
+      const pw = execSync('id -u hysteria 2>/dev/null', { timeout: 4000 }).toString().trim();
+      const gr = execSync('id -g hysteria 2>/dev/null', { timeout: 4000 }).toString().trim();
+      if (pw !== '') uid = parseInt(pw, 10);
+      if (gr !== '') gid = parseInt(gr, 10);
+    } catch {}
+    // No dedicated user (legacy root install) → leave as-is, don't break it.
+    if (uid === null || Number.isNaN(uid)) return;
+    const targets = [];
+    if (file) targets.push(file);
+    // Also fix the dir + the .last backup so a later rollback stays readable.
+    try {
+      const dir = path.dirname(file || HY2_CONFIG);
+      targets.push(dir);
+      if (file) targets.push(file + '.last');
+    } catch {}
+    for (const t of targets) {
+      try {
+        if (!fs.existsSync(t)) continue;
+        fs.chownSync(t, uid, (gid === null || Number.isNaN(gid)) ? -1 : gid);
+        const st = fs.statSync(t);
+        // dir needs traverse (750); files stay group-readable (640).
+        fs.chmodSync(t, st.isDirectory() ? 0o750 : 0o640);
+      } catch {}
+    }
+  } catch {}
+}
+
 // Return the list of users (from the shared pool) that have Hy2 enabled.
 function getHy2Users() {
   return getAllUsers()
@@ -1276,6 +1318,7 @@ function writeHysteriaConfig({ restart = true } = {}) {
     fs.writeFileSync(tmp, next, { mode: 0o600 });
     try { fs.copyFileSync(HY2_CONFIG, last); } catch {}   // backup for rollback
     fs.renameSync(tmp, HY2_CONFIG);                        // atomic replace
+    hy2ChownConfig(HY2_CONFIG);   // hand back to service user (else perm-denied)
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch {}
     return { ok: false, changed: false, active: false, error: 'write failed: ' + e.message };
@@ -1289,6 +1332,7 @@ function writeHysteriaConfig({ restart = true } = {}) {
     try {
       if (fs.existsSync(last)) {
         fs.copyFileSync(last, HY2_CONFIG);
+        hy2ChownConfig(HY2_CONFIG);   // keep rollback readable by the service user
         reloadHysteria();
       }
     } catch {}
@@ -2389,11 +2433,12 @@ app.post('/api/settings/hy2-port', requireAuth, (req, res) => {
     fs.writeFileSync(tmp, text, { mode: 0o600 });
     try { fs.copyFileSync(HY2_CONFIG, last); } catch {}
     fs.renameSync(tmp, HY2_CONFIG);
+    hy2ChownConfig(HY2_CONFIG);   // hand back to service user (else perm-denied)
 
     const r = reloadHysteria();
     if (!r.ok) {
       // Roll back
-      try { if (fs.existsSync(last)) { fs.copyFileSync(last, HY2_CONFIG); reloadHysteria(); } } catch {}
+      try { if (fs.existsSync(last)) { fs.copyFileSync(last, HY2_CONFIG); hy2ChownConfig(HY2_CONFIG); reloadHysteria(); } } catch {}
       cfg.hy2Port = oldPort; saveConfig();
       return res.status(500).json({ ok: false, error: 'Hy2 failed to start on new port; rolled back. ' + (r.error || '') });
     }
