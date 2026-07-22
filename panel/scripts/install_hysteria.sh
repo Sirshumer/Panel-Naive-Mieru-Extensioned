@@ -508,6 +508,18 @@ quic:
   disablePathMTUDiscovery: false
 HYBWEOF
 
+# Traffic Stats API (loopback only) → lets the panel read per-user up/down bytes
+# via GET http://127.0.0.1:9999/traffic (like `mita get users` does for Mieru).
+# Secret is generated per-install; the panel reads it back from this file.
+HY_STATS_SECRET="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+cat >> /etc/hysteria/config.yaml << HYSTATSEOF
+
+# ── Traffic Stats API (управляется панелью — не редактируйте вручную) ──
+trafficStats:
+  listen: 127.0.0.1:9999
+  secret: "${HY_STATS_SECRET}"
+HYSTATSEOF
+
 # The config was written by root via `cat >`, so it ends up root-owned. Hand it
 # (and the dir) back to the service user with explicit modes — otherwise the
 # non-root hysteria service hits "open config.yaml: permission denied" on start.

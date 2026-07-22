@@ -7,6 +7,43 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.8.6]
+
+> **FEATURE — Hy2 traffic accounting, auto-enroll, Hy2 logs, and a fix for the
+> "Failed to fetch" toast when saving a user.**
+
+### Fixed
+- **"Failed to fetch" when ticking Hy2 / saving a user.** A CRUD call ran
+  `applyAllConfigs()` (3 sequential service restarts, up to ~60s) *before*
+  responding, so the fetch connection was dropped even though the DB write
+  had succeeded (hence "reopen and it's there"). Configs now apply in the
+  **background**; the request returns immediately with `servicesReloading:true`
+  and the UI polls `/api/apply-status` for the outcome.
+
+### Added
+- **Per-user Hy2 traffic (Hy2 (МБ) column)**, like Naive/Mieru. Reads the
+  Hysteria2 **Traffic Stats API** (`GET 127.0.0.1:9999/traffic`) — works for
+  direct **and** cascaded Hy2. Isolated source: if unavailable it returns 0
+  and never zeroes the Naive/Mieru figures.
+  - `install_hysteria.sh` enables `trafficStats` (loopback + per-install secret).
+  - `update.sh` `migrate_hy2_traffic_stats()` backfills it on existing installs
+    (idempotent — skips configs that already have it).
+- **Auto-enroll existing keys into Hy2** when installing Hy2 from the panel:
+  every issued key gets `hy2` added to its protocols (idempotent), so the Hy2
+  checkbox/column light up without re-editing each user. Opt-out with
+  `{enrollAll:false}`; also exposed as `POST /api/settings/hy2/enroll-all`.
+- **Hy2 logs** in the Logs page (`journalctl -u hysteria-server`), next to
+  Naive/Mieru/Panel.
+- **Cascade UI hint:** a note under "Включить каскад (relay)" explaining that
+  Hysteria2 cascades automatically through the same Mieru tunnel (matched by
+  process owner) — no separate Hy2 exit address is required.
+
+### Tests
+- `tests/feat-hy2-migration.test.js` section **[13]** (122 passed); full suite
+  18 files green.
+
+---
+
 ## [v1.8.5]
 
 > **BUGFIX — Hy2 died with `permission denied` on the config after the v1.8.4

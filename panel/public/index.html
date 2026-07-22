@@ -289,6 +289,7 @@
                 <th data-i18n="users.hy2Col">Hy2</th>
                 <th data-i18n="users.naiveMB">Naive (MB)</th>
                 <th data-i18n="users.mieruMB">Mieru (MB)</th>
+                <th data-i18n="users.hy2MB">Hy2 (MB)</th>
                 <th data-i18n="users.quotaMB">Quota (MB)</th>
                 <th data-i18n="users.quotaUsed">Quota</th>
                 <th data-i18n="users.lastActive">Last Active</th>
@@ -649,10 +650,11 @@
           <div class="card-header" data-i18n="settings.cascadeTitle">Каскад / Relay</div>
           <div class="card-body">
             <p class="card-desc" data-i18n="settings.cascadeDesc">Настройка relay: трафик идёт через этот сервер (entry) на выходной сервер (exit), а затем в интернет. Mieru использует вариант B (mieru-client + redsocks + iptables) — провайдер видит только этот (entry) сервер.</p>
-            <label class="checkbox" style="margin-bottom:12px">
+            <label class="checkbox" style="margin-bottom:6px">
               <input type="checkbox" id="s-cascade-enabled" />
               <span data-i18n="settings.cascadeEnable">Включить каскад (relay)</span>
             </label>
+            <p class="card-desc" style="margin:0 0 12px;font-size:12px;color:var(--text-muted)" data-i18n="settings.cascadeHy2Hint">ℹ Hysteria2 каскадируется автоматически через тот же Mieru-туннель (по владельцу процесса) — отдельный exit-адрес для Hy2 указывать не нужно. Достаточно заполнить Mieru exit ниже и включить эту галочку.</p>
             <div class="form-group">
               <label data-i18n="settings.cascadeNaiveUpstreamLabel">Naive upstream URL</label>
               <input type="text" id="s-cascade-naive-upstream" placeholder="https://user:pass@exit.server:443" />
@@ -877,6 +879,7 @@
         <div class="btn-group">
           <button class="btn btn-ghost btn-sm active" data-action="load-logs" data-log-svc="caddy" id="log-btn-caddy" data-i18n="logs.naive">Naive</button>
           <button class="btn btn-ghost btn-sm"        data-action="load-logs" data-log-svc="mieru" id="log-btn-mieru" data-i18n="logs.mieru">Mieru</button>
+          <button class="btn btn-ghost btn-sm"        data-action="load-logs" data-log-svc="hy2"   id="log-btn-hy2"   data-i18n="logs.hy2">Hy2</button>
           <button class="btn btn-ghost btn-sm"        data-action="load-logs" data-log-svc="panel" id="log-btn-panel" data-i18n="logs.panel">Panel</button>
         </div>
       </div>

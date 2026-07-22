@@ -563,6 +563,7 @@ async function loadUsers() {
       return Object.assign({}, u, {
         naiveMB: s.naiveMB != null ? s.naiveMB : 0,
         mieruMB: s.mieruMB != null ? s.mieruMB : 0,
+        hy2MB:   s.hy2MB   != null ? s.hy2MB   : 0,
       });
     });
     removeNaiveServerBanner();   // BUG-165: drop any stale server-wide banner
@@ -669,6 +670,7 @@ function renderUsersTable(users) {
       <td>${hasHy2 ? '<span class="badge badge-blue">✓</span>' : '<span class="badge badge-gray">—</span>'}</td>
       <td>${fmtNum(u.naiveMB != null ? u.naiveMB : 0)}</td>
       <td>${fmtNum(u.mieruMB != null ? u.mieruMB : 0)}</td>
+      <td>${fmtNum(u.hy2MB != null ? u.hy2MB : 0)}</td>
       <td>${u.quotaMB > 0 ? fmtNum(u.quotaMB) : '∞'}</td>
       <td>${quotaStr}</td>
       <td>${fmtLastSeen(u.lastSeen)}</td>
@@ -778,15 +780,11 @@ async function saveUser() {
     if (id) {
       const res = await api('PUT', `/api/users/${id}`, body);
       toast(t('users.updated'), 'success');
-      if (res.servicesReloaded === false) {
-        toast(t('users.serviceReloadWarning') || 'Service reload failed — check logs', 'error');
-      }
+      pollApplyStatus(res);   // BUG-176: services reload in the background now
     } else {
       const res = await api('POST', '/api/users', body);
       toast(t('users.created'), 'success');
-      if (res.servicesReloaded === false) {
-        toast(t('users.serviceReloadWarning') || 'Service reload failed — check logs', 'error');
-      }
+      pollApplyStatus(res);   // BUG-176
     }
     closeUserModal();
     // Bug 149: refresh the list from the server so the new user appears without
@@ -797,6 +795,34 @@ async function saveUser() {
   } finally {
     _savingUser = false;
     setBtnBusy(saveBtn, false);
+  }
+}
+
+// BUG-176: after a CRUD, the server applies caddy/mita/hy2 in the background
+// (servicesReloading:true) so the request returns instantly instead of dropping
+// the connection ("Failed to fetch") during ~3×20s of restarts. Poll the
+// outcome and only warn if a service genuinely failed to reload.
+async function pollApplyStatus(res) {
+  if (!res || res.servicesReloading !== true) {
+    // Legacy synchronous shape (older server): honour it directly.
+    if (res && res.servicesReloaded === false)
+      toast(t('users.serviceReloadWarning') || 'Service reload failed — check logs', 'error');
+    return;
+  }
+  for (let i = 0; i < 15; i++) {              // up to ~30s of polling
+    await new Promise(r => setTimeout(r, 2000));
+    let st;
+    try { st = await api('GET', '/api/apply-status'); } catch { continue; }
+    if (st && st.running === false) {
+      if (st.servicesReloaded === false) {
+        const why = st.hy2Error ? ('Hy2: ' + st.hy2Error)
+                  : st.caddyError ? ('Caddy: ' + st.caddyError)
+                  : (t('users.serviceReloadWarning') || 'Service reload failed — check logs');
+        toast(why, 'error');
+      }
+      loadUsers();   // refresh traffic/last-active once services settled
+      return;
+    }
   }
 }
 
@@ -1360,6 +1386,12 @@ async function installHy2(reinstall) {
     // Refresh the card + dashboard so the new service/state appears immediately.
     try { const h = await api('GET', '/api/settings/hy2'); renderHy2Card(h); } catch {}
     if (typeof loadDashboard === 'function') { try { await loadDashboard(); } catch {} }
+    // Auto-enroll lit up Hy2 on existing keys — refresh the user list so the
+    // Hy2 checkboxes/column reflect it without a manual F5.
+    if (res.enrolled) {
+      toast((t('settings.hy2Enrolled') || 'Hy2 включён на существующих ключах') + `: ${res.enrolled}`, 'info');
+      if (typeof loadUsers === 'function') { try { await loadUsers(); } catch {} }
+    }
   } catch (err) {
     showMsg(msgId, err.message, false);
     toast(err.message, 'error');
@@ -1809,7 +1841,7 @@ function renderTrafficTable(stats) {
 
 async function loadLogs(service) {
   currentLogService = service || currentLogService;
-  ['caddy', 'mieru', 'panel'].forEach(s => {
+  ['caddy', 'mieru', 'hy2', 'panel'].forEach(s => {
     el(`log-btn-${s}`)?.classList.toggle('active', s === currentLogService);
   });
   const lines = el('log-lines')?.value || 100;
