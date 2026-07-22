@@ -435,5 +435,23 @@ console.log('\n[12] Hy2 config stays readable by the non-root service user');
      'update: migration sets config.yaml mode 640');
 }
 
+// v1.8.6 — Hy2 traffic accounting, auto-enroll, async apply, Hy2 logs.
+console.log('\n[13] Hy2 traffic / enroll / async-apply / logs');
+{
+  ok(/function readHy2Traffic\(/.test(serverSrc), 'server: readHy2Traffic() helper defined');
+  ok(/http:\/\/\$\{listen\}\/traffic/.test(serverSrc), 'server: reads the Hy2 Traffic Stats API /traffic');
+  ok(/hy2MB:\s+hy2Up \+ hy2Down/.test(serverSrc), 'server: stats endpoint returns per-user hy2MB');
+  ok(/function enrollAllHy2\(/.test(serverSrc), 'server: enrollAllHy2() helper defined');
+  ok(/if \(protocols\.includes\('hy2'\)\) continue;/.test(serverSrc), 'server: enroll is idempotent (skips users already on hy2)');
+  ok(/app\.post\('\/api\/settings\/hy2\/enroll-all'/.test(serverSrc), 'server: /api/settings/hy2/enroll-all route present');
+  ok(/function applyAllConfigsAsync\(/.test(serverSrc), 'server: background applyAllConfigsAsync() defined');
+  ok(/app\.get\('\/api\/apply-status'/.test(serverSrc), 'server: /api/apply-status route present');
+  ok(/servicesReloading:\s*true/.test(serverSrc), 'server: CRUD returns servicesReloading:true (async apply)');
+  ok(/case 'hy2':/.test(serverSrc) && /journalctl -u hysteria-server/.test(serverSrc), 'server: logs API serves hysteria-server');
+  ok(/trafficStats:/.test(hy2Src) && /listen: 127\.0\.0\.1:9999/.test(hy2Src), 'install: config enables the Traffic Stats API');
+  ok(/migrate_hy2_traffic_stats\(\)/.test(upSrc), 'update: migrate_hy2_traffic_stats() defined');
+  ok(/grep -qE '\^\\s\*trafficStats\\s\*:' "\$cfg" && return 0/.test(upSrc), 'update: trafficStats migration is idempotent');
+}
+
 console.log('\nResult: ' + pass + ' passed, ' + fail + ' failed');
 process.exit(fail ? 1 : 0);

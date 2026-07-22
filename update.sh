@@ -1173,10 +1173,35 @@ migrate_hy2_service_user() {
   log_info "Hy2: service user migration applied ✓"
 }
 
+# v1.8.6: enable the Traffic Stats API on existing Hy2 installs so the panel can
+#   show per-user Hy2 traffic (like Naive/Mieru). Adds a loopback trafficStats
+#   block with a generated secret if the config doesn't already have one.
+#   Idempotent: configs that already contain `trafficStats:` are left untouched.
+migrate_hy2_traffic_stats() {
+  local cfg=/etc/hysteria/config.yaml
+  [[ -f "$cfg" ]] || return 0
+  grep -qE '^\s*trafficStats\s*:' "$cfg" && return 0
+  log_info "Hy2: enabling Traffic Stats API (per-user traffic in the panel)"
+  local secret; secret="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  cat >> "$cfg" <<HYSTATSEOF
+
+# ── Traffic Stats API (управляется панелью — не редактируйте вручную) ──
+trafficStats:
+  listen: 127.0.0.1:9999
+  secret: "${secret}"
+HYSTATSEOF
+  # Keep ownership/mode correct for the non-root service user.
+  if id hysteria &>/dev/null; then
+    chown hysteria:hysteria "$cfg" 2>/dev/null || true
+  fi
+  chmod 640 "$cfg" 2>/dev/null || true
+}
+
 migrate_hy2() {
-  $DRY_RUN && { log_dry "Would migrate Hy2 to the 'hysteria' user + restart hysteria-server if installed (else print an install hint)"; return 0; }
+  $DRY_RUN && { log_dry "Would migrate Hy2 to the 'hysteria' user + enable Traffic Stats API + restart hysteria-server if installed (else print an install hint)"; return 0; }
   if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
     migrate_hy2_service_user
+    migrate_hy2_traffic_stats
     systemctl reset-failed hysteria-server 2>/dev/null || true
     if systemctl restart hysteria-server 2>/dev/null; then
       log_info "Hy2: hysteria-server restarted to pick up the update ✓"
