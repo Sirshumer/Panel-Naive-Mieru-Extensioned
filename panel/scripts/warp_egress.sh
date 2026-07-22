@@ -421,6 +421,26 @@ route_up() {
     iptables -t mangle -C OUTPUT -p tcp -j CONNMARK --restore-mark 2>/dev/null \
       || iptables -t mangle -A OUTPUT -p tcp -j CONNMARK --restore-mark 2>/dev/null || true
 
+    # 2a-udp) HY2 (Hysteria2 / QUIC over UDP): identical return-path fix as the
+    #     BUG-171 TCP rule above, but for UDP. Hysteria2 listens on udp/443 (or
+    #     the configured hy2Port); a client's QUIC packets ENTER from a non-WARP
+    #     interface and hit our local UDP socket. Its replies are locally
+    #     generated on OUTPUT — without marking them they fall through the
+    #     `not fwmark → WARP table` rule and get sent into Cloudflare, so the
+    #     handshake never completes for the client. Mark every NEW inbound UDP
+    #     connection arriving from a non-WARP iface, save it on conntrack, and
+    #     restore that mark on all locally-generated UDP so replies carry it and
+    #     the `fwmark MARK_CONN → main` ip rule routes them back natively. Hy2's
+    #     OWN outbound dials (proxy egress) start at OUTPUT with no inbound NEW,
+    #     never get the mark, and still egress via WARP. The PREROUTING
+    #     `-p udp CONNMARK --restore-mark` (set above) already restores on the
+    #     inbound leg; here we add the set-mark + OUTPUT restore to close the loop.
+    #     `! -i <warp>` exempts decrypted traffic returning via the tunnel.
+    iptables -t mangle -C PREROUTING ! -i "$dev" -p udp -m conntrack --ctstate NEW -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null \
+      || iptables -t mangle -A PREROUTING ! -i "$dev" -p udp -m conntrack --ctstate NEW -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
+    iptables -t mangle -C OUTPUT -p udp -j CONNMARK --restore-mark 2>/dev/null \
+      || iptables -t mangle -A OUTPUT -p udp -j CONNMARK --restore-mark 2>/dev/null || true
+
     # 2b) BUG-170: TCP MSS clamping for everything egressing via WARP. Without it
     #     clients connect but heavy traffic stalls (segments > MTU-1280 get DF-
     #     dropped, PMTUD unreliable through the double Naive/Mieru→WARP wrap). We
@@ -522,6 +542,9 @@ route_down() {
     #   restore (the v2 shape that actually fires — no `-m connmark --mark` match).
     iptables -t mangle -D PREROUTING ! -i "$dev" -p tcp -m conntrack --ctstate NEW -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
     iptables -t mangle -D OUTPUT -p tcp -j CONNMARK --restore-mark 2>/dev/null || true
+    # HY2/QUIC (UDP) return-path mark — mirror of the TCP rules above (Hysteria2).
+    iptables -t mangle -D PREROUTING ! -i "$dev" -p udp -m conntrack --ctstate NEW -j CONNMARK --set-mark "$MARK_CONN" 2>/dev/null || true
+    iptables -t mangle -D OUTPUT -p udp -j CONNMARK --restore-mark 2>/dev/null || true
     # legacy BUG-171 v1 (broken, ≤ first 1.5.7 build) + ≤v1.5.6 per-port shapes —
     #   purge so an upgrade from any prior build leaves no orphan mangle rules.
     iptables -t mangle -D OUTPUT -p tcp -m connmark --mark "$MARK_CONN" -j CONNMARK --restore-mark 2>/dev/null || true

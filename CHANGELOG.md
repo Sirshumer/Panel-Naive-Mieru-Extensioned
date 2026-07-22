@@ -7,6 +7,345 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.8.3]
+
+> **BUGFIX — `HY2_ENROLL_ALL=1 ./update.sh` did nothing on a same-version box**
+> (it hit the "Nothing to do" early-exit before the enroll step) + a dedicated
+> one-liner mode for the enrollment.
+
+### Fixed
+- **Enroll now runs even when the installed version already equals the target.**
+  A box already on the current version answered the "Re-sync / force update
+  anyway?" gate and exited with "Nothing to do" *before* reaching
+  `migrate_hy2_enroll_all`, so `HY2_ENROLL_ALL=1` silently had no effect. When
+  `HY2_ENROLL_ALL=1` is set the updater now proceeds through the full flow
+  regardless of version.
+
+### Added
+- **`update.sh --enroll-hy2`** — dedicated mode that runs ONLY the Hy2
+  enrollment (add `"hy2"` to every user → rewrite `userpass` → restart Hy2),
+  with **no full update**. Cleaner one-liner than the env var; errors clearly if
+  Hy2 isn't installed; confirms on a TTY (or `-y` to skip). Documented in
+  `--help`.
+
+### Tests
+- `feat-hy2-migration.test.js`: +8 assertions (same-version bypass + the
+  `--enroll-hy2` flag/dispatch/help wiring), 79 total. Full suite green
+  (18 files, 0 failed). Nothing breaks.
+
+---
+
+## [v1.8.2]
+
+> **BUGFIX — Hy2 crash-loops with `auth.userpass: empty auth userpass`** when no
+> user in the shared pool has Hy2 enabled + **FEATURE — opt-in auto-enroll** so
+> already-issued clients work over Hy2 without re-provisioning.
+
+### Fixed
+- **Empty `userpass` no longer FATALs Hy2.** `buildHy2AuthBlock()` used to emit a
+  bare `{}` when no user had `"hy2"` in their `protocols` — but Hysteria2 rejects
+  an empty userpass map (`invalid config: auth.userpass: empty auth userpass`) and
+  crash-loops. It now emits a single **disabled sentinel** entry
+  (`__disabled_no_hy2_users__` + a long random password) so the map is genuinely
+  non-empty and the service stays **up** while admitting zero real clients. The
+  sentinel is silently replaced the moment a real Hy2 user is added.
+
+### Added
+- **Opt-in auto-enroll (`HY2_ENROLL_ALL=1`).** Existing clients issued before Hy2
+  existed have `protocols = ["naive","mieru"]` and never appear in `userpass`.
+  Running `HY2_ENROLL_ALL=1 ./update.sh` now:
+  - adds `"hy2"` to **every** user's `protocols` array (idempotent — users who
+    already have it are skipped; runs in a single SQLite transaction);
+  - rewrites `/etc/hysteria/config.yaml`'s `userpass` from the enrolled pool
+    (same username → stored plaintext password, so the client's existing
+    credential works — no re-provisioning);
+  - restarts `hysteria-server` → all clients active over Hy2 immediately.
+  Fully opt-in: a plain `update.sh` never changes which protocols users have.
+  Warns (does not crash) if requested while Hy2 isn't installed.
+
+### Tests
+- `feat-hy2-migration.test.js`: +16 assertions (anti-crash sentinel behaviour +
+  auto-enroll wiring). `feat-hy2-link.test.js`: empty-pool assertion updated to
+  the sentinel + `crypto` bound for the extracted helper. Full suite green
+  (18 files, 0 failed). No change to add/delete user, Naive/Mieru — nothing breaks.
+
+---
+
+## [v1.8.1]
+
+> **BUGFIX — Hy2 fails to start with `tls: must set either tls or acme`.**
+> On servers where Caddy's data-dir is `/var/lib/caddy` (i.e. `XDG_DATA_HOME`
+> points there directly), the Let's Encrypt certificate lives under
+> `/var/lib/caddy/caddy/certificates/…` — **not** the
+> `/var/lib/caddy/.local/share/caddy/certificates` path the installer searched
+> exclusively. The cert was never found → a placeholder comment (with no `tls:`
+> block) was written → `hysteria-server` crash-looped with
+> `FATAL … invalid config: tls: must set either tls or acme`.
+
+### Fixed
+- **`install_hysteria.sh` cert discovery** now covers the real-world layouts:
+  - Added `/var/lib/caddy/caddy/certificates` (the missing path — root cause),
+    plus `/root/.local/share/caddy/certificates`,
+    `/home/caddy/.local/share/caddy/certificates`, `/etc/caddy/certificates`.
+  - New `find_caddy_cert()` helper: checks all known roots **and** does a broad
+    `find` under `/var/lib/caddy`, `/root/.local`, `/home` as a final fallback —
+    catches any non-standard Caddy data-dir. Verifies a matching `.key` exists.
+
+### Added
+- **Self-heal for a late-arriving certificate.** If Caddy hasn't issued the
+  cert within 150 s at install time, the installer no longer leaves Hy2
+  permanently dead. It drops `/usr/local/bin/hy2-cert-selfheal.sh` and a
+  `hy2-cert-selfheal.timer` (retries ~every 60 s): as soon as the cert appears
+  it splices the real `tls:` block in, restarts `hysteria-server`, switches to
+  the permanent `caddy-cert-watcher.path`, and disables itself. The self-heal
+  script short-circuits when a `tls:`/`acme:` block is already present (no
+  thrash), so it's safe on already-working configs.
+
+### Tests
+- `feat-hy2-migration.test.js`: +13 assertions covering the new cert-search
+  roots, the broad-find fallback, and the self-heal timer/script wiring
+  (55 assertions total, all green). No behavioural change to add/delete user,
+  Naive/Mieru configs, or the shared user pool — nothing breaks.
+
+---
+
+## [v1.8.0]
+
+> **FEATURE — Hysteria2 UI + WARP compatibility + upgrade migration
+> (continuation of v1.7.0).** Completes the Hy2 frontend, makes Hy2/QUIC work
+> through Cloudflare WARP, and makes existing installs upgrade cleanly — the
+> "Доустановить Hy2" button appears after a plain `update.sh` with **zero data
+> loss** (existing users, protocols, Naive/Mieru configs are untouched).
+
+### Added
+- **Upgrade migration (Sub-stage C)** — `update.sh` / `install.sh`:
+  - `migrate_config`: backfills `hy2Port` (443/udp) and `stack.{naive,mieru,hy2}`
+    into `config.json` for pre-Hy2 installs. **`stack.hy2` defaults to `false` —
+    the update NEVER auto-installs Hy2**; it only makes the install card
+    available in Settings. Idempotent — custom `hy2Port` / operator-enabled
+    `stack.hy2=true` are preserved via jq `//` fallbacks. Existing `users` and
+    their `protocols` arrays are left completely untouched.
+  - `migrate_hy2`: on update, restarts `hysteria-server` **only if Hy2 is
+    installed** (config.yaml + binary present); otherwise prints a one-line
+    "Доустановить Hy2" hint. `do_repair` likewise restarts Hy2 when installed
+    (the panel re-syncs the `userpass` map from the SQLite pool → no user loss).
+  - `update_panel`: `chmod +x` the shipped `install_hysteria.sh` /
+    `warp_egress.sh` / `cascade_mieru.sh` helpers (both `$PANEL_DIR/scripts` and
+    the legacy `$PANEL_DIR/panel/scripts` layouts) so the panel can run them.
+  - `do_status`: adds a `hysteria (Hy2)` version line, a hysteria-server
+    active/inactive (or "not installed") indicator, and `hy2Port`/`stack` in the
+    config dump.
+  - `install.sh`: fresh installs write the same Hy2 config defaults
+    (`hy2Port: 443`, `stack.hy2: false`) — Hy2 added later from the panel.
+- **Full Hy2 frontend (Sub-stage B-UI):**
+  - Dashboard: Hy2 service card (auto-shown when installed) with status badge
+    and start/stop/restart service buttons.
+  - User modal: Hy2 protocol checkbox with install-gating (disabled + hint when
+    Hy2 not installed); edit keeps hy2 enabled for users that already have it.
+  - Users table: new **Hy2** column (✓/—) after Mieru; colspan bumped 11→12
+    across header + loading/error/empty render paths.
+  - Config modal: Hy2 link download button (`hysteria2://…` + QR + copy),
+    shown only when Hy2 installed AND the user has the `hy2` protocol.
+  - Settings: Hy2 card with not-installed (install + port) and installed
+    (reinstall + change-port) states.
+  - i18n: 23 Hy2 keys added to ru/en; fixed pre-existing `toast.cascadeUpdated`
+    gap in en.json (full locale parity restored).
+- **WARP UDP return-path rule (Sub-stage D)** in `scripts/warp_egress.sh`:
+  mirrors the BUG-171 TCP fix for UDP so Hysteria2/QUIC replies (udp/443 or
+  configured `hy2Port`) stay on the NATIVE route instead of being swallowed
+  into Cloudflare. Marks NEW inbound UDP from non-WARP ifaces + restores on
+  OUTPUT; teardown mirrors the deletes. Hy2's own outbound dials still egress
+  via WARP.
+
+### Tests
+- **`tests/feat-hy2-migration.test.js`** (40 assertions): validates the
+  update.sh/install.sh Hy2 migration (config backfill, idempotency, users
+  preserved), the Hy2 restart-only-when-installed logic, do_status wiring, the
+  server runtime backfill + `/api/settings/hy2`, and the Sub-stage D WARP UDP
+  reply-path rules (incl. that the BUG-171 TCP rule is untouched). Wired into
+  `npm test`. Full suite: **18 files, all green, 0 failed.**
+
+---
+
+## [v1.7.0]
+
+> **FEATURE — Hysteria2 (Hy2) integration.** The panel now manages a THIRD
+> protocol, Hysteria2 (QUIC/UDP), alongside Naive and Mieru — **one shared user
+> pool**: a user has Hy2 access iff its `protocols` array contains `"hy2"`.
+
+### Added
+- **`scripts/install_hysteria.sh`** — multi-arch Hy2 installer. Configurable
+  UDP port (`HY_PORT`, default **443/udp**, coexists with Naive on TCP/443
+  because our Caddy runs `protocols h1 h2` → HTTP/3 off → UDP/443 free).
+  `USE_CADDY_CERT=1` reuses Caddy's existing certificate (**no second email,
+  no second ACME**) and installs a `caddy-cert-watcher` to restart Hy2 on cert
+  renewal. Standalone ACME path retained as a fallback.
+- **Backend Hy2 config owner** — `writeHysteriaConfig()` rewrites ONLY the
+  `auth.userpass` block of `/etc/hysteria/config.yaml` from the shared SQLite
+  pool (atomic write → structural validate → `.last` backup → restart → verify
+  → rollback on failure). No new dependency (targeted string splice, not YAML
+  parse). `applyAllConfigs()` calls it after every user add/edit/delete/backup-
+  restore — **non-fatal, no-op when Hy2 isn't installed**.
+- **API** — `GET /api/users/:id/config/hy2` (`hysteria2://` share link),
+  `GET /api/settings/hy2` (installed/active/port/user-count),
+  `POST /api/settings/hy2/install`, `POST /api/settings/hy2-port` (atomic
+  `listen:` rewrite + restart + rollback + UFW). `hy2` added to
+  `VALID_PROTOCOLS`. `/api/status`, `/api/diagnostics`, WS metrics and the
+  service-control map all report/allow `hy2`/`hysteria-server`.
+- **Config** — `cfg.hy2Port` (default 443) and `cfg.stack {naive,mieru,hy2}`
+  with runtime backfill so legacy configs upgrade seamlessly.
+- **Tests** — `tests/feat-hy2-link.test.js` (33 assertions: link builder, auth
+  block, config splice/preservation, structural validation).
+
+## [v1.6.0]
+
+> **FEATURE — Backup & Restore (one-file disaster recovery).** New card in
+> **Server Settings → Backup & Restore**. Requested for server migration: if a
+> server dies, the admin restores everything on a fresh box in a couple of
+> clicks and every existing client key keeps working (if the new server uses the
+> same domain — just repoint DNS).
+>
+> **Export** (`GET /api/backup/export`, auth-gated): downloads a single JSON
+> containing **all users** (including plaintext passwords **and** bcrypt hashes —
+> both are needed to reissue the *identical* `naive+https://` / `mierus://` keys)
+> and the **full panel config** (domains, ports, protocols, cascade/WARP, admin
+> credentials). Filename `rixxx-backup-<domain>-<date>.json`.
+>
+> **Restore** (`POST /api/backup/import`, auth-gated): validates the file
+> (format tag, schema, required sections, per-user records) *before* touching
+> anything, then upserts users and writes the config, and finally rebuilds the
+> Caddyfile + mita config and restarts the services — the **same code path** as
+> every normal add/delete, so nothing bespoke can drift.
+>   - **Domain mode** is chosen at import time:
+>     - *keep backup domain* → same-DNS move, existing client keys keep working;
+>     - *keep this server's domain* → new DNS, clients download fresh keys.
+>   - Local runtime paths (`dbPath`, `caddyBin`, …) are always taken from the
+>     live server, never the backup (a backup from another box may differ).
+>   - The live version tag is never downgraded by a backup.
+>
+> **UI:** "Download backup" + "Restore from backup" buttons, a plaintext-password
+> warning banner, and an inline status line. i18n EN + RU. The JSON body limit
+> was lifted to 25 MB so large user lists import cleanly.
+>
+> **Test:** `tests/feat-backup.test.js` (31 assertions) — structural checks
+> (endpoints, auth, validation, non-destructive rebuild path) plus a standalone
+> simulation of the export shape and the domain-mode merge.
+>
+> **Non-breaking:** purely additive. Existing add/delete/config flows and all
+> issued keys are untouched. Anyone who updates can immediately take a backup and
+> move to a new server.
+
+---
+
+## [v1.5.9]
+
+> **FEATURE — Mieru share-link export (`mierus://`) for routers (Keenetic / OpenWRT).**
+> Requested by a user: export a user's Mieru config not only as a sing-box JSON
+> file, but also as a single copy-paste **share link**, so it can be imported
+> directly on routers (Keenetic NDMS / OpenWRT) and by tools like
+> [awg-manager](https://github.com/hoaxisr/awg-manager).
+>
+> **Link format (canonical, round-trippable):**
+> ```
+> mierus://<user>:<pass>@<host>?profile=default&port=<p>&protocol=TCP
+> ```
+> - scheme `mierus` (the plain-text share form);
+> - `profile` always present (`default`);
+> - **each** `port` paired with its own `protocol` (canonical shape accepted by
+>   real router parsers — see awg-manager issue #516);
+> - host is the raw server IP; userinfo + query values are percent-encoded so
+>   unusual passwords stay valid.
+>
+> **Added — non-breaking (purely additive):**
+> - New endpoint `GET /api/users/:id/config/mieru-link` (auth-gated), returning
+>   `{ link, username }` exactly like the existing Naive-link endpoint. Supports
+>   `?port=<n>` (single, default) and `?range=1` (every port in the configured
+>   Mieru range, each paired with its protocol).
+> - New **"Mieru Link"** button in the config modal, next to "Mieru JSON". It
+>   reuses the shared link box + QR code and copies the link to the clipboard
+>   (same UX as "Naive Link").
+> - i18n: `config.mieruLink` / `config.mieruLinkCopied` in EN + RU.
+> - Test `tests/feat-mieru-link.test.js` (29 assertions) locking down the
+>   canonical format, per-port protocol pairing, percent-encoding, and that the
+>   existing Mieru JSON download is untouched.
+>
+> **Nothing existing changed** — the Mieru JSON download, Naive link, and
+> Universal config paths are all byte-for-byte the same. Safe for existing users;
+> `update.sh` needs no migration for this feature.
+
+---
+
+## [v1.5.8]
+
+> **BUG-172 (CRITICAL) — Mieru cascade silently dies after 2-5 days; watchdog
+> blind to it.** With the cascade (Variant B: `redsocks` + `iptables` +
+> `mieru-client`) enabled, everything works — then after 2-5 days of uptime
+> client devices suddenly time out, while `mita` **and** `redsocks` still report
+> `active (running)` and the web panel stays reachable. Only a manual
+> `systemctl restart redsocks` (or a full reinstall) fixes it.
+>
+> **Field diagnosis (thanks to the reporter's excellent write-up):**
+> - `curl -x socks5h://127.0.0.1:1080 https://api.ipify.org` → **OK** (mieru tunnel alive)
+> - `sudo -u mita curl https://api.ipify.org` → **hangs at TLS handshake, times out**
+> - `strace -p $(pidof redsocks)` while a request is pending → **zero syscalls**
+> - No FD leak (~22 open), no CLOSE-WAIT zombies, iptables `RETURN` rule correct.
+>
+> **Root cause:** redsocks' `libevent` event-loop **dead-locks** under long
+> uptime / connection micro-storms. The process is alive and `:12345` is still
+> bound, but it stops servicing socket events — so the cascade data-plane
+> (`iptables → redsocks → mieru`) is dead even though every unit is "healthy".
+>
+> **Why the old watchdog missed it:** `write_watchdog()` probed
+> `curl --socks5 127.0.0.1:1080`, which talks to **mieru-client directly** and
+> bypasses **both** iptables **and** redsocks. mieru was fine, so the probe
+> passed, the watchdog concluded "internet is up", and never restarted anything
+> — while real client traffic (which *does* traverse iptables → redsocks)
+> black-holed.
+
+### Fixed
+- **BUG-172 (CRITICAL): cascade watchdog now probes the WHOLE chain.**
+  `write_watchdog()` generates a watchdog that issues its health probe **as the
+  `mita` user** (`sudo -u mita curl … https://api.ipify.org`), so the
+  `iptables … OUTPUT -m owner --uid-owner <mita> -j REDSOCKS` rule forces it
+  through the full `iptables → redsocks → mieru` path — exactly like a real
+  client. A redsocks event-loop deadlock is therefore actually detected.
+- **Self-heal targets the ACTUAL culprit** (after 3 consecutive end-to-end
+  failures, to avoid flapping on a transient blip):
+  - chain fails **but** the raw SOCKS5 (`:1080`) probe still works → redsocks is
+    the wedged component → **restart `redsocks`** (the common deadlock case).
+  - chain **and** SOCKS5 both fail → the mieru tunnel itself is down → **restart
+    `mieru`, then `redsocks`** (so redsocks re-dials the fresh SOCKS5 listener).
+  Healing actions are logged to `/var/log/cascade-watchdog.log`.
+
+### Added
+- **Preventive nightly redsocks recycle.** The cron now also runs
+  `0 4 * * * root systemctl restart redsocks` — redsocks is historically prone
+  to slow FD/memory leaks and event-loop wedges over 24/7 uptime, so a nightly
+  restart keeps the loop fresh (the mieru session survives; brief <1 s blip).
+
+### Changed
+- **Safe in-place upgrade for existing cascades.** `update.sh` gains
+  `migrate_cascade_watchdog`, which re-deploys the corrected watchdog + cron on
+  boxes that already run the cascade — **without** touching the live
+  tunnel/iptables (it sources only the orchestrator's function definitions, with
+  the `case "$ACTION"` dispatcher stripped, and calls `write_watchdog` in a
+  guarded subshell). It runs **only** when Variant B is actually deployed here
+  (the `cascade-mieru.state` file or the existing watchdog binary is present)
+  **and** `cascadeEnabled=true`, so a Variant-A-only or cascade-off host is never
+  given a chain-probing watchdog. Idempotent and safe under `-y`.
+
+### Tests
+- `tests/bug172-cascade-watchdog.test.js` (18 assertions): the generated
+  watchdog is valid bash, probes the full chain **as `mita`** (not the bare
+  SOCKS5 shortcut that caused the blind spot), heals the correct component in
+  each state, restarts mieru **before** redsocks, logs its actions, and installs
+  both the 5-minute chain probe and the nightly recycle. Includes a **live**
+  run that shims `sudo`/`curl`/`systemctl` to simulate the three real states
+  (healthy → nothing restarted; redsocks deadlock → redsocks only; mieru down →
+  mieru + redsocks).
+
+---
+
 ## [v1.5.7]
 
 > **BUG-171 (CRITICAL) — WARP: client keys never establish (stuck in SYN-RECV).**

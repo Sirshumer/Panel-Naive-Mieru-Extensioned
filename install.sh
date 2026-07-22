@@ -1232,6 +1232,12 @@ write_config_json() {
       naivePort:      num(E.CFG_NAIVE_PORT, 8443),
       mieruPortStart: num(E.CFG_MIERU_PORT_START, 2012),
       mieruPortEnd:   num(E.CFG_MIERU_PORT_END, 2022),
+      // v1.8.0: Hysteria2 (Hy2) — the optional 3rd protocol. Fresh installs ship
+      // the config defaults but DO NOT install Hy2 (stack.hy2=false). The operator
+      // adds it later from the panel (Settings → «Доустановить Hy2»); it defaults
+      // to 443/udp and reuses the Caddy certificate (no second ACME email).
+      hy2Port:        num(E.CFG_HY2_PORT, 443),
+      stack:          { naive: true, mieru: true, hy2: false },
       panelPort:      3000,
       panelHost:      "127.0.0.1",
       exposePanel:    E.CFG_EXPOSE_PANEL === "1",

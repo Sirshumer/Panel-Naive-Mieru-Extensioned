@@ -53,7 +53,8 @@
     "restart": "Рестарт",
     "stop": "Стоп",
     "active": "Активен",
-    "inactive": "Неактивен"
+    "inactive": "Неактивен",
+    "hy2": "Hysteria2"
   },
   "users": {
     "title": "Пользователи",
@@ -107,7 +108,10 @@
     "copyPassword": "📋 Копировать",
     "passwordGenerated": "Случайный пароль сгенерирован и скопирован",
     "passwordCopied": "Пароль скопирован",
-    "passwordEmpty": "Поле пароля пустое"
+    "passwordEmpty": "Поле пароля пустое",
+    "hy2Label": "Hysteria2",
+    "hy2NotInstalled": "Hysteria2 не установлен — доустановите его в «Настройках сервера», чтобы выдавать hy2-ключи.",
+    "hy2Col": "Hy2"
   },
   "config": {
     "downloadTitle": "Скачать клиентский конфиг",
@@ -120,14 +124,18 @@
     "passwordPlaceholder": "Пароль пользователя",
     "cancel": "Отмена",
     "naiveLink": "Naive ссылка",
+    "mieruLink": "Mieru ссылка",
     "mieruJson": "Mieru JSON",
     "universalConfig": "Универсальный",
     "enterPassword": "Сначала введите пароль пользователя",
     "naiveCopied": "Naive-ссылка скопирована в буфер",
+    "mieruLinkCopied": "Mieru-ссылка скопирована в буфер",
     "mieruDownloaded": "Mieru конфиг скачан",
     "universalDownloaded": "Универсальный конфиг скачан",
     "qrCode": "QR-код",
-    "qrNote": "Отсканируйте QR-код клиентом (iOS: ShadowRocket, Karing)"
+    "qrNote": "Отсканируйте QR-код клиентом (iOS: ShadowRocket, Karing)",
+    "hy2Link": "Hy2 ссылка",
+    "hy2LinkCopied": "Hy2-ссылка скопирована в буфер"
   },
   "settings": {
     "title": "Настройки сервера",
@@ -198,6 +206,17 @@
     "passwordMismatch": "Пароли не совпадают",
     "passwordTooShort": "Новый пароль — минимум 8 символов",
     "passwordChanged": "Пароль успешно изменён",
+    "backupTitle": "Бэкап и восстановление",
+    "backupDesc": "Выгрузите полный бэкап (все пользователи + все настройки) одним файлом или восстановите его на новом сервере. Если новый сервер использует тот же домен (просто направьте DNS на него) — существующие ключи клиентов продолжат работать без изменений.",
+    "backupWarn": "⚠ Файл бэкапа содержит пароли пользователей в открытом виде. Храните его в надёжном месте и никому не передавайте.",
+    "backupExport": "Скачать бэкап",
+    "backupImport": "Восстановить из бэкапа",
+    "backupExported": "Бэкап скачан",
+    "backupImported": "Бэкап восстановлен",
+    "backupImporting": "Восстановление…",
+    "backupBadFile": "Это не корректный файл бэкапа панели RIXXX",
+    "backupDomainPrompt": "Восстановить {n} пользователя(-ей) из бэкапа.\n\nИспользовать ДОМЕН/порты ИЗ БЭКАПА (\"{d}\")?\n\n• OK = домен из бэкапа (тот же DNS → существующие ключи продолжат работать)\n• Отмена = оставить текущий домен ЭТОГО сервера (клиентам нужно скачать новые ключи)",
+    "backupImportConfirm": "Это ПЕРЕЗАПИШЕТ текущих пользователей и настройки данными из бэкапа. Продолжить?",
     "aboutTitle": "О панели",
     "panelVersion": "Версия панели",
     "author": "Автор",
@@ -248,7 +267,24 @@
     "externalStubSaved": "Заглушка сохранена ✓",
     "externalStubEmpty": "HTML заглушки не может быть пустым",
     "externalBaPassNew": "Пароль basic auth (обязательно при первом включении)",
-    "externalBaPassKeep": "Пароль basic auth (пусто — оставить прежний)"
+    "externalBaPassKeep": "Пароль basic auth (пусто — оставить прежний)",
+    "hy2Title": "Hysteria2 (Hy2)",
+    "hy2Desc": "Hysteria2 — быстрый QUIC/UDP-протокол. Работает поверх UDP и сосуществует с NaiveProxy на TCP/443. Использует общий пул пользователей и сертификат Caddy (второй email не нужен).",
+    "hy2NotInstalled": "Hysteria2 ещё не установлен на этом сервере.",
+    "hy2Installed": "Hysteria2 установлен.",
+    "hy2PortLabel": "UDP-порт (1–65535)",
+    "hy2PortHint": "По умолчанию 443/udp (рядом с Naive TCP/443). Можно изменить на 8443 и т.п.",
+    "hy2PortNote": "Смена порта перезапустит Hy2. Клиенты должны обновить ссылки.",
+    "hy2Install": "Доустановить Hy2",
+    "hy2Reinstall": "Переустановить",
+    "hy2ApplyPort": "Применить порт Hy2",
+    "hy2Installing": "Установка Hy2… (до 2 минут)",
+    "hy2InstallConfirm": "Установить Hysteria2 на этот сервер? Может занять до 1–2 минут.",
+    "hy2ReinstallConfirm": "Переустановить Hysteria2? Сервис будет перезапущен.",
+    "hy2PortConfirm": "Сменить порт Hy2? Сервис будет перезапущен, клиентам нужны новые ссылки.",
+    "hy2PortUpdated": "Порт Hy2 обновлён",
+    "hy2Port": "Порт",
+    "hy2Users": "польз."
   },
   "monitoring": {
     "title": "Мониторинг",

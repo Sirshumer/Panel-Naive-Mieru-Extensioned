@@ -113,6 +113,7 @@ parse_args() {
       --ssh-only)  MODE="ssh-only" ;;
       --status)    MODE="status" ;;
       --repair)    MODE="repair" ;;
+      --enroll-hy2) MODE="enroll-hy2" ;;
       --help|-h)   print_help; exit 0 ;;
       *) die "Unknown argument: $1  (use --help)" ;;
     esac
@@ -151,6 +152,9 @@ OPTIONS:
                           remove the panel block, close any legacy bare port
   --status               Print full health report
   --repair               Rebuild Caddyfile + mita config from SQLite DB; restart services
+  --enroll-hy2           Add Hysteria2 to EVERY existing user + rewrite userpass +
+                         restart Hy2 (one-off; existing clients start working over Hy2).
+                         Same as HY2_ENROLL_ALL=1 but runs ONLY this step (no full update).
   --help                 Show this help
 
 EXAMPLES:
@@ -399,6 +403,31 @@ migrate_config() {
       log_info "Config migrated: external-access fields added (SSH-only default) ✓"
     fi
     rm -f "$tmp2"
+  fi
+
+  # v1.8.0 (Hy2 Sub-stage C): backfill the Hysteria2 config fields for installs
+  # that predate the 3rd protocol. We add hy2Port (default 443/udp) and the
+  # stack.{naive,mieru,hy2} map. CRITICAL: stack.hy2 defaults to FALSE — the
+  # update NEVER auto-installs Hy2; it only makes the "Доустановить Hy2" button
+  # available in Settings (the server reports installed:false via
+  # /api/settings/hy2, so the UI renders the install card). Existing users and
+  # their protocols array are left completely untouched. This mirrors the
+  # server-side runtime backfill (index.js) so the config is correct even before
+  # the panel process restarts.
+  local has_hy2; has_hy2=$(jq -r 'has("hy2Port") and (.stack? // {} | has("hy2"))' "$PANEL_CONFIG" 2>/dev/null)
+  if [[ "$has_hy2" != "true" ]]; then
+    local tmp3; tmp3=$(mktemp)
+    if jq '
+        .hy2Port      = (.hy2Port // 443)
+      | .stack        = (.stack // {})
+      | .stack.naive  = (.stack.naive // true)
+      | .stack.mieru  = (.stack.mieru // true)
+      | .stack.hy2    = (.stack.hy2   // false)
+    ' "$PANEL_CONFIG" > "$tmp3" 2>/dev/null && [[ -s "$tmp3" ]]; then
+      cat "$tmp3" > "$PANEL_CONFIG"
+      log_info "Config migrated: Hy2 fields added (hy2Port=443/udp, stack.hy2=false — install via Settings) ✓"
+    fi
+    rm -f "$tmp3"
   fi
 
   # BUG-155 (HIGH): self-heal a polluted panelBasicAuthHash. A pre-fix installer
@@ -1038,6 +1067,185 @@ migrate_warp_safety() {
   [[ "$changed" == "1" ]] && systemctl daemon-reload 2>/dev/null || true
 }
 
+# ── BUG-172 migration: refresh the Mieru-cascade watchdog on existing installs ─
+#   The pre-1.5.8 watchdog probed mieru-client's SOCKS5 (:1080) DIRECTLY, so a
+#   redsocks event-loop deadlock (process alive, port open, no events serviced)
+#   went undetected and clients silently timed out after 2-5 days. If a cascade
+#   is currently enabled, re-run the orchestrator's watchdog installer so the box
+#   gets the new full-chain probe (as the mita user) + nightly redsocks recycle
+#   WITHOUT touching the live tunnel/iptables. Idempotent and safe on -y.
+migrate_cascade_watchdog() {
+  # Gate strictly on Variant-B actually being DEPLOYED on this box, not merely on
+  # cascadeEnabled (which is also true for Variant-A native egress). The state
+  # file /var/lib/rixxx-panel/cascade-mieru.state is written ONLY by
+  # `cascade_mieru.sh setup`, and the old watchdog binary is only present after a
+  # Variant-B setup — either is proof the redsocks+mieru-client chain exists here.
+  # This guarantees we never install a chain-probing watchdog on a host that
+  # doesn't run the chain (which could spuriously restart unrelated services).
+  local state="/var/lib/rixxx-panel/cascade-mieru.state"
+  local wd="/usr/local/bin/mieru-watchdog.sh"
+  if [[ ! -f "$state" && ! -f "$wd" ]]; then
+    return 0
+  fi
+  local enabled
+  enabled=$(jq -r '.cascadeEnabled // false' "$PANEL_CONFIG" 2>/dev/null || echo false)
+  [[ "$enabled" != "true" ]] && return 0
+  $DRY_RUN && { log_dry "Would refresh the Mieru-cascade watchdog (BUG-172: full-chain probe + nightly recycle)"; return 0; }
+  local cs="${PANEL_DIR:-/opt/panel-naive-mieru}/panel/scripts/cascade_mieru.sh"
+  [[ -f "$cs" ]] || cs="$(dirname "$0")/panel/scripts/cascade_mieru.sh"
+  [[ -f "$cs" ]] || { log_warn "cascade script not found — skip watchdog refresh"; return 0; }
+  # Load ONLY the function definitions (strip the trailing `case "$ACTION"`
+  # dispatcher, which would otherwise `die` on an empty action), then re-install
+  # just the watchdog + cron. No tunnel/iptables side effects. Runs in a subshell
+  # so the sourced script's `set -euo pipefail` can't leak into the updater.
+  if ( set +eu +o pipefail 2>/dev/null
+       eval "$(sed '/^case "\$ACTION" in/,$d' "$cs")"
+       write_watchdog ) >/dev/null 2>&1; then
+    log_info "Cascade watchdog refreshed (BUG-172: full-chain probe + nightly recycle) ✓"
+  else
+    log_warn "Cascade watchdog refresh returned non-zero — re-toggle the cascade in the panel to update it"
+  fi
+}
+
+# ── v1.8.0 (Hy2 Sub-stage C): Hysteria2 update migration ─────────────────────
+#   Hy2 is the OPTIONAL third protocol. This migration NEVER auto-installs it.
+#     • Installed (config + binary present): restart hysteria-server so the
+#       refreshed unit/config (and any panel-rewritten userpass) take effect,
+#       exactly like caddy-naive/mita above. The panel keeps the userpass map in
+#       sync from the SQLite pool on the next applyAllConfigs(), so existing Hy2
+#       users are NOT dropped.
+#     • Not installed: print a one-line hint that Hy2 can be added from Settings
+#       ("Доустановить Hy2"). No side effects — existing installs are untouched.
+#   Idempotent and safe under -y / --dry-run.
+migrate_hy2() {
+  $DRY_RUN && { log_dry "Would restart hysteria-server if Hy2 is installed (else print an install hint)"; return 0; }
+  if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    if systemctl restart hysteria-server 2>/dev/null; then
+      log_info "Hy2: hysteria-server restarted to pick up the update ✓"
+    else
+      log_warn "Hy2: hysteria-server restart failed — journalctl -u hysteria-server -n 20"
+    fi
+  else
+    log_info "Hy2 (Hysteria2) is available but NOT installed — add it any time from the panel: Settings → «Доустановить Hy2» (443/udp by default, reuses the Caddy cert)."
+  fi
+}
+
+# ── v1.8.2: Opt-in auto-enroll — add "hy2" to EVERY existing user's protocols ─
+#   Requested feature: "чтобы на уже выпущенные клиенты Hy2 сам подтянулся".
+#   Existing clients were issued BEFORE Hy2 existed, so their protocols array is
+#   ["naive","mieru"] and they never appear in auth.userpass → they can't use Hy2.
+#   This backfills "hy2" into every user (idempotent — users who already have it
+#   are skipped), then rewrites /etc/hysteria/config.yaml's userpass block and
+#   restarts the service so all clients work over Hy2 immediately.
+#
+#   OPT-IN by design: runs only when HY2_ENROLL_ALL=1 is set (so a plain update
+#   never silently changes which protocols users have). Requires Hy2 installed.
+#   Passwords are unchanged — the same credential the client already has works
+#   for Hy2 (auth.userpass maps username → the stored plaintext password).
+migrate_hy2_enroll_all() {
+  [[ "${HY2_ENROLL_ALL:-0}" == "1" ]] || return 0
+  $DRY_RUN && { log_dry "Would add 'hy2' to every user's protocols and rewrite Hy2 userpass (HY2_ENROLL_ALL=1)"; return 0; }
+
+  if [[ ! -f /etc/hysteria/config.yaml || ! -x /usr/local/bin/hysteria ]]; then
+    log_warn "HY2_ENROLL_ALL=1 set but Hy2 is not installed — install it first (Settings → «Доустановить Hy2»), then re-run."
+    return 0
+  fi
+  [[ -f "$DB_PATH" ]] || { log_warn "DB not found at $DB_PATH — cannot enroll users"; return 0; }
+
+  log_step "Enrolling all existing users into Hy2 (HY2_ENROLL_ALL=1)"
+
+  local enroll_js; enroll_js="$(mktemp /tmp/rixxx-hy2-enroll.XXXXXX.js)"
+  cat > "$enroll_js" << 'NODE_EOF'
+'use strict';
+const Database = require('better-sqlite3');
+const db = new Database(process.env.RB_DB_PATH);
+const rows = db.prepare('SELECT id, username, protocols FROM users').all();
+const upd = db.prepare('UPDATE users SET protocols = ? WHERE id = ?');
+let changed = 0, already = 0;
+const tx = db.transaction(() => {
+  for (const r of rows) {
+    let arr;
+    try { arr = JSON.parse(r.protocols || '["naive","mieru"]'); }
+    catch { arr = ['naive', 'mieru']; }
+    if (!Array.isArray(arr)) arr = ['naive', 'mieru'];
+    if (arr.includes('hy2')) { already++; continue; }
+    arr.push('hy2');
+    upd.run(JSON.stringify(arr), r.id);
+    changed++;
+  }
+});
+tx();
+db.close();
+console.log('[hy2-enroll] added hy2 to ' + changed + ' user(s); ' + already + ' already had it');
+NODE_EOF
+
+  if ( cd "$PANEL_DIR" && RB_DB_PATH="$DB_PATH" node "$enroll_js" ); then
+    log_info "All users enrolled into Hy2 ✓"
+  else
+    rm -f "$enroll_js"
+    log_warn "Hy2 auto-enroll failed (node/better-sqlite3) — users left unchanged"
+    return 1
+  fi
+  rm -f "$enroll_js"
+
+  # Rewrite the userpass block from the (now-enrolled) DB and restart Hy2.
+  local rewrite_js; rewrite_js="$(mktemp /tmp/rixxx-hy2-rewrite.XXXXXX.js)"
+  cat > "$rewrite_js" << 'NODE_EOF'
+'use strict';
+const fs = require('fs');
+const Database = require('better-sqlite3');
+const CFG = '/etc/hysteria/config.yaml';
+const db = new Database(process.env.RB_DB_PATH, { readonly: true });
+const users = db.prepare('SELECT username, password, protocols FROM users').all()
+  .filter(u => { try { return JSON.parse(u.protocols || '[]').includes('hy2'); } catch { return false; } });
+db.close();
+
+const q = s => '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+const lines = ['auth:', '  type: userpass', '  userpass:'];
+const seen = new Set();
+for (const u of users) {
+  if (!u.username || seen.has(u.username) || !u.password) continue;
+  seen.add(u.username);
+  lines.push('    ' + u.username + ': ' + q(u.password));
+}
+if (lines.length === 3) {
+  // never leave an empty map (Hy2 FATALs) — disabled sentinel
+  const rnd = require('crypto').randomBytes(24).toString('hex');
+  lines.push('    __disabled_no_hy2_users__: ' + q('disabled-' + rnd));
+}
+const block = lines.join('\n') + '\n';
+
+let text = fs.readFileSync(CFG, 'utf8');
+const re = /^auth:[ \t]*\r?\n(?:[ \t].*\r?\n?|\r?\n)*/m;
+if (re.test(text)) text = text.replace(re, () => block);
+else {
+  const lr = /^listen:.*\r?\n/m;
+  text = lr.test(text) ? text.replace(lr, m => m + '\n' + block) : block + '\n' + text;
+}
+if (!/^listen:/m.test(text) || (!/^tls:/m.test(text) && !/^acme:/m.test(text)) || !/^auth:/m.test(text)) {
+  console.error('[hy2-rewrite] refusing to write — structural validation failed');
+  process.exit(2);
+}
+fs.writeFileSync(CFG, text, { mode: 0o600 });
+console.log('[hy2-rewrite] userpass rewritten with ' + seen.size + ' Hy2 user(s)');
+NODE_EOF
+
+  if ( cd "$PANEL_DIR" && RB_DB_PATH="$DB_PATH" node "$rewrite_js" ); then
+    rm -f "$rewrite_js"
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    if systemctl restart hysteria-server 2>/dev/null && \
+       [[ "$(systemctl is-active hysteria-server 2>/dev/null)" == "active" ]]; then
+      log_info "Hy2 config rewritten and hysteria-server restarted — all clients active over Hy2 ✓"
+    else
+      log_warn "Hy2 restart failed after enroll — journalctl -u hysteria-server -n 20"
+    fi
+  else
+    rm -f "$rewrite_js"
+    log_warn "Hy2 config rewrite failed — run a user add/delete in the panel to resync userpass"
+  fi
+}
+
 # ── Bug 79: fix caddy-naive config permissions ───────────────────────────────
 #   caddy-naive runs as User=caddy and fails to start with
 #     "reading config from file: open /etc/caddy-naive/Caddyfile: permission denied"
@@ -1240,6 +1448,20 @@ update_panel() {
   done
   chmod +x "$PANEL_DIR/update.sh" "$PANEL_DIR/install.sh" "$PANEL_DIR/uninstall.sh" 2>/dev/null || true
 
+  # v1.8.0 (Hy2 Sub-stage C): make the shipped helper scripts executable so the
+  # panel can run them. install_hysteria.sh is the Hy2 installer invoked by
+  # POST /api/settings/hy2/install (the "Доустановить Hy2" button); warp_egress.sh
+  # / cascade_mieru.sh are the WARP + cascade helpers. `cp -a` preserves mode from
+  # the repo, but a git/tarball checkout may land them non-executable — force it.
+  # NOTE: server/index.js resolves scripts via __dirname/../scripts, so on prod
+  # they live at $PANEL_DIR/scripts. We chmod BOTH that canonical location and the
+  # legacy $PANEL_DIR/panel/scripts path (older layouts) to be safe.
+  for base in "$PANEL_DIR/scripts" "$PANEL_DIR/panel/scripts"; do
+    for s in install_hysteria.sh warp_egress.sh cascade_mieru.sh; do
+      [[ -f "$base/$s" ]] && chmod +x "$base/$s" 2>/dev/null || true
+    done
+  done
+
   # npm install must NOT be fatal — keep going even on a transient failure.
   ( cd "$PANEL_DIR" && npm install --omit=dev --silent ) \
     || ( cd "$PANEL_DIR" && npm install --production --silent ) \
@@ -1279,6 +1501,17 @@ smoke_test() {
   # v1.2.3: check caddy-naive (not legacy naive)
   check_svc caddy-naive
   check_svc mita
+
+  # v1.8.0 (Hy2 Sub-stage C): Hy2 is OPTIONAL — only smoke-test it when the
+  # operator has actually installed it (config + binary present). A box that
+  # never enabled Hy2 must NOT be flagged as failing.
+  if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
+    if systemctl is-active --quiet hysteria-server; then
+      echo -e "  ${GREEN}✓${NC} hysteria-server active (Hy2)"; (( pass++ ))
+    else
+      echo -e "  ${YELLOW}⚠${NC}  hysteria-server INACTIVE (Hy2 installed) — journalctl -u hysteria-server -n 20"
+    fi
+  fi
 
   # caddy-naive version check
   if timeout 5 "$CADDY_BIN" version &>/dev/null 2>&1 || \
@@ -1347,6 +1580,7 @@ do_status() {
   echo "  Panel:          $(get_current_version) (target: $TARGET_VERSION)"
   echo "  caddy-naive:    $("$CADDY_BIN" version 2>/dev/null | head -1 || echo 'not installed')"
   echo "  mita:           $(mita version 2>/dev/null | head -1 || echo 'not installed')"
+  echo "  hysteria (Hy2): $([[ -x /usr/local/bin/hysteria ]] && /usr/local/bin/hysteria version 2>/dev/null | head -1 || echo 'not installed')"
   echo "  Node.js:        $(node --version 2>/dev/null || echo 'not installed')"
   echo "  PM2:            $(pm2 --version 2>/dev/null || echo 'not installed')"
   echo ""
@@ -1368,6 +1602,18 @@ do_status() {
       echo -e "  ${RED}●${NC} $svc — $status"
     fi
   done
+  # v1.8.0: Hy2 (Hysteria2) — only shown when the optional 3rd protocol is
+  # installed; a box that never enabled it simply omits the line.
+  if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
+    local hy2s; hy2s=$(systemctl is-active hysteria-server 2>/dev/null || echo "unknown")
+    if [[ "$hy2s" == "active" ]]; then
+      echo -e "  ${GREEN}●${NC} hysteria-server — active (Hy2)"
+    else
+      echo -e "  ${RED}●${NC} hysteria-server — $hy2s (Hy2)"
+    fi
+  else
+    echo -e "  ${YELLOW}○${NC} hysteria-server — not installed (add from Settings → «Доустановить Hy2»)"
+  fi
   # Legacy naive check
   if systemctl is-active naive &>/dev/null 2>&1; then
     echo -e "  ${YELLOW}●${NC} naive — active (LEGACY — should have been removed in v1.2.3 migration)"
@@ -1381,6 +1627,7 @@ do_status() {
   echo -e "${BOLD}Configuration:${NC}"
   if [[ -f "$PANEL_CONFIG" ]]; then
     jq '{ domain, serverIp, naivePort, mieruPortStart, mieruPortEnd,
+          hy2Port, stack,
           exposePanel, trafficPattern, mtu, udpEnabled,
           fakeSiteUrl, probeSecret }' \
       "$PANEL_CONFIG" 2>/dev/null | sed 's/^/  /'
@@ -1614,6 +1861,28 @@ print_panel_credentials() {
   echo ""
 }
 
+# ── --enroll-hy2 mode ────────────────────────────────────────────────────────
+# One-off: add "hy2" to every existing user, rewrite userpass, restart Hy2 —
+# WITHOUT running a full update. Delegates to migrate_hy2_enroll_all (which is
+# gated on HY2_ENROLL_ALL=1), so we just force the flag on for this invocation.
+do_enroll_hy2() {
+  log_step "Enroll-Hy2 mode — adding Hysteria2 to all existing users"
+  if [[ ! -f /etc/hysteria/config.yaml || ! -x /usr/local/bin/hysteria ]]; then
+    log_error "Hysteria2 is not installed. Install it first: panel → Settings → «Доустановить Hy2»."
+    exit 1
+  fi
+  if ! $YES; then
+    if [[ -r /dev/tty ]]; then
+      read -rp "Add Hy2 to EVERY user and restart hysteria-server? [y/N]: " confirm </dev/tty || confirm=""
+      [[ "${confirm^^}" != "Y" ]] && { log_info "Aborted."; exit 0; }
+    else
+      log_info "No interactive terminal — proceeding (explicit --enroll-hy2 is consent)."
+    fi
+  fi
+  HY2_ENROLL_ALL=1 migrate_hy2_enroll_all
+  log_info "Enroll-Hy2 done. Verify: systemctl is-active hysteria-server"
+}
+
 # ── --repair mode ─────────────────────────────────────────────────────────────
 # Rebuild Caddyfile + mita config from SQLite DB; no data loss.
 # v1.2.3: Calls /api/services/rebuild-all (falls back to direct DB rebuild).
@@ -1700,6 +1969,16 @@ FAKEHTML
   systemctl restart mita 2>/dev/null && log_info "mita restarted ✓" || \
     log_warn "mita restart failed — journalctl -u mita -n 20"
 
+  # v1.8.0 (Hy2 Sub-stage C): if Hy2 is installed, restart it too. The panel
+  # rewrites /etc/hysteria/config.yaml's userpass map from the SQLite pool on its
+  # next applyAllConfigs(), so a repair keeps Hy2 users in sync (no data loss).
+  # Skipped entirely when Hy2 was never installed.
+  if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
+    systemctl reset-failed hysteria-server 2>/dev/null || true
+    systemctl restart hysteria-server 2>/dev/null && log_info "hysteria-server restarted (Hy2) ✓" || \
+      log_warn "hysteria-server restart failed — journalctl -u hysteria-server -n 20"
+  fi
+
   # Bug 104 (v1.4.2): --repair previously left config.json's "version" untouched,
   # so PM2 / the UI kept reporting a stale version (e.g. 1.2.6 while 1.4.x is
   # installed). Sync config.json to the installed VERSION *before* restarting the
@@ -1766,7 +2045,14 @@ do_update() {
   local current; current=$(get_current_version)
   log_info "Installed version: $current  |  Target: $TARGET_VERSION"
 
-  if ! $FORCE && ! version_gt "$TARGET_VERSION" "$current"; then
+  # v1.8.3: an explicit maintenance action (HY2_ENROLL_ALL=1) must ALWAYS run to
+  # completion, even when the installed version already equals the target — the
+  # operator asked for a one-off migration, not a version upgrade. Without this,
+  # a same-version box hit the "Nothing to do" early-exit and the enroll step
+  # (which lives further down in do_update) never executed.
+  if [[ "${HY2_ENROLL_ALL:-0}" == "1" ]] && ! version_gt "$TARGET_VERSION" "$current"; then
+    log_info "HY2_ENROLL_ALL=1 — running full update flow to apply the Hy2 enrollment (version unchanged)."
+  elif ! $FORCE && ! version_gt "$TARGET_VERSION" "$current"; then
     log_info "Version file already reports $current (target $TARGET_VERSION)."
     if $YES; then
       # Bug 76: in non-interactive mode, re-sync the panel files anyway. The
@@ -1814,6 +2100,18 @@ do_update() {
   #   operator regains native access. The new (safe) WARP is only re-enabled when
   #   the operator explicitly toggles it again in the panel.
   migrate_warp_safety
+
+  # BUG-172 migration: refresh the cascade watchdog (full-chain probe + nightly
+  # redsocks recycle) on any box that currently has the Mieru cascade enabled.
+  migrate_cascade_watchdog
+
+  # v1.8.0 (Hy2 Sub-stage C): restart Hy2 if installed, else hint how to add it.
+  # Runs BEFORE the dry-run gate returns so --dry-run reports the intended action.
+  migrate_hy2
+
+  # v1.8.2: opt-in — enroll ALL existing users into Hy2 (HY2_ENROLL_ALL=1).
+  # No-op unless the operator explicitly sets the env var. Also honours --dry-run.
+  migrate_hy2_enroll_all
 
   $DRY_RUN && { log_info "[DRY-RUN] No changes were made."; return; }
 
@@ -1874,6 +2172,7 @@ main() {
     expose)   check_install; load_config; do_expose ;;
     ssh-only) check_install; load_config; do_ssh_only ;;
     repair)   check_install; load_config; do_repair ;;
+    enroll-hy2) check_install; load_config; do_enroll_hy2 ;;
     update)   check_install; load_config; do_update ;;
   esac
 }

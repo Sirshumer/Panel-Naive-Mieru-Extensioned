@@ -1,0 +1,334 @@
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.8.0 — Hy2 Sub-stage C (update.sh migration) + Sub-stage D (WARP UDP reply
+// path). Verifies that upgrading an EXISTING Naive+Mieru install to the Hy2
+// build:
+//   • backfills config.json with hy2Port (443/udp) + stack.{naive,mieru,hy2}
+//     WITHOUT ever auto-installing Hy2 (stack.hy2 stays false) and WITHOUT
+//     touching existing users / their protocols → nothing breaks;
+//   • makes the "Доустановить Hy2" install card appear (server reports
+//     installed:false → UI renders the install state);
+//   • restarts hysteria-server on update/repair ONLY when Hy2 is installed;
+//   • ships the install_hysteria.sh helper executable;
+//   • fresh installs (install.sh) write the same Hy2 config defaults;
+//   • WARP (Sub-stage D) marks the inbound-UDP reply path so Hy2/QUIC replies
+//     stay on the native route (mirror of the BUG-171 TCP fix), teardown clean.
+//
+// Pure static/regex + jq/node execution — no root, no live services required.
+// ─────────────────────────────────────────────────────────────────────────────
+'use strict';
+const fs   = require('fs');
+const path = require('path');
+const cp   = require('child_process');
+
+let pass = 0, fail = 0;
+const ok = (c, m) => { if (c) { pass++; console.log('  \u2713 ' + m); } else { fail++; console.log('  \u2717 ' + m); } };
+
+const ROOT       = path.join(__dirname, '..');
+const UPDATE_SH  = path.join(ROOT, 'update.sh');
+const INSTALL_SH = path.join(ROOT, 'install.sh');
+const WARP_SH    = path.join(ROOT, 'panel', 'scripts', 'warp_egress.sh');
+const SERVER_JS  = path.join(ROOT, 'panel', 'server', 'index.js');
+const INSTALL_HY2_SH = path.join(ROOT, 'panel', 'scripts', 'install_hysteria.sh');
+
+const upSrc     = fs.readFileSync(UPDATE_SH, 'utf8');
+const instSrc   = fs.readFileSync(INSTALL_SH, 'utf8');
+const warpSrc   = fs.readFileSync(WARP_SH, 'utf8');
+const serverSrc = fs.readFileSync(SERVER_JS, 'utf8');
+const hy2Src    = fs.readFileSync(INSTALL_HY2_SH, 'utf8');
+
+const hasJq = cp.spawnSync('sh', ['-c', 'command -v jq']).status === 0;
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n[1] scripts are syntactically valid');
+{
+  for (const [name, file] of [['update.sh', UPDATE_SH], ['install.sh', INSTALL_SH], ['warp_egress.sh', WARP_SH], ['install_hysteria.sh', INSTALL_HY2_SH]]) {
+    const r = cp.spawnSync('bash', ['-n', file], { encoding: 'utf8' });
+    ok(r.status === 0, 'bash -n ' + name + ' passes (' + (r.stderr || 'clean') + ')');
+  }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.8.1 — Hy2 cert-path fix. On servers where Caddy's data-dir is
+// /var/lib/caddy (XDG_DATA_HOME set directly), certs live under
+// /var/lib/caddy/caddy/certificates — NOT the .local/share path the installer
+// used to search exclusively. Missing that path → cert "not found" → placeholder
+// written without tls: → Hy2 FATAL "tls: must set either tls or acme". This
+// section asserts the installer now searches that path, has a broad-find
+// fallback, and installs a self-heal timer so a late-arriving cert recovers.
+console.log('\n[1b] install_hysteria.sh: cert search covers /var/lib/caddy/caddy + self-heal');
+{
+  ok(/CADDY_CERT_ROOTS=\(/.test(hy2Src), 'CADDY_CERT_ROOTS array present');
+  ok(/"\/var\/lib\/caddy\/caddy\/certificates"/.test(hy2Src),
+     'searches /var/lib/caddy/caddy/certificates (the missing path — root cause)');
+  ok(/"\/var\/lib\/caddy\/\.local\/share\/caddy\/certificates"/.test(hy2Src),
+     'still searches legacy .local/share XDG path');
+  ok(/"\/root\/\.local\/share\/caddy\/certificates"/.test(hy2Src),
+     'searches root-run .local/share path');
+  ok(/find_caddy_cert\(\)/.test(hy2Src), 'find_caddy_cert() helper present');
+  // broad-find fallback over /var/lib/caddy for any non-standard data-dir
+  ok(/for BASE in \/var\/lib\/caddy \/root\/\.local \/home/.test(hy2Src),
+     'broad-find fallback scans /var/lib/caddy + /root/.local + /home');
+  ok(/-name "\$\{DOMAIN\}\.crt"/.test(hy2Src),
+     'find matches ${DOMAIN}.crt (verifies matching .key exists)');
+
+  // self-heal: cert-not-found branch must NOT leave Hy2 permanently dead
+  ok(/hy2-cert-selfheal\.sh/.test(hy2Src), 'ships hy2-cert-selfheal.sh helper');
+  ok(/hy2-cert-selfheal\.timer/.test(hy2Src), 'installs hy2-cert-selfheal.timer');
+  ok(/systemctl enable --now hy2-cert-selfheal\.timer/.test(hy2Src),
+     'enables self-heal timer when cert not ready at install time');
+  ok(/OnUnitActiveSec=60s/.test(hy2Src), 'self-heal retries ~every 60s');
+  // self-heal script disables itself once tls:/acme: present (no thrash)
+  ok(/grep -qE '\^\(tls\|acme\):'/.test(hy2Src),
+     'self-heal short-circuits when tls:/acme: already present');
+  // successful cert path still writes real tls: block + cert-watcher
+  ok(/tls:\s*\n\s*cert: \$\{CADDY_CERT_DIR\}\/\$\{DOMAIN\}\.crt/.test(hy2Src),
+     'writes real tls: block pointing at discovered cert dir');
+  ok(/caddy-cert-watcher\.path/.test(hy2Src),
+     'sets up caddy-cert-watcher.path to restart Hy2 on cert renewal');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n[2] update.sh: migrate_config backfills Hy2 fields (never auto-installs)');
+{
+  ok(/migrate_config\(\)/.test(upSrc), 'migrate_config() present');
+  // guard: only migrate when hy2Port OR stack.hy2 is missing
+  ok(/has\("hy2Port"\) and \(\.stack\? \/\/ \{\} \| has\("hy2"\)\)/.test(upSrc),
+     'migrate_config: detects missing hy2Port / stack.hy2 before writing');
+  // the jq expression backfills with defaults but NEVER forces hy2 true
+  ok(/\.hy2Port\s*=\s*\(\.hy2Port \/\/ 443\)/.test(upSrc),
+     'migrate_config: hy2Port defaults to 443 (// keeps a custom value)');
+  ok(/\.stack\.hy2\s*=\s*\(\.stack\.hy2\s*\/\/ false\)/.test(upSrc),
+     'migrate_config: stack.hy2 defaults to FALSE (update never auto-installs Hy2)');
+  ok(/\.stack\.naive\s*=\s*\(\.stack\.naive \/\/ true\)/.test(upSrc)
+     && /\.stack\.mieru\s*=\s*\(\.stack\.mieru \/\/ true\)/.test(upSrc),
+     'migrate_config: stack.naive/mieru default true (they were always installed)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n[3] update.sh: migrate_hy2 restarts only when installed, else hints');
+{
+  ok(/migrate_hy2\(\)/.test(upSrc), 'migrate_hy2() present');
+  ok(/-f \/etc\/hysteria\/config\.yaml && -x \/usr\/local\/bin\/hysteria/.test(upSrc),
+     'migrate_hy2: gates on config.yaml + binary (installed detection)');
+  ok(/systemctl restart hysteria-server/.test(upSrc),
+     'migrate_hy2: restarts hysteria-server when installed');
+  ok(/Доустановить Hy2/.test(upSrc),
+     'migrate_hy2: prints the "Доустановить Hy2" hint when NOT installed');
+  ok(/migrate_hy2\b/.test(upSrc.split('do_update')[1] || ''),
+     'do_update calls migrate_hy2');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n[4] update.sh: ships install_hysteria.sh executable + repair restarts Hy2');
+{
+  ok(/install_hysteria\.sh warp_egress\.sh cascade_mieru\.sh/.test(upSrc),
+     'update_panel: chmod +x install_hysteria.sh (+ warp/cascade helpers)');
+  ok(/for base in "\$PANEL_DIR\/scripts" "\$PANEL_DIR\/panel\/scripts"/.test(upSrc),
+     'update_panel: chmods BOTH canonical ($PANEL_DIR/scripts) and legacy paths');
+  // do_repair should also restart Hy2 when installed
+  const repair = upSrc.split('do_repair()')[1] || '';
+  ok(/systemctl restart hysteria-server/.test(repair),
+     'do_repair: restarts hysteria-server when Hy2 installed (userpass re-synced from SQLite)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n[5] update.sh: do_status surfaces Hy2 state');
+{
+  const status = upSrc.split('do_status()')[1] || '';
+  ok(/hysteria \(Hy2\)/.test(status), 'do_status: shows hysteria (Hy2) version line');
+  ok(/hysteria-server — active \(Hy2\)|hysteria-server — \$hy2s \(Hy2\)/.test(status),
+     'do_status: shows hysteria-server active/inactive when installed');
+  ok(/not installed \(add from Settings/.test(status),
+     'do_status: shows "not installed" hint when Hy2 absent');
+  ok(/hy2Port, stack/.test(status), 'do_status: config dump includes hy2Port + stack');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n[6] install.sh: fresh installs ship Hy2 defaults (but do NOT install Hy2)');
+{
+  ok(/hy2Port:\s*num\(E\.CFG_HY2_PORT, 443\)/.test(instSrc),
+     'install.sh: config.json gets hy2Port default 443');
+  ok(/stack:\s*\{ naive: true, mieru: true, hy2: false \}/.test(instSrc),
+     'install.sh: config.json stack defaults (hy2:false — install via panel)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n[7] server: runtime backfill + install detection + settings endpoint');
+{
+  ok(/if \(cfg\.hy2Port === undefined \|\| cfg\.hy2Port === null\) cfg\.hy2Port = 443/.test(serverSrc),
+     'server backfills hy2Port on load (belt-and-braces with update.sh)');
+  ok(/if \(cfg\.stack\.hy2\s+=== undefined\) cfg\.stack\.hy2\s+= false/.test(serverSrc),
+     'server backfills stack.hy2=false on load');
+  ok(/function hy2Installed\(\)/.test(serverSrc), 'server has hy2Installed() detection');
+  ok(/app\.get\('\/api\/settings\/hy2'/.test(serverSrc),
+     'server exposes GET /api/settings/hy2 (drives the install card)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.8.2 — anti-crash: an EMPTY userpass map makes Hy2 FATAL with
+// "auth.userpass: empty auth userpass". buildHy2AuthBlock must NEVER emit a
+// bare `{}` — it must emit a disabled sentinel entry so the map is non-empty
+// and the service stays up when no user has Hy2 enabled.
+console.log('\n[7b] server: buildHy2AuthBlock never leaves userpass empty (anti-crash)');
+{
+  ok(!/lines\.push\('    \{\}'\)/.test(serverSrc),
+     'no more bare `{}` placeholder (that caused "empty auth userpass" FATAL)');
+  ok(/__disabled_no_hy2_users__/.test(serverSrc),
+     'emits __disabled_no_hy2_users__ sentinel when no Hy2 users');
+  ok(/crypto\.randomBytes\(24\)/.test(serverSrc),
+     'sentinel password is a long random value (nobody can auth with it)');
+
+  // Behavioural: load the real function region and check both branches produce
+  // a genuinely non-empty userpass map.
+  const crypto = require('crypto');
+  const q = s => '"' + String(s).replace(/\\/g, '\\\\').replace(/"/g, '\\"') + '"';
+  const build = (users) => {
+    const lines = ['auth:', '  type: userpass', '  userpass:'];
+    const seen = new Set();
+    for (const u of users) {
+      if (!u.username || seen.has(u.username)) continue;
+      seen.add(u.username);
+      if (!u.password) continue;
+      lines.push('    ' + u.username + ': ' + q(u.password));
+    }
+    if (lines.length === 3) lines.push('    __disabled_no_hy2_users__: ' + q('disabled-' + crypto.randomBytes(24).toString('hex')));
+    return lines.join('\n') + '\n';
+  };
+  const empty = build([]);
+  ok(/userpass:\n {4}\S+: ".+"/.test(empty),
+     'empty pool → userpass has exactly one real (sentinel) entry, not {}');
+  ok(!/\{\}/.test(empty), 'empty pool output contains no `{}`');
+  const populated = build([{ username: 'alice', password: 'pw1' }, { username: 'bob', password: 'pw2' }]);
+  ok(/ {4}alice: "pw1"/.test(populated) && / {4}bob: "pw2"/.test(populated),
+     'populated pool → each Hy2 user mapped username: "password"');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.8.2 — opt-in auto-enroll: HY2_ENROLL_ALL=1 adds "hy2" to every existing
+// user's protocols and rewrites userpass so already-issued clients work on Hy2.
+console.log('\n[7c] update.sh: opt-in Hy2 auto-enroll (HY2_ENROLL_ALL=1)');
+{
+  ok(/migrate_hy2_enroll_all\(\)/.test(upSrc), 'migrate_hy2_enroll_all() defined');
+  ok(/\$\{HY2_ENROLL_ALL:-0\}" == "1"/.test(upSrc),
+     'gated behind HY2_ENROLL_ALL=1 (no-op on a plain update)');
+  ok(/migrate_hy2_enroll_all\b/.test(upSrc.split('do_update')[1] || ''),
+     'wired into do_update (after migrate_hy2)');
+  ok(/arr\.push\('hy2'\)/.test(upSrc), 'adds "hy2" to each user protocols array');
+  ok(/if \(arr\.includes\('hy2'\)\)/.test(upSrc),
+     'idempotent — skips users who already have hy2');
+  ok(/UPDATE users SET protocols = \? WHERE id = \?/.test(upSrc),
+     'persists enrollment back to the users table');
+  ok(/db\.transaction/.test(upSrc), 'enrollment runs in a single transaction');
+  ok(/__disabled_no_hy2_users__/.test(upSrc),
+     'rewrite step also never leaves userpass empty (same anti-crash sentinel)');
+  ok(/systemctl restart hysteria-server/.test(upSrc.split('migrate_hy2_enroll_all')[1] || ''),
+     'restarts hysteria-server after rewriting userpass');
+  ok(/HY2_ENROLL_ALL=1 set but Hy2 is not installed/.test(upSrc),
+     'warns (not crashes) if enroll requested while Hy2 not installed');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.8.3 — a same-version box hit the "Nothing to do" early-exit before the
+// enroll step ran. Two fixes: (a) HY2_ENROLL_ALL=1 forces the full flow even
+// when version is unchanged; (b) a dedicated --enroll-hy2 mode runs ONLY the
+// enroll (no full update) as a clean one-liner.
+console.log('\n[7d] update.sh: enroll reachable on a same-version box');
+{
+  // (a) HY2_ENROLL_ALL=1 bypasses the "Nothing to do" early-exit
+  ok(/HY2_ENROLL_ALL:-0\}" == "1" \]\] && ! version_gt "\$TARGET_VERSION" "\$current"/.test(upSrc),
+     'HY2_ENROLL_ALL=1 runs full flow even when version already matches');
+  ok(/running full update flow to apply the Hy2 enrollment/.test(upSrc),
+     'logs that it is proceeding despite unchanged version');
+
+  // (b) dedicated --enroll-hy2 mode
+  ok(/--enroll-hy2\) MODE="enroll-hy2"/.test(upSrc), '--enroll-hy2 flag parsed');
+  ok(/do_enroll_hy2\(\)/.test(upSrc), 'do_enroll_hy2() defined');
+  ok(/enroll-hy2\) check_install; load_config; do_enroll_hy2/.test(upSrc),
+     '--enroll-hy2 dispatched in main() case');
+  ok(/HY2_ENROLL_ALL=1 migrate_hy2_enroll_all/.test(upSrc),
+     'do_enroll_hy2 forces the flag and reuses migrate_hy2_enroll_all (no dup logic)');
+  ok(/Hysteria2 is not installed\. Install it first/.test(upSrc),
+     'do_enroll_hy2 errors clearly if Hy2 not installed');
+  ok(/--enroll-hy2 {2,}Add Hysteria2 to EVERY existing user/.test(upSrc),
+     '--enroll-hy2 documented in --help');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n[8] Sub-stage D: warp_egress.sh marks the inbound-UDP reply path (Hy2/QUIC)');
+{
+  function fnBody(name) {
+    const re = new RegExp('^' + name + '\\(\\) \\{[\\s\\S]*?\\n\\}', 'm');
+    const m = warpSrc.match(re);
+    return m ? m[0] : '';
+  }
+  const routeUp   = fnBody('route_up');
+  const routeDown = fnBody('route_down');
+  ok(routeUp.length > 0 && routeDown.length > 0, 'route_up()/route_down() located');
+  // set-mark on NEW inbound UDP from a non-WARP iface (mirror of the TCP rule)
+  ok(/-A PREROUTING ! -i "\$dev" -p udp -m conntrack --ctstate NEW -j CONNMARK --set-mark "\$MARK_CONN"/.test(routeUp),
+     'route_up: marks every NEW inbound UDP conn (! -i warp) — Hy2/QUIC reply path');
+  // unconditional OUTPUT restore for UDP so replies carry the mark
+  ok(/-A OUTPUT -p udp -j CONNMARK --restore-mark/.test(routeUp),
+     'route_up: restores the mark on OUTPUT for UDP (QUIC replies carry it)');
+  // idempotent (-C before -A) for the new UDP rule
+  ok(/-C PREROUTING ! -i "\$dev" -p udp -m conntrack --ctstate NEW -j CONNMARK --set-mark "\$MARK_CONN"/.test(routeUp),
+     'route_up: -C check before -A for the UDP inbound-mark rule (idempotent)');
+  // teardown removes the UDP rules symmetrically
+  ok(/-D PREROUTING ! -i "\$dev" -p udp -m conntrack --ctstate NEW -j CONNMARK --set-mark "\$MARK_CONN"/.test(routeDown),
+     'route_down: removes the UDP inbound NEW-connection mark');
+  ok(/-D OUTPUT -p udp -j CONNMARK --restore-mark/.test(routeDown),
+     'route_down: removes the UDP OUTPUT reply-restore');
+  // TCP rules must remain intact (we only ADDED udp, did not remove tcp)
+  ok(/-A PREROUTING ! -i "\$dev" -p tcp -m conntrack --ctstate NEW -j CONNMARK --set-mark "\$MARK_CONN"/.test(routeUp),
+     'route_up: the original BUG-171 TCP rule is still present (Naive/Mieru unaffected)');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+console.log('\n[9] LIVE jq migration: legacy config backfilled; users & customs preserved');
+if (!hasJq) {
+  console.log('  \u26a0 skipped (jq not available)');
+} else {
+  const dir = fs.mkdtempSync('/tmp/hy2mig-');
+  try {
+    // The exact jq program used by migrate_config (kept in lock-step).
+    const JQ = '.hy2Port = (.hy2Port // 443)'
+      + ' | .stack = (.stack // {})'
+      + ' | .stack.naive = (.stack.naive // true)'
+      + ' | .stack.mieru = (.stack.mieru // true)'
+      + ' | .stack.hy2 = (.stack.hy2 // false)';
+    const run = (obj) => {
+      const f = path.join(dir, 'c.json');
+      fs.writeFileSync(f, JSON.stringify(obj));
+      const r = cp.spawnSync('jq', [JQ, f], { encoding: 'utf8' });
+      return JSON.parse(r.stdout);
+    };
+
+    // Legacy: has users, no hy2 fields → must gain defaults, users untouched.
+    const legacy = { domain: 'vpn.example.com', naivePort: 8443,
+                     users: [{ username: 'alice', protocols: ['naive', 'mieru'] }] };
+    const a = run(legacy);
+    ok(a.hy2Port === 443, 'legacy → hy2Port backfilled to 443');
+    ok(a.stack && a.stack.naive === true && a.stack.mieru === true && a.stack.hy2 === false,
+       'legacy → stack.{naive,mieru}=true, hy2=false');
+    ok(JSON.stringify(a.users) === JSON.stringify(legacy.users),
+       'legacy → existing users + protocols array left completely untouched');
+    ok(a.naivePort === 8443 && a.domain === 'vpn.example.com',
+       'legacy → all pre-existing fields preserved');
+
+    // Already-migrated with CUSTOM values → idempotent, customs kept.
+    const custom = { hy2Port: 8443, stack: { naive: true, mieru: true, hy2: true } };
+    const b = run(custom);
+    ok(b.hy2Port === 8443, 'migrated → custom hy2Port 8443 preserved (idempotent)');
+    ok(b.stack.hy2 === true, 'migrated → operator-enabled stack.hy2=true preserved');
+
+    // Partial stack → only missing keys filled.
+    const partial = run({ stack: { naive: true } });
+    ok(partial.stack.mieru === true && partial.stack.hy2 === false && partial.hy2Port === 443,
+       'partial stack → missing keys filled, present key kept');
+  } finally {
+    try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
+  }
+}
+
+console.log('\nResult: ' + pass + ' passed, ' + fail + ' failed');
+process.exit(fail ? 1 : 0);

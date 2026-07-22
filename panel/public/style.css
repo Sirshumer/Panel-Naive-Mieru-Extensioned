@@ -491,6 +491,7 @@ img { max-width: 100%; display: block; }
   border: 1px solid rgba(192,133,82,0.25);
 }
 .stat-icon.mieru  { background: var(--purple-dim); color: var(--purple); }
+.stat-icon.hy2    { background: rgba(56,189,248,0.13); color: #38bdf8; }
 .stat-icon.users  { background: var(--green-dim);  color: var(--green);  }
 .stat-icon.system { background: var(--yellow-dim); color: var(--yellow); }
 .stat-label { font-size: 12px; color: var(--text-secondary); text-transform: uppercase; letter-spacing: 0.04em; }
@@ -721,6 +722,23 @@ select option { background: var(--bg-card); color: var(--text); }
   background: var(--yellow-dim);
   line-height: 1.5;
   white-space: normal;
+}
+
+/* v1.6.0: backup card — warning banner + button row */
+.warn-box {
+  padding: 10px 12px;
+  border-radius: var(--radius-sm);
+  font-size: 12.5px;
+  margin-top: 10px;
+  border-left: 3px solid var(--yellow);
+  background: var(--yellow-dim);
+  color: var(--yellow);
+  line-height: 1.5;
+}
+.btn-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
 }
 
 /* ── Table ───────────────────────────────────────────────────── */
