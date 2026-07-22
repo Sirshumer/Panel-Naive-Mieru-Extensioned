@@ -137,7 +137,28 @@ step 5
 log "▶ Создание базового конфига..."
 # ══════════════════════════════════════════════════════
 
+# ── Dedicated service user (Cascade Variant 1) ───────────────────────────────
+# Hy2 runs as its OWN system user 'hysteria' (NOT root) so the cascade relay can
+# scope its egress with `iptables -m owner --uid-owner hysteria` (exactly like
+# Mieru's mita user). Without a distinct uid the cascade could not tell Hy2's
+# egress apart from every other root process. The unit keeps
+# AmbientCapabilities=CAP_NET_BIND_SERVICE so a non-root user can still bind :443.
+HY_USER="hysteria"
+if ! id "$HY_USER" &>/dev/null; then
+  useradd --system --no-create-home --shell /usr/sbin/nologin "$HY_USER" 2>/dev/null \
+    || useradd --system --no-create-home --shell /bin/false "$HY_USER" 2>/dev/null || true
+  log "  Создан системный пользователь ${HY_USER}"
+fi
+# Give hysteria read access to Caddy's cert (Caddy writes key as caddy:caddy 0640)
+# by putting it in the caddy group. Harmless if caddy group is absent.
+if getent group caddy &>/dev/null; then
+  usermod -aG caddy "$HY_USER" 2>/dev/null || true
+  log "  ${HY_USER} добавлен в группу caddy (чтение сертификата)"
+fi
+
 mkdir -p /etc/hysteria
+# Config is owned by the service user (it only reads it); dir traversable.
+chown -R "$HY_USER":"$HY_USER" /etc/hysteria 2>/dev/null || true
 
 # Bootstrap config. The panel backend (writeHysteriaConfig) OWNS the
 # `auth.userpass` map and rewrites it from the SQLite users table on every
@@ -334,7 +355,18 @@ fi
 [[ -z "\$FOUND" ]] && exit 0   # ещё нет — попробуем в следующий тик
 
 CDIR="\$(dirname "\$FOUND")"
-chmod -R o+rX "\$(dirname "\$CDIR")" 2>/dev/null || true
+# Grant the hysteria user (group caddy) read access; fall back to world-read.
+if getent group caddy >/dev/null 2>&1; then
+  _p="\$CDIR"
+  while [[ "\$_p" == /var/lib/caddy* || "\$_p" == /root/.local* || "\$_p" == /home/* ]]; do
+    chgrp caddy "\$_p" 2>/dev/null || true; chmod g+rx "\$_p" 2>/dev/null || true
+    _p="\$(dirname "\$_p")"
+  done
+  chgrp caddy "\$FOUND" "\${FOUND%.crt}.key" 2>/dev/null || true
+  chmod g+r  "\$FOUND" "\${FOUND%.crt}.key" 2>/dev/null || true
+else
+  chmod -R o+rX "\$(dirname "\$CDIR")" 2>/dev/null || true
+fi
 
 # Убрать placeholder-комментарий и дописать реальный tls: блок.
 sed -i '/# ⚠ Сертификат не был готов при установке./,/#   3) systemctl restart hysteria-server/d' "\$CFG"
@@ -397,9 +429,23 @@ SHTMREOF
     systemctl enable --now hy2-cert-selfheal.timer >/dev/null 2>&1 || true
     log "✅ hy2-cert-selfheal.timer активен — Hy2 стартанёт сам после выдачи сертификата"
   else
-    chmod -R 755 "$(dirname "$CADDY_CERT_DIR")" 2>/dev/null || true
-    chmod 644 "${CADDY_CERT_DIR}/${DOMAIN}.crt" 2>/dev/null || true
-    chmod 640 "${CADDY_CERT_DIR}/${DOMAIN}.key" 2>/dev/null || true
+    # Grant the 'hysteria' user (member of group caddy) read access to the cert.
+    # Prefer group-based perms over world-readable: make the whole Caddy data
+    # dir group-traversable for caddy and the key group-readable. Falls back to
+    # world-read only if the caddy group is unavailable.
+    if getent group caddy &>/dev/null; then
+      # Make every dir from /var/lib/caddy down to the cert dir group-traversable.
+      _p="$CADDY_CERT_DIR"
+      while [[ "$_p" == /var/lib/caddy* || "$_p" == /root/.local* || "$_p" == /home/* ]]; do
+        chgrp caddy "$_p" 2>/dev/null || true
+        chmod g+rx "$_p" 2>/dev/null || true
+        _p="$(dirname "$_p")"
+      done
+      chgrp caddy "${CADDY_CERT_DIR}/${DOMAIN}.crt" "${CADDY_CERT_DIR}/${DOMAIN}.key" 2>/dev/null || true
+      chmod g+r  "${CADDY_CERT_DIR}/${DOMAIN}.crt" "${CADDY_CERT_DIR}/${DOMAIN}.key" 2>/dev/null || true
+    else
+      chmod -R o+rX "$(dirname "$CADDY_CERT_DIR")" 2>/dev/null || true
+    fi
 
     cat >> /etc/hysteria/config.yaml << HYTLSEOF
 
@@ -489,8 +535,10 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-User=root
-Group=root
+User=hysteria
+Group=hysteria
+# SupplementaryGroups=caddy → read the shared Caddy cert (key is caddy:caddy 0640).
+SupplementaryGroups=caddy
 ExecStart=/usr/local/bin/hysteria server --config /etc/hysteria/config.yaml
 WorkingDirectory=/etc/hysteria
 LimitNOFILE=1048576

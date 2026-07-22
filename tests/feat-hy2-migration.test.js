@@ -29,12 +29,14 @@ const INSTALL_SH = path.join(ROOT, 'install.sh');
 const WARP_SH    = path.join(ROOT, 'panel', 'scripts', 'warp_egress.sh');
 const SERVER_JS  = path.join(ROOT, 'panel', 'server', 'index.js');
 const INSTALL_HY2_SH = path.join(ROOT, 'panel', 'scripts', 'install_hysteria.sh');
+const CASCADE_SH = path.join(ROOT, 'panel', 'scripts', 'cascade_mieru.sh');
 
 const upSrc     = fs.readFileSync(UPDATE_SH, 'utf8');
 const instSrc   = fs.readFileSync(INSTALL_SH, 'utf8');
 const warpSrc   = fs.readFileSync(WARP_SH, 'utf8');
 const serverSrc = fs.readFileSync(SERVER_JS, 'utf8');
 const hy2Src    = fs.readFileSync(INSTALL_HY2_SH, 'utf8');
+const cascadeSrc= fs.readFileSync(CASCADE_SH, 'utf8');
 
 const hasJq = cp.spawnSync('sh', ['-c', 'command -v jq']).status === 0;
 
@@ -328,6 +330,72 @@ if (!hasJq) {
   } finally {
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch (e) {}
   }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.8.4 — Cascade Variant 1: Hy2 runs as a dedicated 'hysteria' user so the
+// cascade relay can scope its egress by owner-uid (like Mieru's mita). Enabling
+// the cascade now relays ALL THREE protocols. Existing installs migrate
+// root→hysteria idempotently and keep the shared Caddy cert readable.
+console.log('\n[10] Cascade V1: Hy2 as dedicated user + cascade owner-match');
+{
+  // install_hysteria.sh: dedicated user + non-root unit + cert group access
+  ok(/HY_USER="hysteria"/.test(hy2Src) &&
+     /useradd --system --no-create-home[^\n]*"\$HY_USER"/.test(hy2Src),
+     'install: creates system user hysteria (no home, nologin)');
+  ok(/usermod -aG caddy "\$HY_USER"/.test(hy2Src),
+     'install: adds hysteria to group caddy (read the shared cert)');
+  ok(/^User=hysteria$/m.test(hy2Src) && !/^User=root$/m.test(hy2Src),
+     'install: unit runs as User=hysteria (no longer root)');
+  ok(/^SupplementaryGroups=caddy$/m.test(hy2Src),
+     'install: unit has SupplementaryGroups=caddy for cert read');
+  ok(/AmbientCapabilities=CAP_NET_BIND_SERVICE/.test(hy2Src),
+     'install: keeps CAP_NET_BIND_SERVICE so non-root can bind :443');
+  ok(/chown -R "\$HY_USER":"\$HY_USER" \/etc\/hysteria/.test(hy2Src),
+     'install: /etc/hysteria owned by the service user');
+  ok(/chgrp caddy "\$\{CADDY_CERT_DIR\}\/\$\{DOMAIN\}\.crt"/.test(hy2Src),
+     'install: cert made group-readable for caddy (not world-readable)');
+
+  // cascade_mieru.sh: hy2 owner-match, guarded on Hy2 being installed
+  ok(/hy2_uid\(\)/.test(cascadeSrc), 'cascade: hy2_uid() helper present');
+  ok(/-x \/usr\/local\/bin\/hysteria && -f \/etc\/hysteria\/config\.yaml/.test(cascadeSrc),
+     'cascade: hy2_uid() returns "" unless Hy2 is actually installed (guard)');
+  ok(/-A OUTPUT -p tcp -m owner --uid-owner "\$hyuid" -j REDSOCKS/.test(cascadeSrc),
+     'cascade: adds REDSOCKS owner-match for hysteria uid (relays Hy2 egress)');
+  ok(/id -u hysteria 2>\/dev\/null/.test(cascadeSrc),
+     'cascade: teardown resolves hysteria uid directly (removes even after uninstall)');
+  // teardown must remove the hy2 rule too
+  const clearFn = (cascadeSrc.match(/clear_iptables\(\) \{[\s\S]*?\n\}/m) || [''])[0];
+  ok(/--uid-owner "\$hyuid" -j REDSOCKS/.test(clearFn),
+     'cascade: clear_iptables removes the hysteria owner-match rule');
+  // the original mita rule is untouched (Mieru-only boxes unaffected)
+  ok(/-A OUTPUT -p tcp -m owner --uid-owner "\$uid" -j REDSOCKS/.test(cascadeSrc),
+     'cascade: original mita owner-match rule still present (Mieru unaffected)');
+
+  // update.sh: idempotent root→hysteria migration
+  ok(/migrate_hy2_service_user\(\)/.test(upSrc), 'update: migrate_hy2_service_user() defined');
+  ok(/grep -qE '\^\\s\*User\\s\*=\\s\*hysteria\\s\*\$' "\$unit" && return 0/.test(upSrc),
+     'update: migration is idempotent (skips if already hysteria)');
+  ok(/s\/\^\\s\*User\\s\*=\\s\*root\\s\*\$\/User=hysteria\//.test(upSrc),
+     'update: sed patches User=root → User=hysteria in the existing unit');
+  ok(/migrate_hy2_service_user\b/.test((upSrc.match(/migrate_hy2\(\) \{[\s\S]*?\n\}/m) || [''])[0]),
+     'update: migrate_hy2() calls the service-user migration before restart');
+  ok(/chgrp caddy "\$crt" "\$\{crt%\.crt\}\.key"/.test(upSrc),
+     'update: migration makes the existing cert group-readable for caddy');
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// v1.8.4 — enroll better-sqlite3 fix: the temp node scripts must live under
+// $PANEL_DIR (not /tmp) so require('better-sqlite3') resolves. (Server hit
+// MODULE_NOT_FOUND because /tmp/*.js has no node_modules on the lookup path.)
+console.log('\n[11] enroll: node temp scripts live in $PANEL_DIR (better-sqlite3 resolves)');
+{
+  ok(/mktemp "\$\{PANEL_DIR\}\/\.hy2-enroll\.XXXXXX\.js"/.test(upSrc),
+     'enroll: script created under $PANEL_DIR (not /tmp)');
+  ok(/mktemp "\$\{PANEL_DIR\}\/\.hy2-rewrite\.XXXXXX\.js"/.test(upSrc),
+     'rewrite: script created under $PANEL_DIR (not /tmp)');
+  ok(!/mktemp \/tmp\/rixxx-hy2-(enroll|rewrite)/.test(upSrc),
+     'no more /tmp/rixxx-hy2-*.js (the MODULE_NOT_FOUND path)');
 }
 
 console.log('\nResult: ' + pass + ' passed, ' + fail + ' failed');
