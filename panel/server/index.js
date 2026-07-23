@@ -446,12 +446,15 @@ function buildCaddyfile(config, users) {
   let probeMode = (config.probeMode || '').trim().toLowerCase();
   if (!probeMode) probeMode = probeSecret ? 'secret' : 'bare';
 
+  let caddyfileContent = '';
+
   // Bug 26: delegate to the shared template module (single source of truth).
   // Falls back to an inline render if the template file is not yet deployed.
   const tplPath = path.join(__dirname, 'caddyTemplate.js');
   if (fs.existsSync(tplPath)) {
     const tpl = require(tplPath);
-    return tpl.render({
+    // СОХРАНЯЕМ В ПЕРЕМЕННУЮ ВМЕСТО РЕЗКОГО RETURN:
+    caddyfileContent = tpl.render({
       adminEmail:  config.adminEmail  || '',
       domain:      config.domain      || 'localhost',
       naivePort:   config.naivePort   || 443,
@@ -472,84 +475,84 @@ function buildCaddyfile(config, users) {
       panelStubPage:      config.panelStubPage      || '/var/www/panel-stub/index.html',
       panelPort:          config.panelPort          || 3000,
     }, naiveUsers);
-  }
-
-  // ── Inline fallback (identical rules to caddyTemplate.js) ─────────────────
-  // Used only when caddyTemplate.js is not yet on disk (e.g. very first boot
-  // before install_panel() has run).  Kept in sync with the template manually.
-  // (crypto is required at module level — Bug 100)
-  let authLines;
-  if (naiveUsers.length > 0) {
-    // Bug 23: each credential line is "basic_auth <user> <pass>" — no bare keyword
-    authLines = naiveUsers
-      .map(u => `    basic_auth ${u.username} ${u.password}`)
-      .join('\n');
   } else {
-    // Bug 34: unreachable placeholder keeps the block non-empty
-    const rnd = crypto.randomBytes(20).toString('hex');
-    authLines = `    basic_auth _placeholder_${rnd.slice(0, 16)} _disabled_${rnd.slice(16)}`;
-  }
 
-  // Bug 29 + Bug 81: probe_resistance comes after hide_ip + hide_via.
-  // 'off' → none; 'secret' → with token; 'bare' → keyword only.
-  let probeLine;
-  if (probeMode === 'off') {
-    probeLine = '';
-  } else if (probeMode === 'secret' && probeSecret) {
-    probeLine = `\n    probe_resistance ${probeSecret}`;
-  } else {
-    probeLine = `\n    probe_resistance`;
-  }
-
-  // v1.2.6: cascade — upstream proxy support (inline fallback)
-  // Bug 92: normalize the upstream so forward_proxy gets a clean https:// URL.
-  const upstreamUrl = (config.cascadeEnabled && config.cascadeNaiveUpstream) ? normalizeUpstream(config.cascadeNaiveUpstream) : '';
-  const upstreamLine = upstreamUrl ? `\n    upstream ${upstreamUrl}` : '';
-
-  // Bug 98: masquerade — file_server (default) or reverse_proxy (real site).
-  let masqueradeBlock;
-  {
-    const fu = String(config.fakeSiteUrl || '').trim();
-    const isPlaceholder = /^https?:\/\/(www\.)?example\.com\/?$/i.test(fu);
-    const m = (!isPlaceholder && fu) ? fu.match(/^(https?):\/\/([^\/\s]+)/i) : null;
-    if (m) {
-      const scheme = m[1].toLowerCase(), host = m[2];
-      masqueradeBlock = scheme === 'https'
-        ? `  reverse_proxy https://${host} {\n    header_up Host ${host}\n    transport http {\n      tls\n      tls_server_name ${host}\n    }\n  }`
-        : `  reverse_proxy http://${host} {\n    header_up Host ${host}\n  }`;
+    // ── Inline fallback (identical rules to caddyTemplate.js) ─────────────────
+    // Used only when caddyTemplate.js is not yet on disk (e.g. very first boot
+    // before install_panel() has run).  Kept in sync with the template manually.
+    // (crypto is required at module level — Bug 100)
+    let authLines;
+    if (naiveUsers.length > 0) {
+      // Bug 23: each credential line is "basic_auth <user> <pass>" — no bare keyword
+      authLines = naiveUsers
+        .map(u => `    basic_auth ${u.username} ${u.password}`)
+        .join('\n');
     } else {
-      masqueradeBlock = `  file_server {\n    root ${resolvedFakeSiteDir}\n  }`;
+      // Bug 34: unreachable placeholder keeps the block non-empty
+      const rnd = crypto.randomBytes(20).toString('hex');
+      authLines = `    basic_auth _placeholder_${rnd.slice(0, 16)} _disabled_${rnd.slice(16)}`;
     }
-  }
 
-  // v1.4.0: panel external-access subdomain block (inline fallback — mirrors
-  // caddyTemplate.renderPanelBlock). Emitted only when external access is on.
-  let panelBlock = '';
-  {
-    const expose      = !!config.exposePanel;
-    const panelDomain = String(config.panelDomain || '').trim();
-    const baUser      = String(config.panelBasicAuthUser || '').trim();
-    // BUG-155: NEVER emit a polluted/multi-line hash. Sieve config.panelBasicAuthHash
-    // down to a single valid bcrypt token; if it isn't one, drop it (no basic_auth
-    // line) rather than write a broken Caddyfile that fails-loops caddy-naive.
-    const rawHash     = String(config.panelBasicAuthHash || '');
-    const baHash      = BCRYPT_RE.test(rawHash) ? extractBcrypt(rawHash) : '';
-    const stubFile    = String(config.panelStubPage || '/var/www/panel-stub/index.html').trim();
-    let   webBasePath = String(config.webBasePath || '').trim().replace(/^\/+|\/+$/g, '').replace(/[^A-Za-z0-9._~-]/g, '');
-    const panelPort   = parseInt(config.panelPort, 10) || 3000;
-    if (expose && panelDomain && webBasePath) {
-      const stubDir = stubFile.replace(/\/[^/]*$/, '') || '/var/www/panel-stub';
-      let ba = '';
-      if (baUser && baHash) ba = `    basic_auth {\n      ${baUser} ${baHash}\n    }\n`;
-      panelBlock =
+    // Bug 29 + Bug 81: probe_resistance comes after hide_ip + hide_via.
+    // 'off' → none; 'secret' → with token; 'bare' → keyword only.
+    let probeLine;
+    if (probeMode === 'off') {
+      probeLine = '';
+    } else if (probeMode === 'secret' && probeSecret) {
+      probeLine = `\n    probe_resistance ${probeSecret}`;
+    } else {
+      probeLine = `\n    probe_resistance`;
+    }
+
+    // v1.2.6: cascade — upstream proxy support (inline fallback)
+    // Bug 92: normalize the upstream so forward_proxy gets a clean https:// URL.
+    const upstreamUrl = (config.cascadeEnabled && config.cascadeNaiveUpstream) ? normalizeUpstream(config.cascadeNaiveUpstream) : '';
+    const upstreamLine = upstreamUrl ? `\n    upstream ${upstreamUrl}` : '';
+
+    // Bug 98: masquerade — file_server (default) or reverse_proxy (real site).
+    let masqueradeBlock;
+    {
+      const fu = String(config.fakeSiteUrl || '').trim();
+      const isPlaceholder = /^https?:\/\/(www\.)?example\.com\/?$/i.test(fu);
+      const m = (!isPlaceholder && fu) ? fu.match(/^(https?):\/\/([^\/\s]+)/i) : null;
+      if (m) {
+        const scheme = m[1].toLowerCase(), host = m[2];
+        masqueradeBlock = scheme === 'https'
+          ? `  reverse_proxy https://${host} {\n    header_up Host ${host}\n    transport http {\n      tls\n      tls_server_name ${host}\n    }\n  }`
+          : `  reverse_proxy http://${host} {\n    header_up Host ${host}\n  }`;
+      } else {
+        masqueradeBlock = `  file_server {\n    root ${resolvedFakeSiteDir}\n  }`;
+      }
+    }
+
+    // v1.4.0: panel external-access subdomain block (inline fallback — mirrors
+    // caddyTemplate.renderPanelBlock). Emitted only when external access is on.
+    let panelBlock = '';
+    {
+      const expose      = !!config.exposePanel;
+      const panelDomain = String(config.panelDomain || '').trim();
+      const baUser      = String(config.panelBasicAuthUser || '').trim();
+      // BUG-155: NEVER emit a polluted/multi-line hash. Sieve config.panelBasicAuthHash
+      // down to a single valid bcrypt token; if it isn't one, drop it (no basic_auth
+      // line) rather than write a broken Caddyfile that fails-loops caddy-naive.
+      const rawHash     = String(config.panelBasicAuthHash || '');
+      const baHash      = BCRYPT_RE.test(rawHash) ? extractBcrypt(rawHash) : '';
+      const stubFile    = String(config.panelStubPage || '/var/www/panel-stub/index.html').trim();
+      let   webBasePath = String(config.webBasePath || '').trim().replace(/^\/+|\/+$/g, '').replace(/[^A-Za-z0-9._~-]/g, '');
+      const panelPort   = parseInt(config.panelPort, 10) || 3000;
+      if (expose && panelDomain && webBasePath) {
+        const stubDir = stubFile.replace(/\/[^/]*$/, '') || '/var/www/panel-stub';
+        let ba = '';
+        if (baUser && baHash) ba = `    basic_auth {\n      ${baUser} ${baHash}\n    }\n`;
+        panelBlock =
 `\n\n# ── v1.4.0: panel external access (TLS + basic_auth + webBasePath) ────────────\n${panelDomain} {\n  tls ${config.adminEmail || ''}\n\n  # BUG-140: normalize bare base path to trailing slash (relative-asset resolve)\n  redir /${webBasePath} /${webBasePath}/ 301\n\n  handle_path /${webBasePath}/* {\n${ba}    reverse_proxy 127.0.0.1:${panelPort}\n  }\n\n  # Root and any path outside the secret base path → static stub (not a redirect)\n  handle {\n    root * ${stubDir}\n    file_server\n  }\n}\n`;
+      }
     }
-  }
 
-  // Bug 28: no "tls <email>" inside site block
-  // Bug 30: order directive in global block
-  // Bug 38: roll_keep_for 720h
-  return `{
+    // Bug 28: no "tls <email>" inside site block
+    // Bug 30: order directive in global block
+    // Bug 38: roll_keep_for 720h
+    caddyfileContent = `{
   # Bug 30 / Bug 102 (CRITICAL): forward_proxy before ANY handler (file_server
   # OR reverse_proxy). "before file_server" let mirror-mode reverse_proxy hijack
   # authenticated CONNECT → all naive keys broke. "first" fixes both modes.
@@ -590,12 +593,12 @@ ${authLines}
 
 ${masqueradeBlock}
 }
-${panelBlock}\`;
+${panelBlock}`;
+  }
 
-  // === ТВОЙ КАСТОМНЫЙ КЛОК ДЛЯ МАЛИНЫ ===
+  // === ТВОЙ КАСТОМНЫЙ КЛОК ДЛЯ МАЛИНЫ (ПОСТ-ОБРАБОТКА) ===
   // 1. Принудительно вырезаем реверс-прокси петлю, если она вдруг пролезла через веб-интерфейс
   if (caddyfileContent.includes('reverse_proxy https://') || caddyfileContent.includes('reverse_proxy http://')) {
-    // Если в конфиге сидит прокси на самого себя, заменяем его безопасной локальной статикой
     caddyfileContent = caddyfileContent.replace(/reverse_proxy http[s]?:\/\/[\s\S]*?\n\s*\}/g, `root * ${resolvedFakeSiteDir}\n  file_server\n}`);
     caddyfileContent = caddyfileContent.replace(/reverse_proxy http[s]?:\/\/.*$/m, `root * ${resolvedFakeSiteDir}\n  file_server`);
   }
