@@ -7,6 +7,134 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ---
 
+## [v1.8.6]
+
+> **FEATURE — Hy2 traffic accounting, auto-enroll, Hy2 logs, and a fix for the
+> "Failed to fetch" toast when saving a user.**
+
+### Fixed
+- **"Failed to fetch" when ticking Hy2 / saving a user.** A CRUD call ran
+  `applyAllConfigs()` (3 sequential service restarts, up to ~60s) *before*
+  responding, so the fetch connection was dropped even though the DB write
+  had succeeded (hence "reopen and it's there"). Configs now apply in the
+  **background**; the request returns immediately with `servicesReloading:true`
+  and the UI polls `/api/apply-status` for the outcome.
+
+### Added
+- **Per-user Hy2 traffic (Hy2 (МБ) column)**, like Naive/Mieru. Reads the
+  Hysteria2 **Traffic Stats API** (`GET 127.0.0.1:9999/traffic`) — works for
+  direct **and** cascaded Hy2. Isolated source: if unavailable it returns 0
+  and never zeroes the Naive/Mieru figures.
+  - `install_hysteria.sh` enables `trafficStats` (loopback + per-install secret).
+  - `update.sh` `migrate_hy2_traffic_stats()` backfills it on existing installs
+    (idempotent — skips configs that already have it).
+- **Auto-enroll existing keys into Hy2** when installing Hy2 from the panel:
+  every issued key gets `hy2` added to its protocols (idempotent), so the Hy2
+  checkbox/column light up without re-editing each user. Opt-out with
+  `{enrollAll:false}`; also exposed as `POST /api/settings/hy2/enroll-all`.
+- **Hy2 logs** in the Logs page (`journalctl -u hysteria-server`), next to
+  Naive/Mieru/Panel.
+- **Cascade UI hint:** a note under "Включить каскад (relay)" explaining that
+  Hysteria2 cascades automatically through the same Mieru tunnel (matched by
+  process owner) — no separate Hy2 exit address is required.
+
+### Tests
+- `tests/feat-hy2-migration.test.js` section **[13]** (122 passed); full suite
+  18 files green.
+
+---
+
+## [v1.8.5]
+
+> **BUGFIX — Hy2 died with `permission denied` on the config after the v1.8.4
+> root→hysteria migration, whenever the panel rewrote the config.**
+
+### The problem
+v1.8.4 moved hysteria-server to a non-root `hysteria` user. But the **panel
+runs as root** and rewrites `/etc/hysteria/config.yaml` on every edit
+(toggling the Hy2 checkbox, add/delete user, port/masquerade change) with:
+```js
+fs.writeFileSync(tmp, next, { mode: 0o600 });  // → root:root 0600
+fs.renameSync(tmp, HY2_CONFIG);
+```
+So right after you enabled Hy2 in the panel, the config became `root:root 0600`
+and the service user could no longer read it:
+```
+FATAL failed to read server config
+{"error": "open /etc/hysteria/config.yaml: permission denied"}
+```
+(The cert was fine — this was the **config file itself**, not the cert.)
+
+### Fixed
+- **`index.js` — new `hy2ChownConfig()` helper, called after every config
+  write and rollback** (`writeHysteriaConfig()` + the masquerade/port rewrite
+  path). It resolves the `hysteria` uid/gid and restores
+  `hysteria:hysteria` ownership with dir `750` / config `640`, so the service
+  user can always read what the root panel just wrote.
+  - **Legacy-safe:** if there is no `hysteria` user (an old box still running
+    Hy2 as root), the helper **no-ops** — nothing changes for old installs.
+- **`install_hysteria.sh`** — after writing the config as root, explicitly
+  `chown -R hysteria:hysteria /etc/hysteria` + `chmod 750` dir + `chmod 640`
+  config (the `cat >` heredoc had left it root-owned).
+- **`update.sh`** — the `migrate_hy2_service_user()` migration now also sets
+  the explicit `750`/`640` modes, seeding correct perms on in-place upgrades.
+
+### Upgrade note
+Boxes already broken by v1.8.4 self-heal on the next panel config write. To fix
+immediately without waiting: `chown -R hysteria:hysteria /etc/hysteria &&
+chmod 750 /etc/hysteria && chmod 640 /etc/hysteria/config.yaml &&
+systemctl restart hysteria-server`.
+
+---
+
+## [v1.8.4]
+
+> **FEATURE — Hysteria2 now relays through the cascade (relay) chain, like
+> Naive & Mieru.** Turning on **"Включить каскад (relay)"** now cascades all
+> three protocols. Plus a `better-sqlite3` fix for the Hy2 enroll one-liner.
+
+### The problem
+The cascade chain (`cascade_mieru.sh`) captures egress **by process owner-UID**
+(`iptables -t nat -A OUTPUT -p tcp -m owner --uid-owner <mita> -j REDSOCKS`),
+not by interface or mark. Hysteria2 ran as **root**, so its traffic never
+matched the owner-UID rule and silently **bypassed the cascade entirely** —
+even with the relay checkbox on, Hy2 clients exited from the panel's own IP.
+(WARP egress is unaffected: it marks by interface, so it already relayed all
+three protocols.)
+
+### Fixed
+- **Hysteria2 now runs under a dedicated `hysteria` system user** instead of
+  root, so the cascade can add a parallel owner-match rule for it.
+  - `install_hysteria.sh` creates a `--system --no-create-home` `hysteria`
+    user, adds it to group `caddy`, and runs the unit as
+    `User=hysteria` / `Group=hysteria` with `SupplementaryGroups=caddy`.
+  - `CAP_NET_BIND_SERVICE` is kept so the non-root user can still bind `:443`.
+  - The shared Caddy cert is made **group-readable for `caddy`** (dir chain
+    `chgrp caddy` + `chmod g+rx`, cert/key `g+r`) instead of world-readable.
+- **Cascade now relays Hy2 egress.** `cascade_mieru.sh` adds a guarded
+  `hy2_uid()` helper and, when Hy2 is installed, an
+  `-m owner --uid-owner <hysteria> -j REDSOCKS` rule alongside the mita rule;
+  `clear_iptables` removes it on teardown. The existing `exit_ip` RETURN
+  anti-loop and TCP-only REDIRECT already cover the new UID; QUIC/UDP replies
+  to clients are never captured (return-path safe).
+- **`update.sh` migrates existing installs in place.**
+  `migrate_hy2_service_user()` idempotently rewrites a `User=root` unit to
+  `User=hysteria` (+ user creation, caddy group, cert group-read,
+  `daemon-reload`) and is called from `migrate_hy2()` before the restart. Boxes
+  already on `hysteria` are skipped — **nothing changes for them.**
+- **Fixed `Cannot find module 'better-sqlite3'` in the Hy2 enroll flow.** The
+  temporary enroll/rewrite node scripts are now written into `$PANEL_DIR`
+  (not `/tmp`) so Node resolves `$PANEL_DIR/node_modules` (`require()` resolves
+  relative to the script file's directory).
+
+### Compatibility
+- Existing Naive/Mieru cascade behaviour is unchanged (the original mita
+  owner-match rule is untouched). The migration is idempotent and no-ops on
+  boxes that don't have Hy2 or are already migrated — **existing installs
+  keep working.**
+
+---
+
 ## [v1.8.3]
 
 > **BUGFIX — `HY2_ENROLL_ALL=1 ./update.sh` did nothing on a same-version box**

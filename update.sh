@@ -1117,9 +1117,91 @@ migrate_cascade_watchdog() {
 #     • Not installed: print a one-line hint that Hy2 can be added from Settings
 #       ("Доустановить Hy2"). No side effects — existing installs are untouched.
 #   Idempotent and safe under -y / --dry-run.
+# v1.8.4 (Cascade Variant 1): migrate an EXISTING Hy2 install from User=root to
+# a dedicated 'hysteria' system user, so the cascade relay can scope its egress
+# by owner-uid (like Mieru's mita). Idempotent: does nothing if the unit already
+# runs as hysteria. Only touches a box where Hy2 is installed. Preserves the cert
+# (adds hysteria to group caddy + grants group-read) so Hy2 keeps starting.
+migrate_hy2_service_user() {
+  local unit=/etc/systemd/system/hysteria-server.service
+  [[ -f "$unit" ]] || return 0
+  # Already migrated? (unit runs as hysteria) → nothing to do.
+  grep -qE '^\s*User\s*=\s*hysteria\s*$' "$unit" && return 0
+
+  log_info "Hy2: migrating service from root → dedicated 'hysteria' user (cascade owner-match)"
+
+  # 1) Create the system user (idempotent) and grant cert access via group caddy.
+  if ! id hysteria &>/dev/null; then
+    useradd --system --no-create-home --shell /usr/sbin/nologin hysteria 2>/dev/null \
+      || useradd --system --no-create-home --shell /bin/false hysteria 2>/dev/null || true
+  fi
+  if getent group caddy &>/dev/null; then
+    usermod -aG caddy hysteria 2>/dev/null || true
+  fi
+
+  # 2) Patch the unit: User/Group → hysteria, ensure SupplementaryGroups=caddy.
+  sed -i -E 's/^\s*User\s*=\s*root\s*$/User=hysteria/'  "$unit"
+  sed -i -E 's/^\s*Group\s*=\s*root\s*$/Group=hysteria/' "$unit"
+  if ! grep -qE '^\s*SupplementaryGroups\s*=\s*caddy' "$unit"; then
+    sed -i -E '/^\s*Group\s*=\s*hysteria\s*$/a SupplementaryGroups=caddy' "$unit"
+  fi
+
+  # 3) Config dir + files owned by the service user (it only reads them), with
+  #    explicit modes: dir traversable (750), config group-readable (640). The
+  #    panel writes the config as root 0600 on every edit, so the running server
+  #    (index.js hy2ChownConfig) hands it back — this is the migration-time seed.
+  chown -R hysteria:hysteria /etc/hysteria 2>/dev/null || true
+  chmod 750 /etc/hysteria 2>/dev/null || true
+  [[ -f /etc/hysteria/config.yaml ]] && chmod 640 /etc/hysteria/config.yaml 2>/dev/null || true
+
+  # 4) Cert perms: make the Caddy cert group-readable for the caddy group so the
+  #    hysteria user (member of caddy) can read it. Discover the cert dir from the
+  #    tls: block in config.yaml; skip silently if it's ACME/standalone.
+  local crt; crt=$(grep -E '^\s*cert:\s*' /etc/hysteria/config.yaml 2>/dev/null | awk '{print $2}' | head -1)
+  if [[ -n "$crt" && -f "$crt" ]] && getent group caddy &>/dev/null; then
+    local cdir; cdir=$(dirname "$crt")
+    local p="$cdir"
+    while [[ "$p" == /var/lib/caddy* || "$p" == /root/.local* || "$p" == /home/* ]]; do
+      chgrp caddy "$p" 2>/dev/null || true; chmod g+rx "$p" 2>/dev/null || true
+      p=$(dirname "$p")
+    done
+    chgrp caddy "$crt" "${crt%.crt}.key" 2>/dev/null || true
+    chmod g+r  "$crt" "${crt%.crt}.key" 2>/dev/null || true
+  fi
+
+  systemctl daemon-reload 2>/dev/null || true
+  log_info "Hy2: service user migration applied ✓"
+}
+
+# v1.8.6: enable the Traffic Stats API on existing Hy2 installs so the panel can
+#   show per-user Hy2 traffic (like Naive/Mieru). Adds a loopback trafficStats
+#   block with a generated secret if the config doesn't already have one.
+#   Idempotent: configs that already contain `trafficStats:` are left untouched.
+migrate_hy2_traffic_stats() {
+  local cfg=/etc/hysteria/config.yaml
+  [[ -f "$cfg" ]] || return 0
+  grep -qE '^\s*trafficStats\s*:' "$cfg" && return 0
+  log_info "Hy2: enabling Traffic Stats API (per-user traffic in the panel)"
+  local secret; secret="$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+  cat >> "$cfg" <<HYSTATSEOF
+
+# ── Traffic Stats API (управляется панелью — не редактируйте вручную) ──
+trafficStats:
+  listen: 127.0.0.1:9999
+  secret: "${secret}"
+HYSTATSEOF
+  # Keep ownership/mode correct for the non-root service user.
+  if id hysteria &>/dev/null; then
+    chown hysteria:hysteria "$cfg" 2>/dev/null || true
+  fi
+  chmod 640 "$cfg" 2>/dev/null || true
+}
+
 migrate_hy2() {
-  $DRY_RUN && { log_dry "Would restart hysteria-server if Hy2 is installed (else print an install hint)"; return 0; }
+  $DRY_RUN && { log_dry "Would migrate Hy2 to the 'hysteria' user + enable Traffic Stats API + restart hysteria-server if installed (else print an install hint)"; return 0; }
   if [[ -f /etc/hysteria/config.yaml && -x /usr/local/bin/hysteria ]]; then
+    migrate_hy2_service_user
+    migrate_hy2_traffic_stats
     systemctl reset-failed hysteria-server 2>/dev/null || true
     if systemctl restart hysteria-server 2>/dev/null; then
       log_info "Hy2: hysteria-server restarted to pick up the update ✓"
@@ -1155,7 +1237,11 @@ migrate_hy2_enroll_all() {
 
   log_step "Enrolling all existing users into Hy2 (HY2_ENROLL_ALL=1)"
 
-  local enroll_js; enroll_js="$(mktemp /tmp/rixxx-hy2-enroll.XXXXXX.js)"
+  # Bug 86b pattern: write the temp script INTO $PANEL_DIR (not /tmp) so node
+  # resolves require('better-sqlite3') against $PANEL_DIR/node_modules. Node
+  # resolves modules relative to the SCRIPT FILE's dir, not the cwd, so a
+  # /tmp/*.js looked in /tmp/node_modules and failed with MODULE_NOT_FOUND.
+  local enroll_js; enroll_js="$(mktemp "${PANEL_DIR}/.hy2-enroll.XXXXXX.js")"
   cat > "$enroll_js" << 'NODE_EOF'
 'use strict';
 const Database = require('better-sqlite3');
@@ -1190,7 +1276,8 @@ NODE_EOF
   rm -f "$enroll_js"
 
   # Rewrite the userpass block from the (now-enrolled) DB and restart Hy2.
-  local rewrite_js; rewrite_js="$(mktemp /tmp/rixxx-hy2-rewrite.XXXXXX.js)"
+  # Same Bug 86b fix: script lives in $PANEL_DIR so better-sqlite3 resolves.
+  local rewrite_js; rewrite_js="$(mktemp "${PANEL_DIR}/.hy2-rewrite.XXXXXX.js")"
   cat > "$rewrite_js" << 'NODE_EOF'
 'use strict';
 const fs = require('fs');

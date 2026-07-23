@@ -86,6 +86,21 @@ mita_uid() {
   id -u mita 2>/dev/null || echo ""
 }
 
+# ── hysteria uid (owner-match so Hy2 egress ALSO goes through the cascade) ────
+# Hy2 runs as its own 'hysteria' user (see install_hysteria.sh). When Hy2 is
+# installed we add the SAME REDSOCKS owner-match for its uid, so enabling the
+# cascade relays all three protocols (Naive via upstream URL, Mieru + Hy2 via
+# redsocks owner-match). Returns "" if Hy2 isn't installed → rule is skipped,
+# so a Mieru-only box is completely unaffected.
+hy2_uid() {
+  # Only claim a uid if Hy2 is actually installed (guard: no stray owner rule).
+  if [[ -x /usr/local/bin/hysteria && -f /etc/hysteria/config.yaml ]]; then
+    id -u hysteria 2>/dev/null || echo ""
+  else
+    echo ""
+  fi
+}
+
 # ── Resolve exit host → IPv4 (needed for the anti-loop RETURN rule) ────────────
 resolve_exit_ip() {
   local host="$1"
@@ -292,6 +307,18 @@ apply_iptables() {
     return 1
   fi
 
+  # ALSO relay Hy2 egress through the same cascade when Hy2 is installed.
+  # hy2_uid() returns "" on a Mieru-only box → this whole block is a no-op there.
+  # Hy2's QUIC replies to clients are UDP; REDSOCKS only REDIRECTs `-p tcp`, so
+  # the client return-path is never captured — only Hy2's outbound TCP to the
+  # internet is relayed. The shared exit_ip RETURN rule (above) is the anti-loop
+  # for this uid too, since it lives in the REDSOCKS chain both jumps target.
+  local hyuid; hyuid=$(hy2_uid)
+  if [[ -n "$hyuid" ]]; then
+    iptables -t nat -A OUTPUT -p tcp -m owner --uid-owner "$hyuid" -j REDSOCKS
+    log "cascade: Hy2 egress relayed too (hysteria uid=$hyuid) ✓"
+  fi
+
   # Persist if iptables-persistent is available; else install it.
   if ! command -v netfilter-persistent &>/dev/null; then
     DEBIAN_FRONTEND=noninteractive apt-get install -y -qq iptables-persistent 2>/dev/null || true
@@ -306,6 +333,14 @@ clear_iptables() {
   if [[ -n "$uid" ]]; then
     while iptables -t nat -C OUTPUT -p tcp -m owner --uid-owner "$uid" -j REDSOCKS 2>/dev/null; do
       iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner "$uid" -j REDSOCKS 2>/dev/null || break
+    done
+  fi
+  # Same for the hysteria uid (Hy2 egress rule). id -u directly (not hy2_uid) so
+  # the rule is removed even if Hy2 was since uninstalled but the rule lingers.
+  local hyuid; hyuid=$(id -u hysteria 2>/dev/null || echo "")
+  if [[ -n "$hyuid" ]]; then
+    while iptables -t nat -C OUTPUT -p tcp -m owner --uid-owner "$hyuid" -j REDSOCKS 2>/dev/null; do
+      iptables -t nat -D OUTPUT -p tcp -m owner --uid-owner "$hyuid" -j REDSOCKS 2>/dev/null || break
     done
   fi
   # Bug 150: also strip ANY remaining OUTPUT rule that jumps to REDSOCKS, even if

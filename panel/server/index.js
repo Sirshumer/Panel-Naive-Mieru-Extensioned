@@ -1182,11 +1182,76 @@ function shredFile(fp) {
 // so unrelated formatting/comments are untouched.
 const HY2_CONFIG = '/etc/hysteria/config.yaml';
 
+// The panel runs as root; hysteria-server runs as the dedicated `hysteria`
+// system user (cascade owner-match, since v1.8.4). fs.writeFileSync therefore
+// creates config files owned root:root, which the service user then cannot
+// read → "open /etc/hysteria/config.yaml: permission denied" FATAL. After ANY
+// write to a Hy2 config file we MUST hand ownership back to the service user
+// (and its dir) so hysteria can read it. Best-effort + idempotent: on a legacy
+// box still running Hy2 as root, `hysteria` simply doesn't exist and we no-op,
+// so nothing breaks for old installs.
+function hy2ChownConfig(file) {
+  try {
+    // Resolve the uid/gid the unit actually runs as. Prefer the `hysteria`
+    // user; fall back to whatever owns the existing config (covers custom
+    // setups) so we never *lower* access.
+    let uid = null, gid = null;
+    try {
+      const pw = execSync('id -u hysteria 2>/dev/null', { timeout: 4000 }).toString().trim();
+      const gr = execSync('id -g hysteria 2>/dev/null', { timeout: 4000 }).toString().trim();
+      if (pw !== '') uid = parseInt(pw, 10);
+      if (gr !== '') gid = parseInt(gr, 10);
+    } catch {}
+    // No dedicated user (legacy root install) → leave as-is, don't break it.
+    if (uid === null || Number.isNaN(uid)) return;
+    const targets = [];
+    if (file) targets.push(file);
+    // Also fix the dir + the .last backup so a later rollback stays readable.
+    try {
+      const dir = path.dirname(file || HY2_CONFIG);
+      targets.push(dir);
+      if (file) targets.push(file + '.last');
+    } catch {}
+    for (const t of targets) {
+      try {
+        if (!fs.existsSync(t)) continue;
+        fs.chownSync(t, uid, (gid === null || Number.isNaN(gid)) ? -1 : gid);
+        const st = fs.statSync(t);
+        // dir needs traverse (750); files stay group-readable (640).
+        fs.chmodSync(t, st.isDirectory() ? 0o750 : 0o640);
+      } catch {}
+    }
+  } catch {}
+}
+
 // Return the list of users (from the shared pool) that have Hy2 enabled.
 function getHy2Users() {
   return getAllUsers()
     .map(parseUserRow)
     .filter(u => Array.isArray(u.protocols) && u.protocols.includes('hy2'));
+}
+
+// Add the "hy2" protocol to every existing user that doesn't already have it,
+// so that enabling/installing Hy2 lights up the Hy2 checkbox on all issued keys
+// (operator request). Idempotent — users already carrying hy2 are untouched.
+// Returns the number of users updated.
+function enrollAllHy2() {
+  let changed = 0;
+  for (const raw of getAllUsers()) {
+    let protocols;
+    try { protocols = JSON.parse(raw.protocols || '[]'); } catch { protocols = []; }
+    if (!Array.isArray(protocols)) protocols = [];
+    if (protocols.includes('hy2')) continue;
+    protocols.push('hy2');
+    try {
+      upsertUser({ ...raw,
+        protocols: JSON.stringify(protocols),
+        password:  raw.password || '',
+        updatedAt: new Date().toISOString() });
+      changed++;
+    } catch (e) { try { console.error('[HY2 enroll]', raw.username, e.message); } catch {} }
+  }
+  return changed;
 }
 
 // YAML double-quoted scalar: escape backslash and double-quote (sufficient for
@@ -1289,6 +1354,7 @@ function writeHysteriaConfig({ restart = true } = {}) {
     fs.writeFileSync(tmp, next, { mode: 0o600 });
     try { fs.copyFileSync(HY2_CONFIG, last); } catch {}   // backup for rollback
     fs.renameSync(tmp, HY2_CONFIG);                        // atomic replace
+    hy2ChownConfig(HY2_CONFIG);   // hand back to service user (else perm-denied)
   } catch (e) {
     try { fs.unlinkSync(tmp); } catch {}
     return { ok: false, changed: false, active: false, error: 'write failed: ' + e.message };
@@ -1302,6 +1368,7 @@ function writeHysteriaConfig({ restart = true } = {}) {
     try {
       if (fs.existsSync(last)) {
         fs.copyFileSync(last, HY2_CONFIG);
+        hy2ChownConfig(HY2_CONFIG);   // keep rollback readable by the service user
         reloadHysteria();
       }
     } catch {}
@@ -1430,6 +1497,35 @@ function naiveCascadeStatusText() {
   }
 
   return lines.join('\n');
+}
+
+// BUG-176 ("Failed to fetch" when toggling Hy2 / saving a user): a user CRUD
+// call ran applyAllConfigs() SYNCHRONOUSLY before responding. That serially
+// restarts caddy-naive (~20s budget), mita, AND hysteria-server (~20s) — the
+// combined wall-time could exceed the browser/reverse-proxy idle window, so the
+// fetch connection was dropped and the UI showed "Failed to fetch", even though
+// the DB write had already succeeded (hence "reopen and it's there"). Fix: run
+// the heavy service apply in the BACKGROUND and let the request return as soon
+// as the DB write is durable. The last result is cached so the UI can poll it.
+let _lastApplyResult = { caddyOk: true, mitaOk: true, hy2Ok: true,
+                         caddyError: '', hy2Error: '', servicesReloaded: true,
+                         at: null, running: false };
+let _applyQueued = false;
+
+// Kick a background apply. Coalesces bursts (multiple CRUD ops in quick
+// succession) into a single trailing run so we never pile up restarts.
+function applyAllConfigsAsync() {
+  _lastApplyResult.running = true;
+  if (_applyQueued) return;   // a run is already scheduled; it will pick up latest state
+  _applyQueued = true;
+  setImmediate(() => {
+    _applyQueued = false;
+    let r;
+    try { r = applyAllConfigs(); }
+    catch (e) { r = { caddyOk: false, mitaOk: false, hy2Ok: false,
+                      caddyError: e.message, hy2Error: e.message, servicesReloaded: false }; }
+    _lastApplyResult = { ...r, at: new Date().toISOString(), running: false };
+  });
 }
 
 // ── applyAllConfigs() — unified pipeline ─────────────────────────────────────
@@ -2065,6 +2161,13 @@ app.get('/api/users', requireAuth, (req, res) => {
   res.json(users);
 });
 
+// BUG-176: outcome of the most recent background applyAllConfigsAsync() run.
+// The UI polls this after a user CRUD (servicesReloading:true) to learn whether
+// caddy/mita/hy2 actually reloaded, without blocking the CRUD request itself.
+app.get('/api/apply-status', requireAuth, (req, res) => {
+  res.json(_lastApplyResult);
+});
+
 app.post('/api/users', requireAuth, async (req, res) => {
   const { email, username, password, expiry, protocols, quotaMB, quotaGb } = req.body;
   const validation = validateUserInput(
@@ -2165,10 +2268,13 @@ app.post('/api/users', requireAuth, async (req, res) => {
     }
 
     // Run the (heavier) service rebuild only when WE actually inserted the row.
-    const svcStatus = result.created ? applyAllConfigs() : {};
+    // BUG-176: do it in the background so the POST returns promptly (avoids the
+    // dropped-connection "Failed to fetch" during the 3 sequential restarts).
+    if (result.created) applyAllConfigsAsync();
     const row = result.user || user;
     const { passHash, password: _p, ...safe } = row;
-    return { status: 201, payload: { ok: true, ...parseUserRow(safe), ...svcStatus } };
+    return { status: 201, payload: { ok: true, ...parseUserRow(safe),
+             servicesReloading: !!result.created } };
   })();
 
   inflightCreates.set(username, work);
@@ -2241,18 +2347,21 @@ app.put('/api/users/:id', requireAuth, (req, res) => {
     return res.status(d.status).json({ error: d.error });
   }
 
-  const svcStatus = applyAllConfigs();
+  // BUG-176: apply configs in the background so the response returns promptly
+  // (the DB write above is already durable). servicesReloading tells the UI to
+  // poll /api/apply-status for the outcome instead of waiting on this request.
+  applyAllConfigsAsync();
 
   const { passHash, password: _p, ...safe } = updated;
-  res.json({ ok: true, ...parseUserRow(safe), ...svcStatus });
+  res.json({ ok: true, ...parseUserRow(safe), servicesReloading: true });
 });
 
 app.delete('/api/users/:id', requireAuth, (req, res) => {
   const user = getUserById(req.params.id);
   if (!user) return res.status(404).json({ error: 'User not found' });
   deleteUser(req.params.id);
-  const svcStatus = applyAllConfigs();
-  res.json({ ok: true, ...svcStatus });
+  applyAllConfigsAsync();   // BUG-176: background apply
+  res.json({ ok: true, servicesReloading: true });
 });
 
 // ── Server settings ───────────────────────────────────────────────────────────
@@ -2349,6 +2458,16 @@ app.post('/api/settings/hy2/install', requireAuth, (req, res) => {
   cfg.stack.hy2 = true;
   saveConfig();
 
+  // Operator request: auto-enroll all EXISTING keys into Hy2 so they light up
+  // the Hy2 checkbox and can use it immediately (no per-user re-edit). Opt-out
+  // with { enrollAll:false }. Default true (installing Hy2 = "I want everyone
+  // on Hy2"). Idempotent, so re-installing never double-adds.
+  const enrollAll = !(req.body && req.body.enrollAll === false);
+  let enrolled = 0;
+  if (enrollAll) {
+    try { enrolled = enrollAllHy2(); } catch (e) { try { console.error('[HY2 enroll]', e.message); } catch {} }
+  }
+
   // Push the shared-pool users into the userpass map right away.
   let hy2Sync = { ok: true };
   try { hy2Sync = writeHysteriaConfig(); } catch (e) { hy2Sync = { ok: false, error: e.message }; }
@@ -2362,9 +2481,25 @@ app.post('/api/settings/hy2/install', requireAuth, (req, res) => {
     active,
     port: cfg.hy2Port,
     hy2Sync,
-    message: `Hysteria2 установлен на порт ${cfg.hy2Port}/udp. Пользователи с протоколом hy2 добавлены. Клиенты могут скачать hy2-ссылку.`,
+    enrolled,
+    message: `Hysteria2 установлен на порт ${cfg.hy2Port}/udp.` +
+             (enrolled ? ` Hy2 включён на ${enrolled} существующих ключах.` : ' Пользователи с протоколом hy2 добавлены.') +
+             ' Клиенты могут скачать hy2-ссылку.',
     output: r.output
   });
+});
+
+// Enroll all existing keys into Hy2 on demand (operator button), without
+// re-running the installer. Only meaningful once Hy2 is installed.
+app.post('/api/settings/hy2/enroll-all', requireAuth, (req, res) => {
+  if (!hy2Installed())
+    return res.status(400).json({ error: 'Hysteria2 не установлен на этом сервере.' });
+  let enrolled = 0;
+  try { enrolled = enrollAllHy2(); } catch (e) { return res.status(500).json({ error: e.message }); }
+  let hy2Sync = { ok: true };
+  try { hy2Sync = writeHysteriaConfig(); } catch (e) { hy2Sync = { ok: false, error: e.message }; }
+  res.json({ ok: true, enrolled, hy2Sync,
+    message: enrolled ? `Hy2 включён на ${enrolled} ключах.` : 'Все ключи уже используют Hy2.' });
 });
 
 // Change the Hy2 UDP port: update config.yaml's listen directive + restart.
@@ -2402,11 +2537,12 @@ app.post('/api/settings/hy2-port', requireAuth, (req, res) => {
     fs.writeFileSync(tmp, text, { mode: 0o600 });
     try { fs.copyFileSync(HY2_CONFIG, last); } catch {}
     fs.renameSync(tmp, HY2_CONFIG);
+    hy2ChownConfig(HY2_CONFIG);   // hand back to service user (else perm-denied)
 
     const r = reloadHysteria();
     if (!r.ok) {
       // Roll back
-      try { if (fs.existsSync(last)) { fs.copyFileSync(last, HY2_CONFIG); reloadHysteria(); } } catch {}
+      try { if (fs.existsSync(last)) { fs.copyFileSync(last, HY2_CONFIG); hy2ChownConfig(HY2_CONFIG); reloadHysteria(); } } catch {}
       cfg.hy2Port = oldPort; saveConfig();
       return res.status(500).json({ ok: false, error: 'Hy2 failed to start on new port; rolled back. ' + (r.error || '') });
     }
@@ -3217,27 +3353,40 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
   let naiveServerTotalMB = 0;
   try { naiveServerTotalMB = readNaiveTotalMB(); } catch { naiveServerTotalMB = 0; }
 
+  // ── Hy2 source (Traffic Stats API on loopback) — fully isolated ─────────────
+  // Per-user up/down bytes from GET /traffic. Works for direct AND cascaded Hy2.
+  let hy2 = {};
+  try {
+    hy2 = readHy2Traffic() || {};
+  } catch (e) {
+    hy2 = {};
+    try { console.error('[stats/users] hy2 source failed:', e && e.message); } catch {}
+  }
+
   const allUsers = getAllUsers();
 
   const users = allUsers.map(u => {
     const s = live.find(x => x.username === u.username) || {};
     const n = naive[u.username] || {};
+    const hy = hy2[u.username] || {};
     const mieruUp   = s.uploadMB   || 0;
     const mieruDown = s.downloadMB || 0;
+    const hy2Up     = hy.uploadMB   || 0;
+    const hy2Down   = hy.downloadMB || 0;
     // Per-user Naive = only what the access log actually attributed (rare plain
     //   HTTP requests). CONNECT tunnels are never logged → this is usually 0.
     //   The real Naive figure is server-wide (naiveServerTotalMB), shown apart.
     const naiveUp   = n.uploadMB   || 0;
     const naiveDown = n.downloadMB || 0;
-    const uploadMB   = mieruUp   + naiveUp;
-    const downloadMB = mieruDown + naiveDown;
-    // Combined used: prefer live mita "usedMB" when present, plus naive bytes;
-    //   fall back to the stored cumulative value when neither source reports.
-    const liveUsed = (s.usedMB != null ? s.usedMB : 0) + (n.usedMB || 0);
-    const usedMB   = (s.usedMB != null || n.usedMB != null)
+    const uploadMB   = mieruUp   + naiveUp   + hy2Up;
+    const downloadMB = mieruDown + naiveDown + hy2Down;
+    // Combined used: prefer live mita "usedMB" when present, plus naive + hy2
+    //   bytes; fall back to the stored cumulative value when no source reports.
+    const liveUsed = (s.usedMB != null ? s.usedMB : 0) + (n.usedMB || 0) + (hy.usedMB || 0);
+    const usedMB   = (s.usedMB != null || n.usedMB != null || hy.usedMB != null)
       ? liveUsed
       : (u.usedMB || 0);
-    // Most recent activity across both protocols.
+    // Most recent activity across all protocols.
     const seenCandidates = [s.lastSeen, n.lastSeen, u.lastSeen].filter(Boolean);
     const lastSeen = seenCandidates.length
       ? seenCandidates.sort().slice(-1)[0]
@@ -3257,6 +3406,7 @@ app.get('/api/stats/users', requireAuth, (req, res) => {
       //   0. The real Naive number is server-wide (see naiveServerTotalMB).
       naiveMB:    naiveUp + naiveDown,
       mieruMB:    mieruUp + mieruDown,
+      hy2MB:      hy2Up + hy2Down,
       lastSeen
     };
   });
@@ -3288,6 +3438,50 @@ function readNaiveTotalMB() {
     if (m) bytes += Number(m[1]) || 0;
   }
   return bytes / 1048576;
+}
+
+// Read per-user Hysteria2 traffic from the Traffic Stats API (loopback).
+// Returns a map { username: { uploadMB, downloadMB, usedMB } }. The stats API
+// reports cumulative tx/rx bytes since the server started (tx = client upload,
+// rx = client download). Works identically whether Hy2 is direct OR cascaded —
+// it accounts what actually passed through the Hy2 server. Best-effort: returns
+// {} if Hy2 isn't installed / stats not enabled / API unreachable, so it can
+// NEVER zero the Naive/Mieru figures (same isolation contract as those).
+function readHy2Traffic() {
+  const out = {};
+  try {
+    if (!hy2Installed()) return out;
+    let listen = '127.0.0.1:9999', secret = '';
+    try {
+      const cfgTxt = fs.readFileSync(HY2_CONFIG, 'utf8');
+      // trafficStats:\n  listen: <host:port>\n  secret: "<secret>"
+      const block = cfgTxt.split(/^trafficStats:\s*$/m)[1] || '';
+      const lm = block.match(/^\s*listen:\s*(\S+)/m);
+      const sm = block.match(/^\s*secret:\s*"?([^"\n]+)"?/m);
+      if (lm) listen = lm[1].trim();
+      if (sm) secret = sm[1].trim();
+    } catch { return out; }
+    if (!listen) return out;
+    const hdr = secret ? `-H 'Authorization: ${secret.replace(/'/g, "")}'` : '';
+    let raw = '';
+    try {
+      raw = execSync(`curl -fsS --max-time 5 ${hdr} 'http://${listen}/traffic' 2>/dev/null`,
+        { timeout: 7000 }).toString();
+    } catch { return out; }
+    let obj;
+    try { obj = JSON.parse(raw); } catch { return out; }
+    if (!obj || typeof obj !== 'object') return out;
+    for (const [user, v] of Object.entries(obj)) {
+      const tx = (v && Number(v.tx)) || 0;   // client upload
+      const rx = (v && Number(v.rx)) || 0;   // client download
+      out[user] = {
+        uploadMB:   tx / 1048576,
+        downloadMB: rx / 1048576,
+        usedMB:     (tx + rx) / 1048576,
+      };
+    }
+  } catch { return out; }
+  return out;
 }
 
 // Bug 78: parse the `mita get users` table.
@@ -3452,6 +3646,11 @@ app.get('/api/logs/:service', requireAuth, (req, res) => {
       cmd = `journalctl -u caddy-naive -n ${lines} --no-pager 2>/dev/null || tail -n ${lines} ${LOG_CADDY} 2>/dev/null`;
       break;
     case 'mieru': cmd = `journalctl -u mita -n ${lines} --no-pager 2>/dev/null || mita describe log 2>/dev/null`; break;
+    // Hy2 (Hysteria2) service logs — same journalctl treatment as the others.
+    case 'hy2':
+    case 'hysteria':
+      cmd = `journalctl -u hysteria-server -n ${lines} --no-pager 2>/dev/null`;
+      break;
     case 'panel': cmd = `tail -n ${lines} ${LOG_PANEL} 2>/dev/null`; break;
     default: return res.status(400).json({ error: 'Unknown service' });
   }
